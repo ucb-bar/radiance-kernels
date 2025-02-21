@@ -1,0 +1,83 @@
+import time
+import os
+import struct
+from PIL import Image
+from io import BytesIO
+import subprocess
+
+use_fpga = False
+
+def follow(filename):
+    with open(filename, "r") as file:
+        # file.seek(0, os.SEEK_END)  # Move to the end of the file
+        while True:
+            line = file.readline()
+            if not line:
+                time.sleep(0.001)
+                continue
+            yield line.strip()
+
+def process_frame(frame_data):
+    # Create a byte array from the frame data
+    byte_array = bytearray()
+    # for offset, data in frame_data.items():
+    #     byte_array += struct.pack("<I", int(data, 16))
+    for offset in range(75):
+        byte_array += struct.pack("<I", frame_data[offset])
+
+    # Create an image from the byte array
+    img = Image.new('1', (60, 40))  # 60x40 pixels, 1 bit per pixel
+    pixels = img.load()
+
+    for i in range(40):  # 40 rows
+        for j in range(60):  # 60 columns
+            byte_index = (i * 60 + j) // 8
+            bit_index = 7 - ((i * 60 + j) % 8)
+            pixels[j, 39 - i] = (byte_array[byte_index] >> bit_index) & 1
+
+    return img
+
+def display_image(img):
+    with BytesIO() as output:
+        img = img.resize((120, 90), Image.NEAREST)
+        img.save(output, format='PNG')
+        output.seek(0)
+        subprocess.run(["/home/eecs/yrh/.iterm2/imgcat", "-H", "98%"], input=output.read())
+
+def main():
+    if not use_fpga:
+        filename = "/scratch/yrh/chipyard/sims/vcs/output/chipyard.harness.TestHarness.RadianceClusterConfig/kernel.radiance.out"
+    else:
+        filename = "/scratch/yrh/chipyard/sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRadianceClusterSynConfig-WithPrintfSynthesis_BaseXilinxAlveoU250Config/synthesized-prints.out0"
+    # frame_data = {}
+    frame_data0 = [0 for _ in range(80)]
+    frame_data1 = [0 for _ in range(80)]
+    for line in follow(filename):
+        if not "fb0" in line:
+            continue
+        tokens = line.split()
+        if not len(tokens) == 7 if use_fpga else 5:
+            continue
+        offset, data = tokens[4 if use_fpga else 2:-1]
+        offset = int(offset, 16) - 0xff010000
+        offset0 = offset
+        offset1 = offset - 0x200
+
+        if offset0 >= 0 and offset0 < 320:
+            frame_data0[offset0 // 4] = int(data, 16)
+
+        if offset1 >= 0 and offset1 < 320:
+            frame_data1[offset1 // 4] = int(data, 16)
+
+        if offset0 == 0x130 and data == "ff010130":
+            img = process_frame(frame_data0)
+            frame_data0 = [0 for _ in range(80)]
+            display_image(img)
+        elif offset1 == 0x130 and data == "ff010330":
+            img = process_frame(frame_data1)
+            frame_data1 = [0 for _ in range(80)]
+            display_image(img)
+
+if __name__ == "__main__":
+    main()
+

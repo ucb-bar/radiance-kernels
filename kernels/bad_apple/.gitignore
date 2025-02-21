@@ -1,0 +1,6 @@
+*.bin
+*.dump
+*.elf
+sgemm_wg
+.depend
+kernel.radiance.elf
