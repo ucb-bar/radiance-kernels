@@ -281,16 +281,16 @@ SECTIONS
     *(.args)
     . += 8K;
   }> DRAMARG
-  .operand.a : {
-    *(.operand.a)
+  .input.a : {
+    *(.input.a)
     . += 32K;
   }> DRAM1
-  .operand.b : {
-    *(.operand.b)
+  .input.b : {
+    *(.input.b)
     . += 32K;
   }> DRAM2
-  .operand.c : {
-    *(.operand.c)
+  .input.c : {
+    *(.input.c)
     . += 32K;
   }> DRAM3
 }

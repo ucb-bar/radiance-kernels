@@ -11,16 +11,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <sys/stat.h>
-#include <newlib.h>
-#include <unistd.h>
+// #include <sys/stat.h>
+// #include <newlib.h>
+// #include <unistd.h>
 #include <vx_intrinsics.h>
-#include <vx_print.h>
-#include <string.h>
+#include <stddef.h>
+#include <stdint.h>
+// #include <vx_print.h>
+// #include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define HAVE_INITFINI_ARRAY
  
 int _close(int file) { return -1; }
  
@@ -34,20 +38,38 @@ int _open(const char *name, int flags, int mode) { return -1; }
  
 int _read(int file, char *ptr, int len) { return -1; }
  
-caddr_t _sbrk(int incr) { 
-  __asm__ __volatile__("ebreak");
-  return 0; 
-}
+// caddr_t _sbrk(int incr) { 
+//   __asm__ __volatile__("ebreak");
+//   return 0; 
+// }
  
-int _write(int file, char *ptr, int len) {
-  int i; 
-  for (i = 0; i < len; ++i) {
-    vx_putchar(*ptr++);
-  }
-  return len;
-}
+// int _write(int file, char *ptr, int len) {
+//   int i; 
+//   for (i = 0; i < len; ++i) {
+//     vx_putchar(*ptr++);
+//   }
+//   return len;
+// }
 
 int _kill(int pid, int sig) { return -1; }
+
+void *memset(void *ptr, int value, size_t num) {
+    unsigned char *p = (unsigned char *)ptr;
+    while (num--) {
+        *p++ = (unsigned char)value;
+    }
+    return ptr;
+}
+
+void *memcpy(void *dest, const void *src, size_t num) {
+    unsigned char *d = (unsigned char *)dest;
+    const unsigned char *s = (const unsigned char *)src;
+    while (num--) {
+        *d++ = *s++;
+    }
+    return dest;
+}
+
 
 int _getpid() {
   return vx_hart_id();
@@ -117,6 +139,19 @@ void __libc_fini_array (void) {
   _fini ();
 #endif
 }
+
+extern void (_exit) (int) __attribute__((noreturn));
+
+void exit(int return_code) {
+    __libc_fini_array();
+    _exit(return_code);
+}
+
+void libc_init() {
+    // __sinit(_impure_ptr);
+    __libc_init_array();
+}
+
 #endif
 
 #ifdef __cplusplus

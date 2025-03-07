@@ -1,18 +1,10 @@
-XLEN ?= 32
-
 TOOLDIR ?= /opt
 
-ifeq ($(XLEN),64)
-RISCV_TOOLCHAIN_PATH ?= $(TOOLDIR)/riscv64-gnu-toolchain
-VX_CFLAGS += -march=rv64imafd -mabi=lp64d
-STARTUP_ADDR ?= 0x180000000
-else
 RISCV_TOOLCHAIN_PATH ?= $(TOOLDIR)/riscv-gnu-toolchain
-VX_CFLAGS += -march=rv32imaf -mabi=ilp32f
+VX_CFLAGS += -march=rv32imf -mabi=ilp32f
 STARTUP_ADDR ?= 0x80000000
-endif
 
-RISCV_PREFIX ?= riscv$(XLEN)-unknown-elf
+RISCV_PREFIX ?= riscv32-unknown-elf
 RISCV_SYSROOT ?= $(RISCV_TOOLCHAIN_PATH)/$(RISCV_PREFIX)
 
 VORTEX_KN_PATH ?= $(realpath ../../lib)
@@ -20,10 +12,10 @@ GEMMINI_SW_PATH ?= $(realpath ../../lib/gemmini)
 
 LLVM_VORTEX ?= $(TOOLDIR)/llvm-vortex
 
-LLVM_MUON ?= $(TOOLDIR)/llvm-muon
+LLVM_MUON ?= $(realpath ../../llvm/llvm-muon)
 
 LLVM_CFLAGS += --sysroot=$(RISCV_SYSROOT)
-LLVM_CFLAGS += --gcc-toolchain=$(RISCV_TOOLCHAIN_PATH)
+LLVM_CFLAGS += --gcc-toolchain=$(RISCV_TOOLCHAIN_PATH) -nodefaultlibs
 LLVM_CFLAGS += -Xclang -target-feature -Xclang +vortex
 
 #LLVM_CFLAGS += -mllvm -vortex-branch-divergence=2
@@ -54,15 +46,15 @@ VX_CFLAGS += -DNDEBUG -DLLVM_VORTEX
 MU_CFLAGS := $(VX_CFLAGS)
 MU_CFLAGS += -fuse-ld=lld
 
-VX_LDFLAGS += -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/linker/vx_link$(XLEN).ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR)
+VX_LDFLAGS += -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/linker/vx_link32.ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR)
 MU_LDFLAGS := $(VX_LDFLAGS)
 VX_LDFLAGS += $(VORTEX_KN_PATH)/libvortexrt.a
-MU_LDFLAGS += $(VORTEX_KN_PATH)/libvortexrtmuon.a $(VORTEX_KN_PATH)/tohost.S
+MU_LDFLAGS += $(VORTEX_KN_PATH)/libmuonrt.a $(VORTEX_KN_PATH)/tohost.S
 
 # CONFIG is supplied from the command line to differentiate ELF files with custom suffixes
 CONFIGEXT = $(if $(CONFIG),.$(CONFIG),)
 
-all: kernel.radiance.dump kernel.radiance$(CONFIGEXT).dump kernel.vortex.dump
+all: kernel.radiance.dump kernel.radiance$(CONFIGEXT).dump # kernel.vortex.dump
 
 kernel.vortex.dump: kernel.vortex.elf
 	$(VX_DP) -D kernel.vortex.elf > kernel.vortex.dump
@@ -75,31 +67,28 @@ kernel.radiance$(CONFIGEXT).dump: kernel.radiance$(CONFIGEXT).elf
 endif
 
 OBJCOPY_FLAGS ?= "LOAD,ALLOC,DATA,CONTENTS"
-BINFILES :=  args.bin input.a.bin input.b.bin input.c.bin
+BINFILES ?=  args.bin input.a.bin input.b.bin input.c.bin
 
-kernel.vortex.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
-	$(VX_CXX) $(VX_CFLAGS) $(VX_SRCS) $(VX_LDFLAGS) -DRADIANCE -o $@
-	$(VX_CP) --set-section-flags .operand.a=$(OBJCOPY_FLAGS) $@
-	$(VX_CP) --set-section-flags .operand.b=$(OBJCOPY_FLAGS) $@
-	$(VX_CP) --set-section-flags .operand.c=$(OBJCOPY_FLAGS) $@
-	$(VX_CP) --set-section-flags .args=$(OBJCOPY_FLAGS) $@
-	$(VX_CP) --update-section .operand.a=input.a.bin $@ || true
-	$(VX_CP) --update-section .operand.b=input.b.bin $@ || true
-	$(VX_CP) --update-section .operand.c=input.c.bin $@ || true
-	$(VX_CP) --update-section .args=args.bin $@ || true
+# kernel.vortex.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
+# 	$(VX_CXX) $(VX_CFLAGS) $(VX_SRCS) $(VX_LDFLAGS) -DRADIANCE -o $@
+# 
+# 	@for bin in $(BINFILES); do \
+# 		sec=$$(echo $$bin | sed 's/\.bin$$//'); \
+# 		echo "-$(VX_CP) --update-section .$$sec=$$bin $@"; \
+# 		$(VX_CP) --set-section-flags .input.a=$(OBJCOPY_FLAGS) $@; \
+# 		$(VX_CP) --update-section .$$sec=$$bin $@ || true; \
+# 	done
 
 kernel.radiance.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
 	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) $(MU_LDFLAGS) -DRADIANCE -S
 	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) $(MU_LDFLAGS) -DRADIANCE -c
 	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) $(MU_LDFLAGS) -DRADIANCE -o $@
-	# $(MU_CP) --set-section-flags .operand.a=$(OBJCOPY_FLAGS) $@
-	# $(MU_CP) --set-section-flags .operand.b=$(OBJCOPY_FLAGS) $@
-	# $(MU_CP) --set-section-flags .operand.c=$(OBJCOPY_FLAGS) $@
-	# $(MU_CP) --set-section-flags .args=$(OBJCOPY_FLAGS) $@
-	# $(MU_CP) --update-section .operand.a=input.a.bin $@ || true
-	# $(MU_CP) --update-section .operand.b=input.b.bin $@ || true
-	# $(MU_CP) --update-section .operand.c=input.c.bin $@ || true
-	# $(MU_CP) --update-section .args=args.bin $@ || true
+	@for bin in $(BINFILES); do \
+		sec=$$(echo $$bin | sed 's/\.bin$$//'); \
+		echo "-$(MU_CP) --update-section .$$sec=$$bin $@"; \
+		$(MU_CP) --set-section-flags .input.a=$(OBJCOPY_FLAGS) $@; \
+		$(MU_CP) --update-section .$$sec=$$bin $@ || true; \
+	done
 
 ifneq ($(CONFIG),)
 kernel.radiance$(CONFIGEXT).elf: kernel.radiance.elf
@@ -108,6 +97,8 @@ endif
 
 clean:
 	rm -rf *.o
+	rm -rf *.elf
+	rm -rf *.dump
 
 clean-all: clean
 	rm -rf kernel*.elf kernel*.dump

@@ -6,13 +6,14 @@ RISCV_TOOLCHAIN_PATH ?= $(TOOLDIR)/riscv64-gnu-toolchain
 CFLAGS += -march=rv64imafd -mabi=lp64d
 else
 RISCV_TOOLCHAIN_PATH ?= $(TOOLDIR)/riscv-gnu-toolchain
-CFLAGS += -march=rv32imaf -mabi=ilp32f
+CFLAGS += -march=rv32imf -mabi=ilp32f
 endif
 
 RISCV_PREFIX ?= riscv$(XLEN)-unknown-elf
 RISCV_SYSROOT ?= $(RISCV_TOOLCHAIN_PATH)/$(RISCV_PREFIX)
 
 LLVM_VORTEX ?= $(TOOLDIR)/llvm-vortex
+LLVM_MUON ?= $(TOOLDIR)/llvm-muon
 
 LLVM_CFLAGS += --sysroot=$(RISCV_SYSROOT)
 LLVM_CFLAGS += --gcc-toolchain=$(RISCV_TOOLCHAIN_PATH)
@@ -27,41 +28,59 @@ LLVM_CFLAGS += -Xclang -target-feature -Xclang +vortex -mllvm -vortex-branch-div
 #DP  = $(LLVM_VORTEX)/bin/llvm-objdump
 #CP  = $(LLVM_VORTEX)/bin/llvm-objcopy
 
-CC  = $(RISCV_TOOLCHAIN_PATH)/bin/$(RISCV_PREFIX)-gcc
-CXX = $(RISCV_TOOLCHAIN_PATH)/bin/$(RISCV_PREFIX)-g++
+# CC  = $(RISCV_TOOLCHAIN_PATH)/bin/$(RISCV_PREFIX)-gcc
+# CXX = $(RISCV_TOOLCHAIN_PATH)/bin/$(RISCV_PREFIX)-g++
 AR  = $(RISCV_TOOLCHAIN_PATH)/bin/$(RISCV_PREFIX)-gcc-ar
-DP  = $(RISCV_TOOLCHAIN_PATH)/bin/$(RISCV_PREFIX)-objdump
-CP  = $(RISCV_TOOLCHAIN_PATH)/bin/$(RISCV_PREFIX)-objcopy
+# DP  = $(RISCV_TOOLCHAIN_PATH)/bin/$(RISCV_PREFIX)-objdump
+# CP  = $(RISCV_TOOLCHAIN_PATH)/bin/$(RISCV_PREFIX)-objcopy
+
+VX_CC  = $(LLVM_VORTEX)/bin/clang $(LLVM_CFLAGS)
+VX_CXX = $(LLVM_VORTEX)/bin/clang++ $(LLVM_CFLAGS)
+VX_DP  = $(LLVM_VORTEX)/bin/llvm-objdump 
+VX_CP  = $(RISCV_TOOLCHAIN_PATH)/bin/riscv32-unknown-elf-objcopy
+
+MU_CC  = $(LLVM_MUON)/bin/clang $(LLVM_CFLAGS)
+MU_CXX = $(LLVM_MUON)/bin/clang++ $(LLVM_CFLAGS)
+MU_DP  = $(LLVM_MUON)/bin/llvm-objdump 
+MU_CP  = $(LLVM_MUON)/bin/llvm-objcopy
 
 CFLAGS += -O3 -mcmodel=medany -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections
 CFLAGS += -I./include
 CFLAGS += -DXLEN_$(XLEN)
 
-PROJECT = libvortexrt
+VX_CFLAGS := $(CFLAGS)
+VX_CFLAGS += -mllvm -inline-threshold=262144
+VX_CFLAGS += -I$(VORTEX_KN_PATH)/include -I$(GEMMINI_SW_PATH)
+VX_CFLAGS += -DNDEBUG -DLLVM_VORTEX
 
-SRCS = ./src/vx_start.S ./src/vx_syscalls.c ./src/vx_print.S ./src/tinyprintf.c ./src/vx_print.c ./src/vx_spawn.c ./src/vx_serial.S ./src/vx_perf.c
+MU_CFLAGS := $(VX_CFLAGS)
+MU_CFLAGS += -fuse-ld=lld
+
+PROJECT = libmuonrt
+
+SRCS = ./src/vx_start.S ./src/vx_syscalls.c ./src/tinyprintf.c ./src/vx_spawn.c
 
 OBJS := $(addsuffix .o, $(notdir $(SRCS)))
 
 all: $(PROJECT).a $(PROJECT).dump
 
 $(PROJECT).dump: $(PROJECT).a
-	$(DP) -D $(PROJECT).a > $(PROJECT).dump
+	$(MU_DP) -D $(PROJECT).a > $(PROJECT).dump
 
 %.S.o: src/%.S
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(MU_CC) $(MU_CFLAGS) -c $< -o $@
 
 %.cpp.o: src/%.cpp include/vx_spawn.h
-	$(CXX) $(CFLAGS) -c $< -o $@
+	$(MU_CXX) $(MU_CFLAGS) -c $< -o $@
 
 %.c.o: src/%.c include/vx_spawn.h
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(MU_CC) $(MU_CFLAGS) -c $< -o $@
 
 $(PROJECT).a: $(OBJS)
 	$(AR) rcs $@ $^
 
 .depend: $(SRCS)
-	$(CC) $(CFLAGS) -MM $^ > .depend;
+	$(MU_CC) $(MU_CFLAGS) -MM $^ > .depend;
 
 clean:
 	rm -rf *.a *.o *.dump .depend

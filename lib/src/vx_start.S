@@ -58,10 +58,6 @@ _start:
   # la t0, trap_entry
   # csrw mtvec, t0
 
-  # register global termination functions
-  la    a0, __libc_fini_array   
-  call  atexit                  
-
   # run global initialization functions
   call  __libc_init_array  
 
@@ -76,9 +72,9 @@ _start:
 .type _exit, @function
 .global _exit
 _exit:
-  mv    s0, a0
-  call  vx_perf_dump 
-  mv    gp, s0
+  # mv    s0, a0
+  # call  vx_perf_dump 
+  # mv    gp, s0
   .insn r RISCV_CUSTOM0, 0, 0, x0, x0, x0  # tmc x0
 
 .section .text
