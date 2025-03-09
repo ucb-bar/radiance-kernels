@@ -13,7 +13,7 @@ RISCV_PREFIX ?= riscv$(XLEN)-unknown-elf
 RISCV_SYSROOT ?= $(RISCV_TOOLCHAIN_PATH)/$(RISCV_PREFIX)
 
 LLVM_VORTEX ?= $(TOOLDIR)/llvm-vortex
-LLVM_MUON ?= $(TOOLDIR)/llvm-muon
+LLVM_MUON ?= $(realpath ../llvm/llvm-muon)
 
 LLVM_CFLAGS += --sysroot=$(RISCV_SYSROOT)
 LLVM_CFLAGS += --gcc-toolchain=$(RISCV_TOOLCHAIN_PATH)
