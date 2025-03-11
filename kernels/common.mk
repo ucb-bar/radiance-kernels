@@ -80,8 +80,8 @@ BINFILES ?=  args.bin input.a.bin input.b.bin input.c.bin
 # 	done
 
 kernel.radiance.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
-	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) $(MU_LDFLAGS) -DRADIANCE -S
-	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) $(MU_LDFLAGS) -DRADIANCE -c
+	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) -DRADIANCE -S
+	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) -DRADIANCE -c
 	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) $(MU_LDFLAGS) -DRADIANCE -o $@
 	@for bin in $(BINFILES); do \
 		sec=$$(echo $$bin | sed 's/\.bin$$//'); \
