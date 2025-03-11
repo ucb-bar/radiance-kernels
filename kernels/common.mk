@@ -36,7 +36,7 @@ MU_DP  = $(LLVM_MUON)/bin/llvm-objdump
 MU_CP  = $(LLVM_MUON)/bin/llvm-objcopy
 
 VX_CFLAGS += -v -O3 -std=c++17
-VX_CFLAGS += -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections
+VX_CFLAGS += -mcmodel=medany -fno-rtti -fno-exceptions -fdata-sections -ffunction-sections
 # comment out below for regression/basic, which uses GCC that doesn't
 # understand these flags
 VX_CFLAGS += -mllvm -inline-threshold=262144
@@ -44,10 +44,9 @@ VX_CFLAGS += -I$(VORTEX_KN_PATH)/include -I$(GEMMINI_SW_PATH)
 VX_CFLAGS += -DNDEBUG -DLLVM_VORTEX
 
 MU_CFLAGS := $(VX_CFLAGS)
-MU_CFLAGS += -fuse-ld=lld
 
-VX_LDFLAGS += -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/linker/vx_link32.ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR)
-MU_LDFLAGS := $(VX_LDFLAGS)
+VX_LDFLAGS += -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/linker/vx_link32.ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR)
+MU_LDFLAGS := -fuse-ld=lld $(VX_LDFLAGS)
 VX_LDFLAGS += $(VORTEX_KN_PATH)/libvortexrt.a
 MU_LDFLAGS += $(VORTEX_KN_PATH)/libmuonrt.a $(VORTEX_KN_PATH)/tohost.S
 
