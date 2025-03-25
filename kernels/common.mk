@@ -36,16 +36,15 @@ MU_DP  = $(LLVM_MUON)/bin/llvm-objdump
 MU_CP  = $(LLVM_MUON)/bin/llvm-objcopy
 
 VX_CFLAGS += -v -O3 -std=c++17
-VX_CFLAGS += -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections
+VX_CFLAGS += -mcmodel=medany -fno-rtti -fno-exceptions -fdata-sections -ffunction-sections
 VX_CFLAGS += -mllvm -inline-threshold=262144
 VX_CFLAGS += -I$(VORTEX_KN_PATH)/include -I$(GEMMINI_SW_PATH)
 VX_CFLAGS += -DNDEBUG -DLLVM_VORTEX
 
 MU_CFLAGS := $(VX_CFLAGS)
-MU_CFLAGS += -fuse-ld=lld
 
-VX_LDFLAGS += -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/linker/vx_link32.ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR)
-MU_LDFLAGS := $(VX_LDFLAGS)
+VX_LDFLAGS += -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/linker/vx_link32.ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR)
+MU_LDFLAGS := -fuse-ld=lld $(VX_LDFLAGS)
 VX_LDFLAGS += $(VORTEX_KN_PATH)/libvortexrt.a
 MU_LDFLAGS += $(VORTEX_KN_PATH)/libmuonrt.a $(VORTEX_KN_PATH)/tohost.S
 
@@ -78,8 +77,8 @@ BINFILES ?=  args.bin input.a.bin input.b.bin input.c.bin
 # 	done
 
 kernel.radiance.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
-	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) $(MU_LDFLAGS) -DRADIANCE -S
-	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) $(MU_LDFLAGS) -DRADIANCE -c
+	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) -DRADIANCE -S
+	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) -DRADIANCE -c
 	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) $(MU_LDFLAGS) -DRADIANCE -o $@
 	@for bin in $(BINFILES); do \
 		sec=$$(echo $$bin | sed 's/\.bin$$//'); \
