@@ -2,3 +2,6 @@
 	path = llvm/llvm-src
 	url = https://github.com/richardyrh/llvm.git
 	shallow = true
+[submodule "muon-isa-tests"]
+	path = muon-isa-tests
+	url = https://github.com/richardyrh/muon-isa-tests.git
