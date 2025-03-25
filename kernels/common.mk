@@ -1,7 +1,7 @@
 TOOLDIR ?= /opt
 
 RISCV_TOOLCHAIN_PATH ?= $(TOOLDIR)/riscv-gnu-toolchain
-VX_CFLAGS += -march=rv32imf -mabi=ilp32f
+VX_CFLAGS += -march=rv32im_zfinx -mabi=ilp32
 STARTUP_ADDR ?= 0x80000000
 
 RISCV_PREFIX ?= riscv32-unknown-elf
@@ -37,8 +37,6 @@ MU_CP  = $(LLVM_MUON)/bin/llvm-objcopy
 
 VX_CFLAGS += -v -O3 -std=c++17
 VX_CFLAGS += -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections
-# comment out below for regression/basic, which uses GCC that doesn't
-# understand these flags
 VX_CFLAGS += -mllvm -inline-threshold=262144
 VX_CFLAGS += -I$(VORTEX_KN_PATH)/include -I$(GEMMINI_SW_PATH)
 VX_CFLAGS += -DNDEBUG -DLLVM_VORTEX

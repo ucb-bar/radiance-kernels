@@ -6,7 +6,7 @@ RISCV_TOOLCHAIN_PATH ?= $(TOOLDIR)/riscv64-gnu-toolchain
 CFLAGS += -march=rv64imafd -mabi=lp64d
 else
 RISCV_TOOLCHAIN_PATH ?= $(TOOLDIR)/riscv-gnu-toolchain
-CFLAGS += -march=rv32imf -mabi=ilp32f
+CFLAGS += -march=rv32im_zfinx -mabi=ilp32
 endif
 
 RISCV_PREFIX ?= riscv$(XLEN)-unknown-elf
