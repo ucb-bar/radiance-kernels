@@ -4,7 +4,7 @@ SCRIPT_PATH=$(cd "$(dirname "$0")" && pwd)
 LLVM_BASE=$(realpath "${SCRIPT_PATH}/../llvm")
 
 cd "${LLVM_BASE}"
-git submodule update --init llvm
+git submodule update --init llvm-src
 
 cd llvm-src
 rm -rf build
