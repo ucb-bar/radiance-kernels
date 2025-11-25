@@ -2,7 +2,7 @@ TOOLDIR ?= /opt
 
 RISCV_TOOLCHAIN_PATH ?= $(TOOLDIR)/riscv-gnu-toolchain
 VX_CFLAGS += -march=rv32im_zfinx -mabi=ilp32
-STARTUP_ADDR ?= 0x80000000
+STARTUP_ADDR ?= 0x10000000
 
 RISCV_PREFIX ?= riscv32-unknown-elf
 RISCV_SYSROOT ?= $(RISCV_TOOLCHAIN_PATH)/$(RISCV_PREFIX)

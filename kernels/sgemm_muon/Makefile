@@ -1,6 +1,6 @@
 PROJECT = sgemm_muon
 
-VX_SRCS = gemm.c
+VX_SRCS = simple.c
 
 OPTS ?= -n16
 
