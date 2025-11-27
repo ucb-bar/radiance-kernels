@@ -43,7 +43,7 @@ VX_CFLAGS += -DNDEBUG -DLLVM_VORTEX
 
 MU_CFLAGS := $(VX_CFLAGS)
 
-VX_LDFLAGS += -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/linker/vx_link32.ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR)
+VX_LDFLAGS += -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/linker/vx_link32.ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR),-z,norelro
 MU_LDFLAGS := -fuse-ld=lld $(VX_LDFLAGS)
 VX_LDFLAGS += $(VORTEX_KN_PATH)/libvortexrt.a
 MU_LDFLAGS += $(VORTEX_KN_PATH)/libmuonrt.a $(VORTEX_KN_PATH)/tohost.S
