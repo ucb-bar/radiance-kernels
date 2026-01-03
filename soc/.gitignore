@@ -1,3 +1,4 @@
 fused.elf
 muon.elf
 *.o
+/tmp/

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+set -x
+
 SCRIPT_PATH=$(cd "$(dirname "$0")" && pwd)
 LLVM_BASE=$(realpath "${SCRIPT_PATH}/../llvm")
 
