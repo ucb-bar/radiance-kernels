@@ -22,9 +22,10 @@
 _start:  
 
   # initialize per-thread registers
-  csrr  t0, VX_CSR_NUM_WARPS  # get num warps
-  la    t1, init_regs_all
-  .insn r RISCV_CUSTOM0, 1, 0, x0, t0, t1  # wspawn t0, t1
+  # TODO: re-enable
+  # csrr  t0, VX_CSR_NUM_WARPS  # get num warps
+  # la    t1, init_regs_all
+  # .insn r RISCV_CUSTOM0, 1, 0, x0, t0, t1  # wspawn t0, t1
   li    t0, -1
   .insn r RISCV_CUSTOM0, 0, 0, x0, t0, x0  # tmc t0
   jal   init_regs
@@ -32,49 +33,33 @@ _start:
   .insn r RISCV_CUSTOM0, 0, 0, x0, t0, x0  # tmc t0
 
   # wait for spawn warps to terminate
-  jal vx_wspawn_wait
+  # jal vx_wspawn_wait
 
-  # initialize TLS for all warps
-  csrr  t0, VX_CSR_NUM_WARPS  # get num warps
-  la    t1, init_tls_all
-  .insn r RISCV_CUSTOM0, 1, 0, x0, t0, t1  # wspawn t0, t1
-  li    t0, -1
-  .insn r RISCV_CUSTOM0, 0, 0, x0, t0, x0  # tmc t0
-  call  __init_tls
-  li    t0, 1
-  .insn r RISCV_CUSTOM0, 0, 0, x0, t0, x0  # tmc t0
-
-  # wait for spawn warps to terminate
-  jal vx_wspawn_wait
-  
   # clear BSS segment
-  la    a0, _edata
-  la    a2, _end
-  sub   a2, a2, a0
-  li    a1, 0
-  call  memset
-
-  # initialize trap vector
-  # la t0, trap_entry
-  # csrw mtvec, t0
+  # TODO: re-enable for global/statics
+  # la    a0, _edata
+  # la    a2, _end
+  # sub   a2, a2, a0
+  # li    a1, 0
+  # call  memset
 
   # run global initialization functions
-  call  __libc_init_array  
+  # TODO: re-enable with libc
+  # call  __libc_init_array
 
   # call main program routine
-  call  main
+  call main
 
   # call exit routine
-  tail  exit
+  # TODO: re-enable with libc
+  # tail  exit
+  tail _exit
 .size _start, .-_start
 
 .section .text
 .type _exit, @function
 .global _exit
 _exit:
-  # mv    s0, a0
-  # call  vx_perf_dump 
-  # mv    gp, s0
   .insn r RISCV_CUSTOM0, 0, 0, x0, x0, x0  # tmc x0
 
 .section .text
@@ -121,16 +106,6 @@ init_regs_all:
   jal   init_regs
   .insn r RISCV_CUSTOM0, 0, 0, x0, x0, x0  # tmc x0
   ret  
-
-.section .text
-.type init_tls_all, @function
-.local init_tls_all
-init_tls_all:
-  li    t0, -1
-  .insn r RISCV_CUSTOM0, 0, 0, x0, t0, x0  # tmc t0
-  call  __init_tls
-  .insn r RISCV_CUSTOM0, 0, 0, x0, x0, x0  # tmc x0
-  ret 
 
 .section .text
 .type vx_wspawn_wait, @function
