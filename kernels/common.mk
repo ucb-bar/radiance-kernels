@@ -44,7 +44,7 @@ VX_CFLAGS += -DNDEBUG -DLLVM_VORTEX
 MU_CFLAGS := $(VX_CFLAGS)
 
 VX_LDFLAGS += -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/linker/vx_link32.ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR),-z,norelro
-MU_LDFLAGS := -fuse-ld=lld $(VX_LDFLAGS)
+MU_LDFLAGS += -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/../muon-isa-tests/env/link.ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR),-z,norelro -fuse-ld=lld
 VX_LDFLAGS += $(VORTEX_KN_PATH)/libvortexrt.a
 MU_LDFLAGS += $(VORTEX_KN_PATH)/libmuonrt.a $(VORTEX_KN_PATH)/tohost.S
 
@@ -64,7 +64,8 @@ kernel.radiance$(CONFIGEXT).dump: kernel.radiance$(CONFIGEXT).elf
 endif
 
 OBJCOPY_FLAGS ?= "LOAD,ALLOC,DATA,CONTENTS"
-BINFILES ?=  args.bin input.a.bin input.b.bin input.c.bin
+# BINFILES ?=  args.bin input.a.bin input.b.bin input.c.bin
+BINFILES ?=
 
 # kernel.vortex.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
 # 	$(VX_CXX) $(VX_CFLAGS) $(VX_SRCS) $(VX_LDFLAGS) -DRADIANCE -o $@
