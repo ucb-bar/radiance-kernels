@@ -2,7 +2,7 @@ TOOLDIR ?= /opt
 
 RISCV_TOOLCHAIN_PATH ?= $(TOOLDIR)/riscv-gnu-toolchain
 VX_CFLAGS += -march=rv32im_zfinx -mabi=ilp32
-STARTUP_ADDR ?= 0x10000000
+STARTUP_ADDR ?= 0x80000000
 
 RISCV_PREFIX ?= riscv32-unknown-elf
 RISCV_SYSROOT ?= $(RISCV_TOOLCHAIN_PATH)/$(RISCV_PREFIX)
@@ -44,14 +44,14 @@ VX_CFLAGS += -DNDEBUG -DLLVM_VORTEX
 MU_CFLAGS := $(VX_CFLAGS)
 
 VX_LDFLAGS += -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/linker/vx_link32.ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR),-z,norelro
-MU_LDFLAGS += -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/../muon-isa-tests/env/link.ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR),-z,norelro -fuse-ld=lld
+MU_LDFLAGS += -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/../muon-isa-tests/env/link.ld,-z,norelro -fuse-ld=lld
 VX_LDFLAGS += $(VORTEX_KN_PATH)/libvortexrt.a
 MU_LDFLAGS += $(VORTEX_KN_PATH)/libmuonrt.a $(VORTEX_KN_PATH)/tohost.S
 
 # CONFIG is supplied from the command line to differentiate ELF files with custom suffixes
 CONFIGEXT = $(if $(CONFIG),.$(CONFIG),)
 
-all: kernel.radiance.dump kernel.radiance$(CONFIGEXT).dump # kernel.vortex.dump
+all: kernel.radiance.dump kernel.radiance$(CONFIGEXT).dump kernel.vortex.dump
 
 kernel.vortex.dump: kernel.vortex.elf
 	$(VX_DP) -D kernel.vortex.elf > kernel.vortex.dump
@@ -67,15 +67,15 @@ OBJCOPY_FLAGS ?= "LOAD,ALLOC,DATA,CONTENTS"
 # BINFILES ?=  args.bin input.a.bin input.b.bin input.c.bin
 BINFILES ?=
 
-# kernel.vortex.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
-# 	$(VX_CXX) $(VX_CFLAGS) $(VX_SRCS) $(VX_LDFLAGS) -DRADIANCE -o $@
-# 
-# 	@for bin in $(BINFILES); do \
-# 		sec=$$(echo $$bin | sed 's/\.bin$$//'); \
-# 		echo "-$(VX_CP) --update-section .$$sec=$$bin $@"; \
-# 		$(VX_CP) --set-section-flags .input.a=$(OBJCOPY_FLAGS) $@; \
-# 		$(VX_CP) --update-section .$$sec=$$bin $@ || true; \
-# 	done
+kernel.vortex.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
+	$(VX_CXX) $(VX_CFLAGS) $(VX_SRCS) $(VX_LDFLAGS) -DRADIANCE -o $@
+
+	@for bin in $(BINFILES); do \
+		sec=$$(echo $$bin | sed 's/\.bin$$//'); \
+		echo "-$(VX_CP) --update-section .$$sec=$$bin $@"; \
+		$(VX_CP) --set-section-flags .input.a=$(OBJCOPY_FLAGS) $@; \
+		$(VX_CP) --update-section .$$sec=$$bin $@ || true; \
+	done
 
 kernel.radiance.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
 	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) -DRADIANCE -S

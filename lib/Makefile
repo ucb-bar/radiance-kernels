@@ -55,7 +55,7 @@ VX_CFLAGS += -DNDEBUG -DLLVM_VORTEX
 
 MU_CFLAGS := $(VX_CFLAGS)
 
-PROJECT = libmuonrt
+PROJECT = libmuonrt libvortexrt
 
 VX_SRCS = ./src/vx_start.S ./src/vx_syscalls.c ./src/tinyprintf.c ./src/vx_spawn.c
 MU_SRCS = ./src/mu_start.S ./src/vx_syscalls.c ./src/vx_spawn.c
@@ -63,10 +63,13 @@ MU_SRCS = ./src/mu_start.S ./src/vx_syscalls.c ./src/vx_spawn.c
 VX_OBJS := $(addsuffix .o, $(notdir $(VX_SRCS)))
 MU_OBJS := $(addsuffix .o, $(notdir $(MU_SRCS)))
 
-all: $(PROJECT).a $(PROJECT).dump
+VX_TARGET := $(addsuffix .dump, $(PROJECT))
+MU_TARGET := $(addsuffix .dump, $(PROJECT))
 
-$(PROJECT).dump: $(PROJECT).a
-	$(MU_DP) -D $(PROJECT).a > $(PROJECT).dump
+all: $(MU_TARGET) $(VX_TARGET)
+
+%.dump: %.a
+	$(MU_DP) -D $< > $@
 
 %.S.o: src/%.S
 	$(MU_CC) $(MU_CFLAGS) -c $< -o $@
