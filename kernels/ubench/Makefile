@@ -1,3 +1,5 @@
-VX_SRCS = kernel.cpp
+PROJECT = flops
+
+VX_SRCS = flops.cpp
 
 include ../common.mk

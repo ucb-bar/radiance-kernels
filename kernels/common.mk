@@ -51,23 +51,27 @@ MU_LDFLAGS += $(VORTEX_KN_PATH)/libmuonrt.a $(VORTEX_KN_PATH)/tohost.S
 # CONFIG is supplied from the command line to differentiate ELF files with custom suffixes
 CONFIGEXT = $(if $(CONFIG),.$(CONFIG),)
 
-all: kernel.radiance.dump kernel.radiance$(CONFIGEXT).dump kernel.vortex.dump
+PROJECT ?= kernel
+BINARIES := $(addsuffix .vortex.elf,$(PROJECT)) $(addsuffix .radiance.elf,$(PROJECT))
+OBJDUMPS := $(addsuffix .vortex.dump,$(PROJECT)) $(addsuffix .radiance.dump,$(PROJECT))
 
-kernel.vortex.dump: kernel.vortex.elf
-	$(VX_DP) -D kernel.vortex.elf > kernel.vortex.dump
-kernel.radiance.dump: kernel.radiance.elf
-	$(MU_DP) -D kernel.radiance.elf > kernel.radiance.dump
+all: $(BINARIES) $(OBJDUMPS)
+
+%.vortex.dump: %.vortex.elf
+	$(VX_DP) -D $< > $@
+%.radiance.dump: %.radiance.elf
+	$(MU_DP) -D $< > $@
 
 ifneq ($(CONFIG),)
-kernel.radiance$(CONFIGEXT).dump: kernel.radiance$(CONFIGEXT).elf
-	$(MU_DP) -D kernel.radiance$(CONFIGEXT).elf > kernel.radiance$(CONFIGEXT).dump
+%.radiance$(CONFIGEXT).dump: %.radiance$(CONFIGEXT).elf
+	$(MU_DP) -D %.radiance$(CONFIGEXT).elf > $@
 endif
 
 OBJCOPY_FLAGS ?= "LOAD,ALLOC,DATA,CONTENTS"
 # BINFILES ?=  args.bin input.a.bin input.b.bin input.c.bin
 BINFILES ?=
 
-kernel.vortex.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
+%.vortex.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
 	$(VX_CXX) $(VX_CFLAGS) $(VX_SRCS) $(VX_LDFLAGS) -DRADIANCE -o $@
 
 	@for bin in $(BINFILES); do \
@@ -77,7 +81,7 @@ kernel.vortex.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
 		$(VX_CP) --update-section .$$sec=$$bin $@ || true; \
 	done
 
-kernel.radiance.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
+%.radiance.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
 	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) -DRADIANCE -S
 	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) -DRADIANCE -c
 	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) $(MU_LDFLAGS) -DRADIANCE -o $@
@@ -89,14 +93,15 @@ kernel.radiance.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
 	done
 
 ifneq ($(CONFIG),)
-kernel.radiance$(CONFIGEXT).elf: kernel.radiance.elf
+%.radiance$(CONFIGEXT).elf: %.radiance.elf
 	cp $< $@
 endif
 
 clean:
 	rm -rf *.o
-	rm -rf *.elf
-	rm -rf *.dump
+	rm -rf $(BINARIES) $(OBJDUMPS)
 
 clean-all: clean
-	rm -rf kernel*.elf kernel*.dump
+	rm -rf *.o
+	rm -rf *.elf
+	rm -rf *.dump
