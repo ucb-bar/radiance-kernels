@@ -27,9 +27,10 @@ inline T sum() {
 }
 
 int main() {
-  vx_tmc(vx_num_threads());
+  vx_tmc((1u << vx_num_threads()) - 1);
+  // vx_tmc(1);
 
-  sum<int32_t>();
+  sum<float>();
 
   vx_tmc(1);
 
