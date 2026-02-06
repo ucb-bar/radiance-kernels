@@ -7,18 +7,35 @@ CC="${CC:-${CROSS64}-gcc}"
 LD="${LD:-${CROSS64}-ld}"
 OBJCOPY="${OBJCOPY:-${CROSS64}-objcopy}"
 READELF="${READELF:-readelf}"
+RV64_CFLAGS="${RV64_CFLAGS--march=rv64gc -mabi=lp64 -ffreestanding -nostdlib -mcmodel=medany}"
 
 # inputs/outputs
 RV32_ELF="${RV32_ELF:-muon.elf}"     # your rv32 payload
 OUT="${OUT:-fused.elf}"              # final fused rv64 elf
 ENTRY_SYM="${ENTRY_SYM:-_start}"
+RV64_START="${RV64_START-start.S}"
+RV64_MAIN="${RV64_MAIN-main.c}"
+RV64_OBJS="${RV64_OBJS-}"
+RV64_LIBS="${RV64_LIBS-}"
+RV64_LDFLAGS="${RV64_LDFLAGS-}"
+RV64_LINK="${RV64_LINK-${LD}}"
 OFFSET_HEX=0x100000000               # +1_0000_0000
 
 [[ -f "${RV32_ELF}" ]] || { echo "error: ${RV32_ELF} not found"; exit 1; }
 
-# 1) build tiny rv64 carrier (compile as rv64; no libs; medany to avoid reloc truncation)
-${CC} -march=rv64gc -mabi=lp64 -ffreestanding -nostdlib -mcmodel=medany -c start.S -o start.o
-${CC} -march=rv64gc -mabi=lp64 -ffreestanding -nostdlib -mcmodel=medany -c main.c  -o main.o
+# 1) build rv64 carrier (compile as rv64; no libs; medany to avoid reloc truncation)
+[[ -f "${RV64_START}" ]] || { echo "error: ${RV64_START} not found"; exit 1; }
+${CC} ${RV64_CFLAGS} -c "${RV64_START}" -o start.o
+RV64_EXTRA_OBJS=()
+if [[ -n "${RV64_MAIN}" ]]; then
+  [[ -f "${RV64_MAIN}" ]] || { echo "error: ${RV64_MAIN} not found"; exit 1; }
+  ${CC} ${RV64_CFLAGS} -c "${RV64_MAIN}" -o main.o
+  RV64_EXTRA_OBJS+=(main.o)
+fi
+if [[ -n "${RV64_OBJS}" ]]; then
+  read -r -a EXTRA_OBJS_ARR <<<"${RV64_OBJS}"
+  RV64_EXTRA_OBJS+=("${EXTRA_OBJS_ARR[@]}")
+fi
 
 # 2) read RV32 PT_LOADs
 mapfile -t LOADS < <(
@@ -109,8 +126,15 @@ SECTIONS
     *(COMMON)
   } :data
 
+  /* heap symbols expected by htif/newlib */
+  _end = .;
+  __heap_end = .;
+
   /* mirrored rv32 segments as raw bytes */
 $(printf "%s\n" "${SEG_SECTIONS[@]}")
+
+  /* alias to the mirrored rv32 tohost region */
+  PROVIDE(tocpu = 0x100010000);
 
   __rv32_min  = 0x110000000;
   __rv32_max  = .;
@@ -119,9 +143,8 @@ $(printf "%s\n" "${SEG_SECTIONS[@]}")
 EOF
 
 # 5) final link: rv64 objs + binary segment objs
-${LD} -o "${OUT}" -T "${LD_SCRIPT}" start.o main.o "${SEG_OBJS[@]}"
+${RV64_LINK} -o "${OUT}" -T "${LD_SCRIPT}" ${RV64_LDFLAGS} start.o "${RV64_EXTRA_OBJS[@]}" "${SEG_OBJS[@]}" ${RV64_LIBS}
 
 echo "wrote ${OUT}"
 echo "verify:"
 echo "  readelf -lW ${OUT}"
-

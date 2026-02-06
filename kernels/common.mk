@@ -6,9 +6,12 @@ STARTUP_ADDR ?= 0x80000000
 
 RISCV_PREFIX ?= riscv32-unknown-elf
 RISCV_SYSROOT ?= $(RISCV_TOOLCHAIN_PATH)/$(RISCV_PREFIX)
+RISCV64_PREFIX ?= riscv64-unknown-elf
+RISCV64_TOOLCHAIN_PATH ?= $(RISCV)
 
 VORTEX_KN_PATH ?= $(realpath ../../lib)
 GEMMINI_SW_PATH ?= $(realpath ../../lib/gemmini)
+SOC_DIR ?= $(realpath ../../soc)
 
 LLVM_VORTEX ?= $(TOOLDIR)/llvm-vortex
 
@@ -35,6 +38,16 @@ MU_CXX = $(LLVM_MUON)/bin/clang++ $(LLVM_CFLAGS)
 MU_DP  = $(LLVM_MUON)/bin/llvm-objdump 
 MU_CP  = $(LLVM_MUON)/bin/llvm-objcopy
 
+CPU_TOOLCHAIN_PREFIX ?= $(RISCV64_TOOLCHAIN_PATH)/bin/$(RISCV64_PREFIX)
+CPU_CC ?= $(CPU_TOOLCHAIN_PREFIX)-gcc
+CPU_CXX ?= $(CPU_TOOLCHAIN_PREFIX)-g++
+CPU_AS ?= $(CPU_TOOLCHAIN_PREFIX)-as
+CPU_LD ?= $(CPU_TOOLCHAIN_PREFIX)-ld
+CPU_LINK ?= $(CPU_CC)
+CPU_DP ?= $(CPU_TOOLCHAIN_PREFIX)-objdump
+CPU_OBJCOPY ?= $(CPU_TOOLCHAIN_PREFIX)-objcopy
+CPU_READELF ?= readelf
+
 VX_CFLAGS += -v -O3 -std=c++17
 VX_CFLAGS += -mcmodel=medany -fno-rtti -fno-exceptions -fdata-sections -ffunction-sections
 VX_CFLAGS += -mllvm -inline-threshold=262144
@@ -48,12 +61,24 @@ MU_LDFLAGS += -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/../muon-isa-tests/
 VX_LDFLAGS += $(VORTEX_KN_PATH)/libvortexrt.a
 MU_LDFLAGS += $(VORTEX_KN_PATH)/libmuonrt.a $(VORTEX_KN_PATH)/tohost.S
 
+CPU_CFLAGS ?= -march=rv64imafd -mabi=lp64d -mcmodel=medany -ffreestanding -fno-common -fno-builtin-printf
+CPU_CXXFLAGS ?= $(CPU_CFLAGS)
+CPU_LDFLAGS ?= -static -specs=htif_nano.specs
+CPU_LIBS ?=
+
 # CONFIG is supplied from the command line to differentiate ELF files with custom suffixes
 CONFIGEXT = $(if $(CONFIG),.$(CONFIG),)
 
 PROJECT ?= kernel
-BINARIES := $(addsuffix .vortex.elf,$(PROJECT)) $(addsuffix .radiance.elf,$(PROJECT))
-OBJDUMPS := $(addsuffix .vortex.dump,$(PROJECT)) $(addsuffix .radiance.dump,$(PROJECT))
+# BINARIES := $(addsuffix .vortex.elf,$(PROJECT)) $(addsuffix .radiance.elf,$(PROJECT))
+# OBJDUMPS := $(addsuffix .vortex.dump,$(PROJECT)) $(addsuffix .radiance.dump,$(PROJECT))
+BINARIES := $(addsuffix .radiance.elf,$(PROJECT))
+OBJDUMPS := $(addsuffix .radiance.dump,$(PROJECT))
+
+ifneq ($(strip $(CPU_SRCS)),)
+BINARIES += $(addsuffix .soc.elf,$(PROJECT))
+OBJDUMPS += $(addsuffix .soc.dump,$(PROJECT))
+endif
 
 all: $(BINARIES) $(OBJDUMPS)
 
@@ -61,6 +86,8 @@ all: $(BINARIES) $(OBJDUMPS)
 	$(VX_DP) -D $< > $@
 %.radiance.dump: %.radiance.elf
 	$(MU_DP) -D $< > $@
+%.soc.dump: %.soc.elf
+	$(CPU_DP) -D $< > $@
 
 ifneq ($(CONFIG),)
 %.radiance$(CONFIGEXT).dump: %.radiance$(CONFIGEXT).elf
@@ -71,8 +98,8 @@ OBJCOPY_FLAGS ?= "LOAD,ALLOC,DATA,CONTENTS"
 # BINFILES ?=  args.bin input.a.bin input.b.bin input.c.bin
 BINFILES ?=
 
-%.vortex.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
-	$(VX_CXX) $(VX_CFLAGS) $(VX_SRCS) $(VX_LDFLAGS) -DRADIANCE -o $@
+%.vortex.elf: $(MU_SRCS) $(VX_INCLUDES) $(BINFILES)
+	$(VX_CXX) $(VX_CFLAGS) $(MU_SRCS) $(VX_LDFLAGS) -DRADIANCE -o $@
 
 	@for bin in $(BINFILES); do \
 		sec=$$(echo $$bin | sed 's/\.bin$$//'); \
@@ -81,10 +108,10 @@ BINFILES ?=
 		$(VX_CP) --update-section .$$sec=$$bin $@ || true; \
 	done
 
-%.radiance.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
-	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) -DRADIANCE -S
-	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) -DRADIANCE -c
-	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) $(MU_LDFLAGS) -DRADIANCE -o $@
+%.radiance.elf: $(MU_SRCS) $(VX_INCLUDES) $(BINFILES)
+	$(MU_CXX) $(MU_CFLAGS) $(MU_SRCS) -DRADIANCE -S
+	$(MU_CXX) $(MU_CFLAGS) $(MU_SRCS) -DRADIANCE -c
+	$(MU_CXX) $(MU_CFLAGS) $(MU_SRCS) $(MU_LDFLAGS) -DRADIANCE -o $@
 	@for bin in $(BINFILES); do \
 		sec=$$(echo $$bin | sed 's/\.bin$$//'); \
 		echo "-$(MU_CP) --update-section .$$sec=$$bin $@"; \
@@ -97,8 +124,32 @@ ifneq ($(CONFIG),)
 	cp $< $@
 endif
 
+ifneq ($(strip $(CPU_SRCS)),)
+CPU_OBJS := $(addsuffix .cpu.o,$(basename $(CPU_SRCS)))
+
+%.cpu.o: %.c
+	$(CPU_CC) $(CPU_CFLAGS) -c $< -o $@
+%.cpu.o: %.cc
+	$(CPU_CXX) $(CPU_CXXFLAGS) -c $< -o $@
+%.cpu.o: %.cpp
+	$(CPU_CXX) $(CPU_CXXFLAGS) -c $< -o $@
+%.cpu.o: %.S
+	$(CPU_CC) $(CPU_CFLAGS) -c $< -o $@
+%.cpu.o: %.s
+	$(CPU_CC) $(CPU_CFLAGS) -c $< -o $@
+
+%.soc.elf: %.radiance.elf $(CPU_OBJS) $(SOC_DIR)/fuse_rv32_into_rv64.sh $(SOC_DIR)/start.S
+	RV32_ELF="$<" OUT="$@" \
+	RV64_START="$(SOC_DIR)/start.S" RV64_MAIN= \
+	RV64_OBJS="$(CPU_OBJS)" RV64_CFLAGS="$(CPU_CFLAGS)" \
+	RV64_LDFLAGS="$(CPU_LDFLAGS)" RV64_LIBS="$(CPU_LIBS)" \
+	CC="$(CPU_CC)" LD="$(CPU_LD)" RV64_LINK="$(CPU_LINK)" OBJCOPY="$(CPU_OBJCOPY)" READELF="$(CPU_READELF)" \
+	$(SOC_DIR)/fuse_rv32_into_rv64.sh
+endif
+
 clean:
 	rm -rf *.o
+	rm -rf *.cpu.o
 	rm -rf $(BINARIES) $(OBJDUMPS)
 
 clean-all: clean

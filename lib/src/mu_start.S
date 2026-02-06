@@ -11,10 +11,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <VX_config.h>
-#include <VX_types.h>
+// #include <VX_config.h>
+// #include <VX_types.h>
 
 #define RISCV_CUSTOM0   0x0B
+
+#define STACK_BASE_ADDR 0x7F000000
+#define STACK_LOG2_SIZE 13
+#define CSR_WMASK 0xCC3
 
 .section .init, "ax"
 .global _start
@@ -27,10 +31,11 @@ _start:
   # la    t1, init_regs_all
   # .insn r RISCV_CUSTOM0, 1, 0, x0, t0, t1  # wspawn t0, t1
   li    t0, -1
-  .insn r RISCV_CUSTOM0, 0, 0, x0, t0, x0  # tmc t0
+  vx_tmc t0
   jal   init_regs
   li    t0, 1
-  .insn r RISCV_CUSTOM0, 0, 0, x0, t0, x0  # tmc t0
+  vx_tmc t0
+#   .insn r RISCV_CUSTOM0, 0, 0, x0, t0, x0  # tmc t0
 
   # wait for spawn warps to terminate
   # jal vx_wspawn_wait
@@ -73,15 +78,8 @@ init_regs:
   .option pop
   
   # set stack pointer register
-#if (XLEN == 64)
-  li    t0, (STACK_BASE_ADDR >> 32)
-  slli  t0, t0, 32
-  li    sp, (STACK_BASE_ADDR & 0xffffffff)
-  or    sp, sp, t0
-#else
   li    sp, STACK_BASE_ADDR # load stack base address
-#endif
-  csrr  t0, VX_CSR_MHARTID
+  csrr  t0, mhartid
   sll   t1, t0, STACK_LOG2_SIZE
   sll   t2, t0, 4
   add   t1, t1, t2
@@ -111,7 +109,7 @@ init_regs_all:
 .type vx_wspawn_wait, @function
 .global vx_wspawn_wait
 vx_wspawn_wait:
-  csrr  t0, VX_CSR_WARP_MASK
+  csrr  t0, CSR_WMASK
   li    t1, 1
   bne   t0, t1, vx_wspawn_wait
   ret
