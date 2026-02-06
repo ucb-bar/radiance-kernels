@@ -8,7 +8,6 @@
 namespace {
 constexpr uint32_t kDefaultIterations = 64;
 constexpr uint32_t kSharedSize = 256;
-__shared__ volatile uint32_t shared_data[kSharedSize];
 }
 
 void kernel_body(int task_id, kernel_arg_t* __UNIFORM__ arg) {
@@ -21,11 +20,11 @@ void kernel_body(int task_id, kernel_arg_t* __UNIFORM__ arg) {
       memstress::resolve_iterations(arg, kDefaultIterations);
   const uint32_t lane = static_cast<uint32_t>(vx_thread_id());
   const uint32_t idx = lane % kSharedSize;
+  auto* shared_data = reinterpret_cast<volatile uint32_t*>(vx_shared_ptr(0));
 
   uint32_t acc = lane + 9;
   for (uint32_t iter = 0; iter < iterations; ++iter) {
     shared_data[idx] = acc + iter;
-    vx_barrier(0, vx_num_warps());
     acc ^= shared_data[idx];
   }
 

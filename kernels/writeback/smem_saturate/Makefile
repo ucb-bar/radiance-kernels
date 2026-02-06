@@ -2,7 +2,7 @@ PROJECT = writeback_smem_saturate
 
 VX_SRCS = kernel.cpp
 
-BINFILES :=
+BINFILES := args.bin
 
 OPTS ?= -n64
 

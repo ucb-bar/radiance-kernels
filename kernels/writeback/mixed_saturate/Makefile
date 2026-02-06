@@ -2,7 +2,7 @@ PROJECT = writeback_mixed_saturate
 
 VX_SRCS = kernel.cpp
 
-BINFILES :=
+BINFILES := args.bin
 
 OPTS ?= -n64
 
