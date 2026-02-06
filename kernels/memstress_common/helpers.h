@@ -6,9 +6,9 @@
 
 namespace memstress {
 
-constexpr uint64_t kDefaultSrcBase = 0x90000000UL;
-constexpr uint64_t kDefaultDstBase = 0x91000000UL;
-constexpr uint64_t kDefaultAuxBase = 0x92000000UL;
+constexpr uint64_t kDefaultSrcBase = 0x80004000UL;
+constexpr uint64_t kDefaultDstBase = 0x80004100UL;
+constexpr uint64_t kDefaultAuxBase = 0x80004200UL;
 constexpr uint32_t kDefaultLanesPerWarp = 16;
 constexpr uint32_t kDefaultWarpsPerCore = 4;
 
