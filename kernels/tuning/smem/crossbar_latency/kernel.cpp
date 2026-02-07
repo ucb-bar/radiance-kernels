@@ -20,7 +20,7 @@ int main() {
   kernel_arg_t* arg = tune::args();
   const uint32_t iterations = tune::iterations(arg, kDefaultIterations);
   volatile uint32_t* shared_words =
-      reinterpret_cast<volatile uint32_t*>(vx_shared_ptr(0));
+      reinterpret_cast<volatile uint32_t*>(DEV_SMEM_START_ADDR);
 
   const uint32_t lane = static_cast<uint32_t>(vx_thread_id());
   shared_words[lane] = lane ^ 0x5Au;

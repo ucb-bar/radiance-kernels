@@ -21,7 +21,8 @@ void kernel_body(int task_id, kernel_arg_t* __UNIFORM__ arg) {
   const uint32_t lane = static_cast<uint32_t>(vx_thread_id());
   const uint32_t warp = static_cast<uint32_t>(vx_warp_id());
   const uint32_t idx = ((warp << 4) + lane) % kSharedSize;
-  auto* shared_data = reinterpret_cast<volatile uint32_t*>(vx_shared_ptr(0));
+  volatile uint32_t* shared_data =
+      reinterpret_cast<volatile uint32_t*>(DEV_SMEM_START_ADDR);
 
   // one initialization write, then repeated reads to stress shared LDQ
   shared_data[idx] = lane + 7;

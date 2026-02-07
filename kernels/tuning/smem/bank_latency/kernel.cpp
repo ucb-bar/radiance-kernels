@@ -26,7 +26,7 @@ int main() {
   kernel_arg_t* arg = tune::args();
   const uint32_t iterations = tune::iterations(arg, kDefaultIterations);
   volatile uint32_t* shared_words =
-      reinterpret_cast<volatile uint32_t*>(vx_shared_ptr(0));
+      reinterpret_cast<volatile uint32_t*>(DEV_SMEM_START_ADDR);
 
   shared_words[0] = 0x2468ACE1u;
 

@@ -22,7 +22,8 @@ void kernel_body(int task_id, kernel_arg_t* __UNIFORM__ arg) {
   volatile uint32_t* dst = memstress::dst_ptr(arg);
   const uint32_t lane = static_cast<uint32_t>(vx_thread_id());
   const uint32_t idx = lane % kSharedSize;
-  auto* shared_data = reinterpret_cast<volatile uint32_t*>(vx_shared_ptr(0));
+  volatile uint32_t* shared_data =
+      reinterpret_cast<volatile uint32_t*>(DEV_SMEM_START_ADDR);
 
   uint32_t acc = lane + 13;
   for (uint32_t iter = 0; iter < iterations; ++iter) {

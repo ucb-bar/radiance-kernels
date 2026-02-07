@@ -6,9 +6,12 @@ STARTUP_ADDR ?= 0x80000000
 
 RISCV_PREFIX ?= riscv32-unknown-elf
 RISCV_SYSROOT ?= $(RISCV_TOOLCHAIN_PATH)/$(RISCV_PREFIX)
+RISCV64_PREFIX ?= riscv64-unknown-elf
+RISCV64_TOOLCHAIN_PATH ?= $(RISCV)
 
 VORTEX_KN_PATH ?= $(realpath ../../lib)
 GEMMINI_SW_PATH ?= $(realpath ../../lib/gemmini)
+SOC_DIR ?= $(realpath ../../soc)
 
 LLVM_VORTEX ?= $(TOOLDIR)/llvm-vortex
 
@@ -35,6 +38,16 @@ MU_CXX = $(LLVM_MUON)/bin/clang++ $(LLVM_CFLAGS)
 MU_DP  = $(LLVM_MUON)/bin/llvm-objdump 
 MU_CP  = $(LLVM_MUON)/bin/llvm-objcopy
 
+CPU_TOOLCHAIN_PREFIX ?= $(RISCV64_TOOLCHAIN_PATH)/bin/$(RISCV64_PREFIX)
+CPU_CC ?= $(CPU_TOOLCHAIN_PREFIX)-gcc
+CPU_CXX ?= $(CPU_TOOLCHAIN_PREFIX)-g++
+CPU_AS ?= $(CPU_TOOLCHAIN_PREFIX)-as
+CPU_LD ?= $(CPU_TOOLCHAIN_PREFIX)-ld
+CPU_LINK ?= $(CPU_CC)
+CPU_DP ?= $(CPU_TOOLCHAIN_PREFIX)-objdump
+CPU_OBJCOPY ?= $(CPU_TOOLCHAIN_PREFIX)-objcopy
+CPU_READELF ?= readelf
+
 VX_CFLAGS += -v -O3 -std=c++17
 VX_CFLAGS += -mcmodel=medany -fno-rtti -fno-exceptions -fdata-sections -ffunction-sections
 VX_CFLAGS += -mllvm -inline-threshold=262144
@@ -43,43 +56,66 @@ VX_CFLAGS += -DNDEBUG -DLLVM_VORTEX
 
 MU_CFLAGS := $(VX_CFLAGS)
 
-VX_LDFLAGS += -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/linker/vx_link32.ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR)
-MU_LDFLAGS := -fuse-ld=lld $(VX_LDFLAGS)
+VX_LDFLAGS += -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/linker/vx_link32.ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR),-z,norelro
+MU_LDFLAGS += -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/linker/vx_link32.ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR),-z,norelro -fuse-ld=lld
 VX_LDFLAGS += $(VORTEX_KN_PATH)/libvortexrt.a
 MU_LDFLAGS += $(VORTEX_KN_PATH)/libmuonrt.a $(VORTEX_KN_PATH)/tohost.S
+
+# Keep both source variable names working while makefiles transition.
+MU_SRCS ?= $(VX_SRCS)
+VX_SRCS ?= $(MU_SRCS)
+
+CPU_CFLAGS ?= -march=rv64imafd -mabi=lp64d -mcmodel=medany -ffreestanding -fno-common -fno-builtin-printf
+CPU_CXXFLAGS ?= $(CPU_CFLAGS)
+CPU_LDFLAGS ?= -static -specs=htif_nano.specs
+CPU_LIBS ?=
 
 # CONFIG is supplied from the command line to differentiate ELF files with custom suffixes
 CONFIGEXT = $(if $(CONFIG),.$(CONFIG),)
 
-all: kernel.radiance.dump kernel.radiance$(CONFIGEXT).dump # kernel.vortex.dump
+PROJECT ?= kernel
+# BINARIES := $(addsuffix .vortex.elf,$(PROJECT)) $(addsuffix .radiance.elf,$(PROJECT))
+# OBJDUMPS := $(addsuffix .vortex.dump,$(PROJECT)) $(addsuffix .radiance.dump,$(PROJECT))
+BINARIES := $(addsuffix .radiance.elf,$(PROJECT))
+OBJDUMPS := $(addsuffix .radiance.dump,$(PROJECT))
 
-kernel.vortex.dump: kernel.vortex.elf
-	$(VX_DP) -D kernel.vortex.elf > kernel.vortex.dump
-kernel.radiance.dump: kernel.radiance.elf
-	$(MU_DP) -D kernel.radiance.elf > kernel.radiance.dump
+ifneq ($(strip $(CPU_SRCS)),)
+BINARIES += $(addsuffix .soc.elf,$(PROJECT))
+OBJDUMPS += $(addsuffix .soc.dump,$(PROJECT))
+endif
+
+all: $(BINARIES) $(OBJDUMPS)
+
+%.vortex.dump: %.vortex.elf
+	$(VX_DP) -D $< > $@
+%.radiance.dump: %.radiance.elf
+	$(MU_DP) -D $< > $@
+%.soc.dump: %.soc.elf
+	$(CPU_DP) -D $< > $@
 
 ifneq ($(CONFIG),)
-kernel.radiance$(CONFIGEXT).dump: kernel.radiance$(CONFIGEXT).elf
-	$(MU_DP) -D kernel.radiance$(CONFIGEXT).elf > kernel.radiance$(CONFIGEXT).dump
+%.radiance$(CONFIGEXT).dump: %.radiance$(CONFIGEXT).elf
+	$(MU_DP) -D %.radiance$(CONFIGEXT).elf > $@
 endif
 
 OBJCOPY_FLAGS ?= "LOAD,ALLOC,DATA,CONTENTS"
-BINFILES ?=  args.bin input.a.bin input.b.bin input.c.bin
+# BINFILES ?=  args.bin input.a.bin input.b.bin input.c.bin
+BINFILES ?=
 
-# kernel.vortex.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
-# 	$(VX_CXX) $(VX_CFLAGS) $(VX_SRCS) $(VX_LDFLAGS) -DRADIANCE -o $@
-# 
-# 	@for bin in $(BINFILES); do \
-# 		sec=$$(echo $$bin | sed 's/\.bin$$//'); \
-# 		echo "-$(VX_CP) --update-section .$$sec=$$bin $@"; \
-# 		$(VX_CP) --set-section-flags .input.a=$(OBJCOPY_FLAGS) $@; \
-# 		$(VX_CP) --update-section .$$sec=$$bin $@ || true; \
-# 	done
+%.vortex.elf: $(MU_SRCS) $(VX_INCLUDES) $(BINFILES)
+	$(VX_CXX) $(VX_CFLAGS) $(MU_SRCS) $(VX_LDFLAGS) -DRADIANCE -o $@
 
-kernel.radiance.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
-	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) -DRADIANCE -S
-	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) -DRADIANCE -c
-	$(MU_CXX) $(MU_CFLAGS) $(VX_SRCS) $(MU_LDFLAGS) -DRADIANCE -o $@
+	@for bin in $(BINFILES); do \
+		sec=$$(echo $$bin | sed 's/\.bin$$//'); \
+		echo "-$(VX_CP) --update-section .$$sec=$$bin $@"; \
+		$(VX_CP) --set-section-flags .input.a=$(OBJCOPY_FLAGS) $@; \
+		$(VX_CP) --update-section .$$sec=$$bin $@ || true; \
+	done
+
+%.radiance.elf: $(MU_SRCS) $(VX_INCLUDES) $(BINFILES)
+	$(MU_CXX) $(MU_CFLAGS) $(MU_SRCS) -DRADIANCE -S
+	$(MU_CXX) $(MU_CFLAGS) $(MU_SRCS) -DRADIANCE -c
+	$(MU_CXX) $(MU_CFLAGS) $(MU_SRCS) $(MU_LDFLAGS) -DRADIANCE -o $@
 	@for bin in $(BINFILES); do \
 		sec=$$(echo $$bin | sed 's/\.bin$$//'); \
 		echo "-$(MU_CP) --update-section .$$sec=$$bin $@"; \
@@ -88,14 +124,39 @@ kernel.radiance.elf: $(VX_SRCS) $(VX_INCLUDES) $(BINFILES)
 	done
 
 ifneq ($(CONFIG),)
-kernel.radiance$(CONFIGEXT).elf: kernel.radiance.elf
+%.radiance$(CONFIGEXT).elf: %.radiance.elf
 	cp $< $@
+endif
+
+ifneq ($(strip $(CPU_SRCS)),)
+CPU_OBJS := $(addsuffix .cpu.o,$(basename $(CPU_SRCS)))
+
+%.cpu.o: %.c
+	$(CPU_CC) $(CPU_CFLAGS) -c $< -o $@
+%.cpu.o: %.cc
+	$(CPU_CXX) $(CPU_CXXFLAGS) -c $< -o $@
+%.cpu.o: %.cpp
+	$(CPU_CXX) $(CPU_CXXFLAGS) -c $< -o $@
+%.cpu.o: %.S
+	$(CPU_CC) $(CPU_CFLAGS) -c $< -o $@
+%.cpu.o: %.s
+	$(CPU_CC) $(CPU_CFLAGS) -c $< -o $@
+
+%.soc.elf: %.radiance.elf $(CPU_OBJS) $(SOC_DIR)/fuse_rv32_into_rv64.sh $(SOC_DIR)/start.S
+	RV32_ELF="$<" OUT="$@" \
+	RV64_START="$(SOC_DIR)/start.S" RV64_MAIN= \
+	RV64_OBJS="$(CPU_OBJS)" RV64_CFLAGS="$(CPU_CFLAGS)" \
+	RV64_LDFLAGS="$(CPU_LDFLAGS)" RV64_LIBS="$(CPU_LIBS)" \
+	CC="$(CPU_CC)" LD="$(CPU_LD)" RV64_LINK="$(CPU_LINK)" OBJCOPY="$(CPU_OBJCOPY)" READELF="$(CPU_READELF)" \
+	$(SOC_DIR)/fuse_rv32_into_rv64.sh
 endif
 
 clean:
 	rm -rf *.o
-	rm -rf *.elf
-	rm -rf *.dump
+	rm -rf *.cpu.o
+	rm -rf $(BINARIES) $(OBJDUMPS)
 
 clean-all: clean
-	rm -rf kernel*.elf kernel*.dump
+	rm -rf *.o
+	rm -rf *.elf
+	rm -rf *.dump

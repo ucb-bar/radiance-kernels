@@ -20,7 +20,8 @@ int main() {
       memstress::resolve_iterations(arg, kDefaultIterations);
   const uint32_t lane = static_cast<uint32_t>(vx_thread_id());
   const uint32_t warp = static_cast<uint32_t>(vx_warp_id());
-  auto* shared_words = reinterpret_cast<volatile uint32_t*>(vx_shared_ptr(0));
+  volatile uint32_t* shared_words =
+      reinterpret_cast<volatile uint32_t*>(DEV_SMEM_START_ADDR);
 
   // Map both warps to the same bank set, but different subbanks:
   // warp 0 -> subbank 0 (idx 0..7), warp 1 -> subbank 1 (idx 8..15).

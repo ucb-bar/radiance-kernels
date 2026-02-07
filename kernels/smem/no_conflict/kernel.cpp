@@ -18,7 +18,8 @@ int main() {
   const uint32_t iterations =
       memstress::resolve_iterations(arg, kDefaultIterations);
   const uint32_t lane = static_cast<uint32_t>(vx_thread_id());
-  auto* shared_words = reinterpret_cast<volatile uint32_t*>(vx_shared_ptr(0));
+  volatile uint32_t* shared_words =
+      reinterpret_cast<volatile uint32_t*>(DEV_SMEM_START_ADDR);
   const uint32_t idx = lane;
 
   uint32_t acc = lane + 1u;

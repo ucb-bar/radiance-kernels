@@ -44,7 +44,7 @@ MU_CXX = $(LLVM_MUON)/bin/clang++ $(LLVM_CFLAGS)
 MU_DP  = $(LLVM_MUON)/bin/llvm-objdump 
 MU_CP  = $(LLVM_MUON)/bin/llvm-objcopy
 
-CFLAGS += -O3 -mcmodel=medany -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections
+CFLAGS += -O3 -mcmodel=medany -fno-exceptions -fdata-sections -ffunction-sections
 CFLAGS += -I./include
 CFLAGS += -DXLEN_$(XLEN)
 
@@ -54,18 +54,22 @@ VX_CFLAGS += -I$(VORTEX_KN_PATH)/include -I$(GEMMINI_SW_PATH)
 VX_CFLAGS += -DNDEBUG -DLLVM_VORTEX
 
 MU_CFLAGS := $(VX_CFLAGS)
-MU_CFLAGS += -fuse-ld=lld
 
-PROJECT = libmuonrt
+PROJECT = libmuonrt libvortexrt
 
-SRCS = ./src/vx_start.S ./src/vx_syscalls.c ./src/tinyprintf.c ./src/vx_spawn.c
+VX_SRCS = ./src/vx_start.S ./src/vx_syscalls.c ./src/tinyprintf.c ./src/vx_spawn.c
+MU_SRCS = ./src/mu_start.S ./src/vx_syscalls.c ./src/vx_spawn.c
 
-OBJS := $(addsuffix .o, $(notdir $(SRCS)))
+VX_OBJS := $(addsuffix .o, $(notdir $(VX_SRCS)))
+MU_OBJS := $(addsuffix .o, $(notdir $(MU_SRCS)))
 
-all: $(PROJECT).a $(PROJECT).dump
+VX_TARGET := $(addsuffix .dump, $(PROJECT))
+MU_TARGET := $(addsuffix .dump, $(PROJECT))
 
-$(PROJECT).dump: $(PROJECT).a
-	$(MU_DP) -D $(PROJECT).a > $(PROJECT).dump
+all: $(MU_TARGET) $(VX_TARGET)
+
+%.dump: %.a
+	$(MU_DP) -D $< > $@
 
 %.S.o: src/%.S
 	$(MU_CC) $(MU_CFLAGS) -c $< -o $@
@@ -76,7 +80,10 @@ $(PROJECT).dump: $(PROJECT).a
 %.c.o: src/%.c include/vx_spawn.h
 	$(MU_CC) $(MU_CFLAGS) -c $< -o $@
 
-$(PROJECT).a: $(OBJS)
+libvortexrt.a: $(VX_OBJS)
+	$(AR) rcs $@ $^
+
+libmuonrt.a: $(MU_OBJS)
 	$(AR) rcs $@ $^
 
 .depend: $(SRCS)
