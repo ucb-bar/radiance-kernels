@@ -24,7 +24,7 @@ int main() {
   uint32_t acc = lane + 1u;
   for (uint32_t iter = 0; iter < iterations; ++iter) {
     // Every lane reads the same shared word each iteration -> full bank conflict
-    acc ^= shared_word[0];
+    acc ^= vx_smem_load_u32(shared_word);
   }
 
   asm volatile("" : "+r"(acc) :: "memory");

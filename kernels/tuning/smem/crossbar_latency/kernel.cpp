@@ -9,6 +9,7 @@
 namespace {
 constexpr uint32_t kDefaultIterations = 256;
 constexpr uint32_t kWarmupIterations = 32;
+constexpr uint32_t kSharedWords = 32;
 }
 
 int main() {
@@ -23,19 +24,21 @@ int main() {
       reinterpret_cast<volatile uint32_t*>(DEV_SMEM_START_ADDR);
 
   const uint32_t lane = static_cast<uint32_t>(vx_thread_id());
-  shared_words[lane] = lane ^ 0x5Au;
+  const uint32_t lane_idx = lane % kSharedWords;
+  vx_smem_store_u32(shared_words + lane_idx, lane ^ 0x5Au);
 
   const uint32_t src_lane = (lanes == 0) ? 0u : ((lane * 3u + 1u) % lanes);
+  const uint32_t src_idx = src_lane % kSharedWords;
 
   uint32_t acc = lane;
   for (uint32_t i = 0; i < kWarmupIterations; ++i) {
-    acc ^= shared_words[src_lane];
+    acc ^= vx_smem_load_u32(shared_words + src_idx);
   }
 
   const uint32_t start = tune_read_cycle();
   for (uint32_t i = 0; i < iterations; ++i) {
     // Each lane reads another lane's slot to exercise routed access
-    acc ^= shared_words[src_lane];
+    acc ^= vx_smem_load_u32(shared_words + src_idx);
   }
   const uint32_t end = tune_read_cycle();
 

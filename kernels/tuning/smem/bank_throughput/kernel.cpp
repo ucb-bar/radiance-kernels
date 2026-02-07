@@ -10,6 +10,7 @@ namespace {
 constexpr uint32_t kDefaultIterations = 1024;
 constexpr uint32_t kWarmupIterations = 64;
 constexpr uint32_t kBytesPerLoad = 4;
+constexpr uint32_t kSharedWords = 32;
 }
 
 /*
@@ -31,17 +32,18 @@ int main() {
       reinterpret_cast<volatile uint32_t*>(DEV_SMEM_START_ADDR);
 
   const uint32_t lane = static_cast<uint32_t>(vx_thread_id());
-  shared_words[lane] = lane + 1u;
+  const uint32_t idx = lane % kSharedWords;
+  vx_smem_store_u32(shared_words + idx, lane + 1u);
 
   uint32_t acc = lane + 7u;
   for (uint32_t i = 0; i < kWarmupIterations; ++i) {
-    acc ^= shared_words[lane];
+    acc ^= vx_smem_load_u32(shared_words + idx);
   }
 
   const uint32_t start = tune_read_cycle();
   for (uint32_t i = 0; i < iterations; ++i) {
     // Each lane repeatedly reads its own slot to maximize throughput
-    acc ^= shared_words[lane];
+    acc ^= vx_smem_load_u32(shared_words + idx);
   }
   const uint32_t end = tune_read_cycle();
 

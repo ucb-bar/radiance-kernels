@@ -27,18 +27,17 @@ int main() {
   const uint32_t iterations = tune::iterations(arg, kDefaultIterations);
   volatile uint32_t* shared_words =
       reinterpret_cast<volatile uint32_t*>(DEV_SMEM_START_ADDR);
-
-  shared_words[0] = 0x2468ACE1u;
+  vx_smem_store_u32(shared_words, 0x2468ACE1u);
 
   uint32_t acc = static_cast<uint32_t>(vx_thread_id()) + 1u;
   for (uint32_t i = 0; i < kWarmupIterations; ++i) {
-    acc ^= shared_words[0];
+    acc ^= vx_smem_load_u32(shared_words);
   }
 
   const uint32_t start = tune_read_cycle();
   for (uint32_t i = 0; i < iterations; ++i) {
     // All lanes load shared_words[0], forcing one bank hot spot
-    acc ^= shared_words[0];
+    acc ^= vx_smem_load_u32(shared_words);
   }
   const uint32_t end = tune_read_cycle();
 

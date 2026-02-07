@@ -32,9 +32,9 @@ int main() {
     // Use warp-role split so load/store can be in flight concurrently:
     // warp 0 issues stores while warp 1 issues loads to the same banks.
     if ((warp & 1u) == 0u) {
-      shared_words[idx] = acc + iter;
+      vx_smem_store_u32(shared_words + idx, acc + iter);
     } else {
-      acc ^= shared_words[idx];
+      acc ^= vx_smem_load_u32(shared_words + idx);
     }
   }
 

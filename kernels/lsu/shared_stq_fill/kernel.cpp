@@ -26,10 +26,10 @@ void kernel_body(int task_id, kernel_arg_t* __UNIFORM__ arg) {
 
   uint32_t acc = lane + 11;
   for (uint32_t iter = 0; iter < iterations; ++iter) {
-    shared_data[idx] = acc + iter;
+    vx_smem_store_u32(shared_data + idx, acc + iter);
   }
   // final read ensures stores remain data-dependent
-  acc ^= shared_data[idx];
+  acc ^= vx_smem_load_u32(shared_data + idx);
 }
 
 int main() {

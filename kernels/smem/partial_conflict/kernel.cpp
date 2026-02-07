@@ -27,7 +27,7 @@ int main() {
 
   uint32_t acc = lane + 1u;
   for (uint32_t iter = 0; iter < iterations; ++iter) {
-    acc ^= shared_words[idx];
+    acc ^= vx_smem_load_u32(shared_words + idx);
   }
 
   asm volatile("" : "+r"(acc) :: "memory");

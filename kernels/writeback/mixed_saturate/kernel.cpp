@@ -29,8 +29,8 @@ void kernel_body(int task_id, kernel_arg_t* __UNIFORM__ arg) {
   for (uint32_t iter = 0; iter < iterations; ++iter) {
     const size_t gidx = static_cast<size_t>(iter) * num_threads + task_id;
     const uint32_t val = src[gidx];
-    shared_data[idx] = val ^ acc;
-    acc ^= shared_data[idx];
+    vx_smem_store_u32(shared_data + idx, val ^ acc);
+    acc ^= vx_smem_load_u32(shared_data + idx);
     dst[gidx] = acc;
   }
   dst[task_id] = acc;

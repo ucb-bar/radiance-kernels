@@ -25,12 +25,12 @@ void kernel_body(int task_id, kernel_arg_t* __UNIFORM__ arg) {
       reinterpret_cast<volatile uint32_t*>(DEV_SMEM_START_ADDR);
 
   // one initialization write, then repeated reads to stress shared LDQ
-  shared_data[idx] = lane + 7;
+  vx_smem_store_u32(shared_data + idx, lane + 7);
   uint32_t acc = 0;
   for (uint32_t iter = 0; iter < iterations; ++iter) {
-    acc ^= shared_data[(idx + iter) % kSharedSize];
+    acc ^= vx_smem_load_u32(shared_data + ((idx + iter) % kSharedSize));
   }
-  shared_data[idx] = acc;
+  vx_smem_store_u32(shared_data + idx, acc);
 }
 
 int main() {

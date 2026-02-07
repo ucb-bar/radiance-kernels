@@ -25,8 +25,8 @@ void kernel_body(int task_id, kernel_arg_t* __UNIFORM__ arg) {
 
   uint32_t acc = lane + 9;
   for (uint32_t iter = 0; iter < iterations; ++iter) {
-    shared_data[idx] = acc + iter;
-    acc ^= shared_data[idx];
+    vx_smem_store_u32(shared_data + idx, acc + iter);
+    acc ^= vx_smem_load_u32(shared_data + idx);
   }
 
   volatile uint32_t* dst = memstress::dst_ptr(arg);
