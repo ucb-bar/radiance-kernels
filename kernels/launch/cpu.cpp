@@ -16,30 +16,20 @@
 extern volatile uint64_t tohost;
 volatile uint64_t *tocpu = (volatile uint64_t *) 0x100010000ULL;
 
-// #define SYNC_GPU() ({ \
-//     uint64_t fromgpu = *tocpu; \
-//     *tocpu = tohost; \
-//     tohost = fromgpu; \
-// })
-
 inline static void SYNC_GPU() {
-    uint64_t old;
-
-    // atomically: old = *tocpu; *tocpu = *tohost;
-    __asm__ __volatile__(
-        "amoswap.d.aqrl %0, %2, (%1)"
-        : "=r"(old)
-        : "r"(tocpu), "r"(tohost)
-        : "memory"
-    );
-
-    tohost = old;
+    volatile uint64_t _fromcpu = *tocpu;
+    if (_fromcpu > 0) {
+        volatile uint64_t _fromhost = tohost;
+        tohost = _fromcpu;
+        *tocpu = _fromhost;
+    }
 }
 
 int main() {
-    *tocpu = 0;
-    printf("reset\n");
+    printf("reset 1\n");
     WRITE_MMIO_32(GPU_RESET, 1);
+    // tohost = 0;
+    *tocpu = tohost;
     printf("wait\n");
     WRITE_MMIO_32(GPU_RESET, 0);
 
@@ -47,13 +37,24 @@ int main() {
     while (!finished) {
         SYNC_GPU();
         finished = READ_MMIO_32(GPU_ALL_FINISHED);
-        uint32_t core0 = READ_MMIO_32(GPU_CORES);
-        uint32_t core1 = READ_MMIO_32(GPU_CORES + 4);
-        uint32_t core2 = READ_MMIO_32(GPU_CORES + 8);
-        uint32_t core3 = READ_MMIO_32(GPU_CORES + 12);
+        // uint32_t core0 = READ_MMIO_32(GPU_CORES);
+        // uint32_t core1 = READ_MMIO_32(GPU_CORES + 4);
+        // uint32_t core2 = READ_MMIO_32(GPU_CORES + 8);
+        // uint32_t core3 = READ_MMIO_32(GPU_CORES + 12);
         // printf("%d %d %d %d\n", core0, core1, core2, core3);
     }
 
-    printf("done!\n");
+    WRITE_MMIO_32(GPU_RESET, 1);
+    printf("reset 2\n"); // reset before print to prevent simulation end
+    // tohost = 0;
+    *tocpu = tohost;
+    printf("wait\n");
+    WRITE_MMIO_32(GPU_RESET, 0);
+
+    finished = 0;
+    while (!finished) {
+        SYNC_GPU();
+        finished = READ_MMIO_32(GPU_ALL_FINISHED);
+    }
     return 0;
 }
