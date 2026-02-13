@@ -39,3 +39,12 @@ MUON_INSTALL_PATH="${LLVM_BASE}/llvm-muon"
 ../build.sh "${CLANG_PATH}" "${MUON_INSTALL_PATH}"
 
 ninja && ninja install
+
+# Copy over C++ headers, __config_site, and __assertion_handler
+# actually trying to use anything that allocates or asserts will probably lead to incomprehensible linker errors, 
+# but header-only functionality should work (tm)
+cd "${SCRIPT_PATH}/../llvm"
+mkdir -p llvm-muon/include/c++
+cp -r llvm-src/libcxx/include llvm-muon/include/c++/v1
+cp "${SCRIPT_PATH}/__config_site" llvm-muon/include/c++/v1
+cp llvm-src/libcxx/vendor/llvm/default_assertion_handler.in llvm-muon/include/c++/v1/__assertion_handler
