@@ -1,1 +1,3 @@
 This kernel aims to verify software implementation of special functions `sin`, `cos`, and `exp`, and to determine their performance running on Muon. We also want to ensure that this works for bf16 / lower-precision variants that will be used in real kernels. 
+
+- sinf/cosf take about 8000 cycles per operation for "normal" inputs. I think zero and super small angles are special cased. looking at llvm-libc, it looks like they are using soft-double for some of the implementation, which is not performant

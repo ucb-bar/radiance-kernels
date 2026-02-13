@@ -32,3 +32,21 @@ with open('sin', 'w') as f:
     for arg in sin_test_vector:
         expected = math.sin(arg)
         f.write(f'{float.hex(arg)},{float.hex(expected)},')
+
+with open('cos', 'w') as f:
+    for arg in sin_test_vector:
+        expected = math.cos(arg)
+        f.write(f'{float.hex(arg)},{float.hex(expected)},')
+
+exp_test_vector = [
+    0.0,
+    1.0,
+    10.0,
+    -1.0,
+    -10.0
+]
+
+with open('exp', 'w') as f:
+    for arg in exp_test_vector:
+        expected = math.exp(arg)
+        f.write(f'{float.hex(arg)},{float.hex(expected)},')
