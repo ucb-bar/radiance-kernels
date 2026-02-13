@@ -1,7 +1,6 @@
 TOOLDIR ?= /opt
 
 RISCV_TOOLCHAIN_PATH ?= $(TOOLDIR)/riscv-gnu-toolchain
-VX_CFLAGS += -march=rv32im_zfinx -mabi=ilp32
 STARTUP_ADDR ?= 0x80000000
 
 RISCV_PREFIX ?= riscv32-unknown-elf
@@ -13,28 +12,10 @@ VORTEX_KN_PATH ?= $(realpath ../../lib)
 GEMMINI_SW_PATH ?= $(realpath ../../lib/gemmini)
 SOC_DIR ?= $(realpath ../../soc)
 
-LLVM_VORTEX ?= $(TOOLDIR)/llvm-vortex
-
 LLVM_MUON ?= $(realpath ../../llvm/llvm-muon)
 
-LLVM_CFLAGS += --sysroot=$(RISCV_SYSROOT)
-LLVM_CFLAGS += --gcc-toolchain=$(RISCV_TOOLCHAIN_PATH) -nodefaultlibs
-LLVM_CFLAGS += -Xclang -target-feature -Xclang +vortex
-
-#LLVM_CFLAGS += -mllvm -vortex-branch-divergence=2
-#LLVM_CFLAGS += -mllvm -print-after-all 
-#LLVM_CFLAGS += -I$(RISCV_SYSROOT)/include/c++/9.2.0/$(RISCV_PREFIX) 
-#LLVM_CFLAGS += -I$(RISCV_SYSROOT)/include/c++/9.2.0
-#LLVM_CFLAGS += -Wl,-L$(RISCV_TOOLCHAIN_PATH)/lib/gcc/$(RISCV_PREFIX)/9.2.0
-#LLVM_CFLAGS += --rtlib=libgcc
-
-VX_CC  = $(LLVM_VORTEX)/bin/clang $(LLVM_CFLAGS)
-VX_CXX = $(LLVM_VORTEX)/bin/clang++ $(LLVM_CFLAGS)
-VX_DP  = $(LLVM_VORTEX)/bin/llvm-objdump 
-VX_CP  = $(RISCV_TOOLCHAIN_PATH)/bin/riscv32-unknown-elf-objcopy
-
-MU_CC  = $(LLVM_MUON)/bin/clang $(LLVM_CFLAGS)
-MU_CXX = $(LLVM_MUON)/bin/clang++ $(LLVM_CFLAGS)
+MU_CC  = $(LLVM_MUON)/bin/clang
+MU_CXX = $(LLVM_MUON)/bin/clang++
 MU_DP  = $(LLVM_MUON)/bin/llvm-objdump 
 MU_CP  = $(LLVM_MUON)/bin/llvm-objcopy
 
@@ -48,18 +29,22 @@ CPU_DP ?= $(CPU_TOOLCHAIN_PREFIX)-objdump
 CPU_OBJCOPY ?= $(CPU_TOOLCHAIN_PREFIX)-objcopy
 CPU_READELF ?= readelf
 
-VX_CFLAGS += -v -O3 -std=c++17
-VX_CFLAGS += -mcmodel=medany -fno-rtti -fno-exceptions -fdata-sections -ffunction-sections
-VX_CFLAGS += -mllvm -inline-threshold=262144
-VX_CFLAGS += -I$(VORTEX_KN_PATH)/include -I$(GEMMINI_SW_PATH)
-VX_CFLAGS += -DNDEBUG -DLLVM_VORTEX
+MU_CFLAGS += --sysroot=$(LLVM_MUON)
+MU_CFLAGS += -Xclang -target-feature -Xclang +vortex
+MU_CFLAGS += -march=rv32im_zfinx -mabi=ilp32
+MU_CFLAGS += -O3 -std=c++17
+MU_CFLAGS += -mcmodel=medany -fno-rtti -fno-exceptions -fdata-sections -ffunction-sections
+MU_CFLAGS += -mllvm -inline-threshold=262144
+MU_CFLAGS += -I$(VORTEX_KN_PATH)/include -I$(GEMMINI_SW_PATH)
+MU_CFLAGS += -DNDEBUG -DLLVM_VORTEX
 
-MU_CFLAGS := $(VX_CFLAGS)
-
-VX_LDFLAGS += -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/linker/vx_link32.ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR),-z,norelro
-MU_LDFLAGS += -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/../muon-isa-tests/env/link.ld,-z,norelro -fuse-ld=lld
-VX_LDFLAGS += $(VORTEX_KN_PATH)/libvortexrt.a
+MU_LDFLAGS += -nodefaultlibs -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/../muon-isa-tests/env/link.ld,-z,norelro -fuse-ld=lld
 MU_LDFLAGS += $(VORTEX_KN_PATH)/libmuonrt.a $(VORTEX_KN_PATH)/tohost.S
+
+ifdef MU_USE_LIBC
+# Link in libc + compiler builtins; not sure why it doesn't know about them already
+MU_LDFLAGS += -L$(LLVM_MUON)/lib/riscv32-unknown-elf -lc -lm -Wl,$(LLVM_MUON)/lib/clang/18/lib/riscv32-unknown-elf/libclang_rt.builtins.a
+endif
 
 CPU_CFLAGS ?= -march=rv64imafd -mabi=lp64d -mcmodel=medany -ffreestanding -fno-common -fno-builtin-printf
 CPU_CXXFLAGS ?= $(CPU_CFLAGS)
@@ -70,8 +55,6 @@ CPU_LIBS ?=
 CONFIGEXT = $(if $(CONFIG),.$(CONFIG),)
 
 PROJECT ?= kernel
-# BINARIES := $(addsuffix .vortex.elf,$(PROJECT)) $(addsuffix .radiance.elf,$(PROJECT))
-# OBJDUMPS := $(addsuffix .vortex.dump,$(PROJECT)) $(addsuffix .radiance.dump,$(PROJECT))
 BINARIES := $(addsuffix .radiance.elf,$(PROJECT))
 OBJDUMPS := $(addsuffix .radiance.dump,$(PROJECT))
 
@@ -82,8 +65,6 @@ endif
 
 all: $(BINARIES) $(OBJDUMPS)
 
-%.vortex.dump: %.vortex.elf
-	$(VX_DP) -D $< > $@
 %.radiance.dump: %.radiance.elf
 	$(MU_DP) -D $< > $@
 %.soc.dump: %.soc.elf
@@ -98,17 +79,7 @@ OBJCOPY_FLAGS ?= "LOAD,ALLOC,DATA,CONTENTS"
 # BINFILES ?=  args.bin input.a.bin input.b.bin input.c.bin
 BINFILES ?=
 
-%.vortex.elf: $(MU_SRCS) $(VX_INCLUDES) $(BINFILES)
-	$(VX_CXX) $(VX_CFLAGS) $(MU_SRCS) $(VX_LDFLAGS) -DRADIANCE -o $@
-
-	@for bin in $(BINFILES); do \
-		sec=$$(echo $$bin | sed 's/\.bin$$//'); \
-		echo "-$(VX_CP) --update-section .$$sec=$$bin $@"; \
-		$(VX_CP) --set-section-flags .input.a=$(OBJCOPY_FLAGS) $@; \
-		$(VX_CP) --update-section .$$sec=$$bin $@ || true; \
-	done
-
-%.radiance.elf: $(MU_SRCS) $(VX_INCLUDES) $(BINFILES)
+%.radiance.elf: $(MU_SRCS) $(BINFILES)
 	$(MU_CXX) $(MU_CFLAGS) $(MU_SRCS) -DRADIANCE -S
 	$(MU_CXX) $(MU_CFLAGS) $(MU_SRCS) -DRADIANCE -c
 	$(MU_CXX) $(MU_CFLAGS) $(MU_SRCS) $(MU_LDFLAGS) -DRADIANCE -o $@

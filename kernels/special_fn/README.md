@@ -1,0 +1,1 @@
+This kernel aims to verify software implementation of special functions `sin`, `cos`, and `exp`, and to determine their performance running on Muon. We also want to ensure that this works for bf16 / lower-precision variants that will be used in real kernels. 

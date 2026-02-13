@@ -1,5 +1,8 @@
-# Find all subdirectories containing a Makefile
-SUBDIRS := $(shell find . -mindepth 1 -maxdepth 1 -type d -exec test -e {}/Makefile \; -print)
+SUBDIRS := address_space \
+	special_fn \
+	ubench \
+	spin \
+	launch
 
 .PHONY: all $(SUBDIRS) clean clean-all
 

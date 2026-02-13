@@ -1,5 +1,5 @@
 PROJECT = flops
 
-VX_SRCS = flops.cpp
+MU_SRCS = flops.cpp
 
 include ../common.mk

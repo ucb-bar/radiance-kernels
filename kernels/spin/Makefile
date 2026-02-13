@@ -1,6 +1,6 @@
 PROJECT = spin
 
-VX_SRCS = kernel.cpp
+MU_SRCS = kernel.cpp
 
 BINFILES =
 
