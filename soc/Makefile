@@ -14,7 +14,7 @@ fused.elf: main.c start.S fuse_rv32_into_rv64.sh muon.elf
 fuse-temp:
 	@mkdir -p $(FUSED_DIR)
 	@tmp="$(abspath $(FUSED_DIR))/fused_$$(basename $(MUON_ELF))"; \
-	RV32_ELF="$(MUON_ELF)" OUT="$${tmp}" ./fuse_rv32_into_rv64.sh > /dev/null 2>&1; \
+	RV32_ELF="$(MUON_ELF)" OUT="$${tmp}" ./fuse_rv32_into_rv64.sh >/dev/null; \
 	echo "$${tmp}"
 
 clean:
