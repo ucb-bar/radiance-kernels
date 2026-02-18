@@ -55,14 +55,26 @@ CPU_LIBS ?=
 CONFIGEXT = $(if $(CONFIG),.$(CONFIG),)
 
 PROJECT ?= kernel
-BINARIES := $(addsuffix .radiance.elf,$(PROJECT))
-OBJDUMPS := $(addsuffix .radiance.dump,$(PROJECT))
 
-ifneq ($(strip $(CPU_SRCS)),)
-BINARIES += $(addsuffix .soc.elf,$(PROJECT))
-OBJDUMPS += $(addsuffix .soc.dump,$(PROJECT))
+# MU_SRCS are entrypoint sources that provide main()
+# MU_SRC_DEPS are optional shared/common sources linked into every radiance target
+ifneq ($(strip $(MU_SRCS)),)
+RADIANCE_TARGETS := $(addsuffix .radiance.elf,$(basename $(MU_SRCS)))
+else
+RADIANCE_TARGETS := $(addsuffix .radiance.elf,$(PROJECT))
 endif
 
+BINARIES := $(RADIANCE_TARGETS)
+OBJDUMPS := $(patsubst %.elf,%.dump,$(RADIANCE_TARGETS))
+MU_LIB_OBJS := $(sort $(addsuffix .mu.o,$(basename $(MU_SRC_DEPS))))
+
+ifneq ($(strip $(CPU_SRCS)),)
+SOC_TARGETS := $(patsubst %.radiance.elf,%.soc.elf,$(RADIANCE_TARGETS))
+BINARIES += $(SOC_TARGETS)
+OBJDUMPS += $(patsubst %.elf,%.dump,$(SOC_TARGETS))
+endif
+
+.DEFAULT_GOAL := all
 all: $(BINARIES) $(OBJDUMPS)
 
 %.radiance.dump: %.radiance.elf
@@ -79,10 +91,11 @@ OBJCOPY_FLAGS ?= "LOAD,ALLOC,DATA,CONTENTS"
 # BINFILES ?=  args.bin input.a.bin input.b.bin input.c.bin
 BINFILES ?=
 
-%.radiance.elf: $(MU_SRCS) $(BINFILES)
-	$(MU_CXX) $(MU_CFLAGS) $(MU_SRCS) -DRADIANCE -S
-	$(MU_CXX) $(MU_CFLAGS) $(MU_SRCS) -DRADIANCE -c
-	$(MU_CXX) $(MU_CFLAGS) $(MU_SRCS) $(MU_LDFLAGS) -DRADIANCE -o $@
+%.mu.o: %.cpp
+	$(MU_CXX) $(MU_CFLAGS) -DRADIANCE -c $< -o $@
+
+%.radiance.elf: %.mu.o $(MU_LIB_OBJS) $(BINFILES)
+	$(MU_CXX) $(MU_CFLAGS) $< $(MU_LIB_OBJS) $(MU_LDFLAGS) -DRADIANCE -o $@
 	@for bin in $(BINFILES); do \
 		sec=$$(echo $$bin | sed 's/\.bin$$//'); \
 		echo "-$(MU_CP) --update-section .$$sec=$$bin $@"; \
