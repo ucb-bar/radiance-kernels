@@ -31,7 +31,7 @@ CPU_READELF ?= readelf
 
 MU_CFLAGS += --sysroot=$(LLVM_MUON)
 MU_CFLAGS += -Xclang -target-feature -Xclang +vortex
-MU_CFLAGS += -march=rv32im_zfinx -mabi=ilp32
+MU_CFLAGS += -march=rv32im_zfinx_zhinx -mabi=ilp32
 MU_CFLAGS += -O3 -std=c++17
 MU_CFLAGS += -mcmodel=medany -fno-rtti -fno-exceptions -fdata-sections -ffunction-sections
 MU_CFLAGS += -mllvm -inline-threshold=262144
