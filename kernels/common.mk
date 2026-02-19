@@ -46,7 +46,8 @@ ifdef MU_USE_LIBC
 MU_LDFLAGS += -L$(LLVM_MUON)/lib/riscv32-unknown-elf -lc -lm -Wl,$(LLVM_MUON)/lib/clang/18/lib/riscv32-unknown-elf/libclang_rt.builtins.a
 endif
 
-CPU_CFLAGS ?= -march=rv64imafd -mabi=lp64d -mcmodel=medany -ffreestanding -fno-common -fno-builtin-printf
+CPU_CFLAGS ?= -march=rv64imafd -mabi=lp64d -mcmodel=medany -ffreestanding -fno-common -fno-builtin-printf \
+	      -I$(GEMMINI_SW_PATH)
 CPU_CXXFLAGS ?= $(CPU_CFLAGS)
 CPU_LDFLAGS ?= -static -specs=htif_nano.specs
 CPU_LIBS ?=
