@@ -9,7 +9,7 @@ RISCV64_PREFIX ?= riscv64-unknown-elf
 RISCV64_TOOLCHAIN_PATH ?= $(RISCV)
 
 VORTEX_KN_PATH ?= $(realpath ../../lib)
-GEMMINI_SW_PATH ?= $(realpath ../../lib/gemmini)
+GEMMINI_SW_PATH ?= $(realpath ../../lib/mxgemmini)
 SOC_DIR ?= $(realpath ../../soc)
 
 LLVM_MUON ?= $(realpath ../../llvm/llvm-muon)
@@ -110,6 +110,7 @@ endif
 
 ifneq ($(strip $(CPU_SRCS)),)
 CPU_OBJS := $(addsuffix .cpu.o,$(basename $(CPU_SRCS)))
+endif
 
 %.cpu.o: %.c
 	$(CPU_CC) $(CPU_CFLAGS) -c $< -o $@
@@ -129,7 +130,6 @@ CPU_OBJS := $(addsuffix .cpu.o,$(basename $(CPU_SRCS)))
 	RV64_LDFLAGS="$(CPU_LDFLAGS)" RV64_LIBS="$(CPU_LIBS)" \
 	CC="$(CPU_CC)" LD="$(CPU_LD)" RV64_LINK="$(CPU_LINK)" OBJCOPY="$(CPU_OBJCOPY)" READELF="$(CPU_READELF)" \
 	$(SOC_DIR)/fuse_rv32_into_rv64.sh
-endif
 
 clean:
 	rm -rf *.o
