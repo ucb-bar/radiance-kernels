@@ -8,7 +8,7 @@ RISCV_SYSROOT ?= $(RISCV_TOOLCHAIN_PATH)/$(RISCV_PREFIX)
 RISCV64_PREFIX ?= riscv64-unknown-elf
 RISCV64_TOOLCHAIN_PATH ?= $(RISCV)
 
-VORTEX_KN_PATH ?= $(realpath ../../lib)
+RADIANCE_LIB_PATH ?= $(realpath ../../lib)
 GEMMINI_SW_PATH ?= $(realpath ../../lib/mxgemmini)
 SOC_DIR ?= $(realpath ../../soc)
 
@@ -35,11 +35,11 @@ MU_CFLAGS += -march=rv32im_zfinx_zhinx -mabi=ilp32
 MU_CFLAGS += -O3 -std=c++17
 MU_CFLAGS += -mcmodel=medany -fno-rtti -fno-exceptions -fdata-sections -ffunction-sections
 MU_CFLAGS += -mllvm -inline-threshold=262144
-MU_CFLAGS += -I$(VORTEX_KN_PATH)/include -I$(GEMMINI_SW_PATH)
+MU_CFLAGS += -I$(RADIANCE_LIB_PATH)/include -I$(GEMMINI_SW_PATH)
 MU_CFLAGS += -DNDEBUG -DLLVM_VORTEX
 
-MU_LDFLAGS += -nodefaultlibs -nostartfiles -Wl,-Bstatic,-T,$(VORTEX_KN_PATH)/../muon-isa-tests/env/link.ld,-z,norelro -fuse-ld=lld
-MU_LDFLAGS += $(VORTEX_KN_PATH)/libmuonrt.a $(VORTEX_KN_PATH)/tohost.S
+MU_LDFLAGS += -nodefaultlibs -nostartfiles -Wl,-Bstatic,-T,$(RADIANCE_LIB_PATH)/linker/mu_link.ld,-z,norelro -fuse-ld=lld
+MU_LDFLAGS += $(RADIANCE_LIB_PATH)/libmuonrt.a $(RADIANCE_LIB_PATH)/tohost.S
 
 ifdef MU_USE_LIBC
 # Link in libc + compiler builtins; not sure why it doesn't know about them already
