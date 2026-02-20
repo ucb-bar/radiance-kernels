@@ -1,6 +1,8 @@
 #ifndef __MU_INTRINSICS_H__
 #define __MU_INTRINSICS_H__
 
+#include <stdint.h>
+
 // Base of GPU GMEM(DRAM) address space in host CPU's global address space
 #define GPU_DRAM_ADDR_BASE 0x100000000ul
 

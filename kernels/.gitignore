@@ -3,3 +3,6 @@
 **/*.bin
 **/*.o
 **/*.s
+
+# clangd
+**/compile_commands.json
