@@ -37,7 +37,7 @@ MU_CFLAGS += -O3 -std=c++17
 MU_CFLAGS += -mcmodel=medany -fno-rtti -fno-exceptions -fdata-sections -ffunction-sections
 MU_CFLAGS += -mllvm -inline-threshold=262144
 MU_CFLAGS += -I$(RADIANCE_INCLUDE_PATH) -I$(GEMMINI_SW_PATH)
-MU_CFLAGS += -DNDEBUG -DLLVM_VORTEX
+MU_CFLAGS += -DRADIANCE -DRADIANCE_DEVICE -DNDEBUG -DLLVM_VORTEX
 
 MU_LDFLAGS += -nodefaultlibs -nostartfiles -Wl,-Bstatic,-T,$(RADIANCE_LIB_PATH)/linker/mu_link.ld,-z,norelro -fuse-ld=lld
 MU_LDFLAGS += $(RADIANCE_LIB_PATH)/libmuonrt.a $(RADIANCE_LIB_PATH)/tohost.S
@@ -97,10 +97,10 @@ BINFILES ?=
 MU_BIN_OBJS ?=
 
 %.mu.o: %.cpp
-	$(MU_CXX) $(MU_CFLAGS) -DRADIANCE -c $< -o $@
+	$(MU_CXX) $(MU_CFLAGS) -c $< -o $@
 
 %.radiance.elf: %.mu.o $(MU_LIB_OBJS) $(MU_BIN_OBJS) $(BINFILES)
-	$(MU_CXX) $(MU_CFLAGS) $< $(MU_LIB_OBJS) $(MU_BIN_OBJS) $(MU_LDFLAGS) -DRADIANCE -o $@
+	$(MU_CXX) $(MU_CFLAGS) $< $(MU_LIB_OBJS) $(MU_BIN_OBJS) $(MU_LDFLAGS) -o $@
 	@for bin in $(BINFILES); do \
 		sec=$$(echo $$bin | sed 's/\.bin$$//'); \
 		echo "-$(MU_OBJCOPY) --update-section .$$sec=$$bin $@"; \

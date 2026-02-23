@@ -4,9 +4,6 @@
 #include <stdint.h>
 #include <vx_intrinsics.h>
 
-// Base of GPU GMEM(DRAM) address space in host CPU's global address space
-#define GPU_DRAM_ADDR_BASE 0x100000000ul
-
 inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {
     asm volatile("sw.shared %2, %1(%0)" :: "r"(base), "I"(offset), "r"(data)
                  : "memory");

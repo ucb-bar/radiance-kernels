@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <radiance.h>
 #include <vx_intrinsics.h>
 #include <mu_intrinsics.h>
 
@@ -30,7 +31,7 @@ inline void load_scale_factors(volatile uint64_t *sf_mem, const uint8_t *scale_f
 
 /** Convert GPU-local GMEM address to CPU-addressable global address */
 inline uint64_t convert_to_global(uint32_t addr) {
-  return (static_cast<uint64_t>(addr) | GPU_DRAM_ADDR_BASE);
+  return (static_cast<uint64_t>(addr) | RAD_HOST_GPU_DRAM_BASE);
 }
 
 inline int mxgemm() {
