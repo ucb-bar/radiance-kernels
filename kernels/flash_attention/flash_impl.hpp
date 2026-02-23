@@ -38,13 +38,14 @@ inline void rowmax(const _Float16 *tensor, _Float16 *result,
     const auto row         = tid_in_threadblock / NT;
 
     const auto iter = dim_col / NT;
-    const auto *elem = &tensor[row * dim_col + tid_in_warp];
-    _Float16 max_per_thread = *elem;
+    const auto *elem_addr = &tensor[row * dim_col + tid_in_warp];
+    _Float16 max_per_thread = load16_shared(elem_addr);
     for (int i = 0; i < iter; i++) {
-        if (*elem > max_per_thread) {
-            max_per_thread = *elem;
+        const auto elem = load16_shared(elem_addr);
+        if (elem > max_per_thread) {
+            max_per_thread = elem;
         }
-        elem += NT;
+        elem_addr += NT;
     }
 
     // TODO: threadblock barrier here
