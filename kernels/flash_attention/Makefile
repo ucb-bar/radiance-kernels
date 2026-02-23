@@ -1,7 +1,7 @@
 PROJECT = flash_attention
 
 MU_SRCS = flash_attention.cpp
-CPU_SRCS = host.cpp
+HOST_SRCS = host.cpp
 MU_BIN_OBJS = numpy.a.o numpy.b.o
 
 numpy.%.o: numpy.%.bin

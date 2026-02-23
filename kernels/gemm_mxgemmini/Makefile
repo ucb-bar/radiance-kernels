@@ -1,7 +1,7 @@
 PROJECT = mxgemm
 
 MU_SRCS = mxgemm.cpp
-CPU_SRCS = cpu.cpp
+HOST_SRCS = host.cpp
 
 mxgemm.mu.o: lib.h
 

@@ -1,7 +1,7 @@
 PROJECT = launch
 
 MU_SRCS = kernel.cpp
-CPU_SRCS = cpu.cpp
+HOST_SRCS = host.cpp
 
 BINFILES =
 

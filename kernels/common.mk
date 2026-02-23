@@ -9,6 +9,7 @@ RISCV64_PREFIX ?= riscv64-unknown-elf
 RISCV64_TOOLCHAIN_PATH ?= $(RISCV)
 
 RADIANCE_LIB_PATH ?= $(realpath ../../lib)
+RADIANCE_INCLUDE_PATH ?= $(RADIANCE_LIB_PATH)/include
 GEMMINI_SW_PATH ?= $(realpath ../../lib/mxgemmini)
 SOC_DIR ?= $(realpath ../../soc)
 
@@ -19,15 +20,15 @@ MU_CXX = $(LLVM_MUON)/bin/clang++
 MU_OBJDUMP  = $(LLVM_MUON)/bin/llvm-objdump
 MU_OBJCOPY  = $(LLVM_MUON)/bin/llvm-objcopy
 
-CPU_TOOLCHAIN_PREFIX ?= $(RISCV64_TOOLCHAIN_PATH)/bin/$(RISCV64_PREFIX)
-CPU_CC ?= $(CPU_TOOLCHAIN_PREFIX)-gcc
-CPU_CXX ?= $(CPU_TOOLCHAIN_PREFIX)-g++
-CPU_AS ?= $(CPU_TOOLCHAIN_PREFIX)-as
-CPU_LD ?= $(CPU_TOOLCHAIN_PREFIX)-ld
-CPU_LINK ?= $(CPU_CC)
-CPU_OBJDUMP ?= $(CPU_TOOLCHAIN_PREFIX)-objdump
-CPU_OBJCOPY ?= $(CPU_TOOLCHAIN_PREFIX)-objcopy
-CPU_READELF ?= readelf
+HOST_TOOLCHAIN_PREFIX ?= $(RISCV64_TOOLCHAIN_PATH)/bin/$(RISCV64_PREFIX)
+HOST_CC ?= $(HOST_TOOLCHAIN_PREFIX)-gcc
+HOST_CXX ?= $(HOST_TOOLCHAIN_PREFIX)-g++
+HOST_AS ?= $(HOST_TOOLCHAIN_PREFIX)-as
+HOST_LD ?= $(HOST_TOOLCHAIN_PREFIX)-ld
+HOST_LINK ?= $(HOST_CC)
+HOST_OBJDUMP ?= $(HOST_TOOLCHAIN_PREFIX)-objdump
+HOST_OBJCOPY ?= $(HOST_TOOLCHAIN_PREFIX)-objcopy
+HOST_READELF ?= readelf
 
 MU_CFLAGS += --sysroot=$(LLVM_MUON)
 MU_CFLAGS += -Xclang -target-feature -Xclang +vortex
@@ -35,7 +36,7 @@ MU_CFLAGS += -march=rv32im_zfinx_zhinx -mabi=ilp32
 MU_CFLAGS += -O3 -std=c++17
 MU_CFLAGS += -mcmodel=medany -fno-rtti -fno-exceptions -fdata-sections -ffunction-sections
 MU_CFLAGS += -mllvm -inline-threshold=262144
-MU_CFLAGS += -I$(RADIANCE_LIB_PATH)/include -I$(GEMMINI_SW_PATH)
+MU_CFLAGS += -I$(RADIANCE_INCLUDE_PATH) -I$(GEMMINI_SW_PATH)
 MU_CFLAGS += -DNDEBUG -DLLVM_VORTEX
 
 MU_LDFLAGS += -nodefaultlibs -nostartfiles -Wl,-Bstatic,-T,$(RADIANCE_LIB_PATH)/linker/mu_link.ld,-z,norelro -fuse-ld=lld
@@ -46,11 +47,11 @@ ifdef MU_USE_LIBC
 MU_LDFLAGS += -L$(LLVM_MUON)/lib/riscv32-unknown-elf -lc -lm -Wl,$(LLVM_MUON)/lib/clang/18/lib/riscv32-unknown-elf/libclang_rt.builtins.a
 endif
 
-CPU_CFLAGS ?= -march=rv64imafd -mabi=lp64d -mcmodel=medany -ffreestanding -fno-common -fno-builtin-printf \
-	      -I$(GEMMINI_SW_PATH)
-CPU_CXXFLAGS ?= $(CPU_CFLAGS)
-CPU_LDFLAGS ?= -static -specs=htif_nano.specs
-CPU_LIBS ?=
+HOST_CFLAGS ?= -march=rv64imafd -mabi=lp64d -mcmodel=medany -ffreestanding -fno-common -fno-builtin-printf \
+	       -I$(RADIANCE_INCLUDE_PATH) -I$(GEMMINI_SW_PATH)
+HOST_CXXFLAGS ?= $(HOST_CFLAGS)
+HOST_LDFLAGS ?= -static -specs=htif_nano.specs
+HOST_LIBS ?=
 
 # CONFIG is supplied from the command line to differentiate ELF files with custom suffixes
 CONFIGEXT = $(if $(CONFIG),.$(CONFIG),)
@@ -69,7 +70,7 @@ BINARIES := $(RADIANCE_TARGETS)
 OBJDUMPS := $(patsubst %.elf,%.dump,$(RADIANCE_TARGETS))
 MU_LIB_OBJS := $(sort $(addsuffix .mu.o,$(basename $(MU_SRC_DEPS))))
 
-ifneq ($(strip $(CPU_SRCS)),)
+ifneq ($(strip $(HOST_SRCS)),)
 SOC_TARGETS := $(patsubst %.radiance.elf,%.soc.elf,$(RADIANCE_TARGETS))
 BINARIES += $(SOC_TARGETS)
 OBJDUMPS += $(patsubst %.elf,%.dump,$(SOC_TARGETS))
@@ -81,7 +82,7 @@ all: $(BINARIES) $(OBJDUMPS)
 %.radiance.dump: %.radiance.elf
 	$(MU_OBJDUMP) -D $< > $@
 %.soc.dump: %.soc.elf
-	$(CPU_OBJDUMP) -D $< > $@
+	$(HOST_OBJDUMP) -D $< > $@
 
 ifneq ($(CONFIG),)
 %.radiance$(CONFIGEXT).dump: %.radiance$(CONFIGEXT).elf
@@ -112,32 +113,32 @@ ifneq ($(CONFIG),)
 	cp $< $@
 endif
 
-ifneq ($(strip $(CPU_SRCS)),)
-CPU_OBJS := $(addsuffix .cpu.o,$(basename $(CPU_SRCS)))
+ifneq ($(strip $(HOST_SRCS)),)
+HOST_OBJS := $(addsuffix .host.o,$(basename $(HOST_SRCS)))
 endif
 
-%.cpu.o: %.c
-	$(CPU_CC) $(CPU_CFLAGS) -c $< -o $@
-%.cpu.o: %.cc
-	$(CPU_CXX) $(CPU_CXXFLAGS) -c $< -o $@
-%.cpu.o: %.cpp
-	$(CPU_CXX) $(CPU_CXXFLAGS) -c $< -o $@
-%.cpu.o: %.S
-	$(CPU_CC) $(CPU_CFLAGS) -c $< -o $@
-%.cpu.o: %.s
-	$(CPU_CC) $(CPU_CFLAGS) -c $< -o $@
+%.host.o: %.c
+	$(HOST_CC) $(HOST_CFLAGS) -c $< -o $@
+%.host.o: %.cc
+	$(HOST_CXX) $(HOST_CXXFLAGS) -c $< -o $@
+%.host.o: %.cpp
+	$(HOST_CXX) $(HOST_CXXFLAGS) -c $< -o $@
+%.host.o: %.S
+	$(HOST_CC) $(HOST_CFLAGS) -c $< -o $@
+%.host.o: %.s
+	$(HOST_CC) $(HOST_CFLAGS) -c $< -o $@
 
-%.soc.elf: %.radiance.elf $(CPU_OBJS) $(SOC_DIR)/fuse_rv32_into_rv64.sh $(SOC_DIR)/start.S
+%.soc.elf: %.radiance.elf $(HOST_OBJS) $(SOC_DIR)/fuse_rv32_into_rv64.sh $(SOC_DIR)/start.S
 	RV32_ELF="$<" OUT="$@" \
 	RV64_START="$(SOC_DIR)/start.S" RV64_MAIN= \
-	RV64_OBJS="$(CPU_OBJS)" RV64_CFLAGS="$(CPU_CFLAGS)" \
-	RV64_LDFLAGS="$(CPU_LDFLAGS)" RV64_LIBS="$(CPU_LIBS)" \
-	CC="$(CPU_CC)" LD="$(CPU_LD)" RV64_LINK="$(CPU_LINK)" OBJCOPY="$(CPU_OBJCOPY)" READELF="$(CPU_READELF)" \
+	RV64_OBJS="$(HOST_OBJS)" RV64_CFLAGS="$(HOST_CFLAGS)" \
+	RV64_LDFLAGS="$(HOST_LDFLAGS)" RV64_LIBS="$(HOST_LIBS)" \
+	CC="$(HOST_CC)" LD="$(HOST_LD)" RV64_LINK="$(HOST_LINK)" OBJCOPY="$(HOST_OBJCOPY)" READELF="$(HOST_READELF)" \
 	$(SOC_DIR)/fuse_rv32_into_rv64.sh
 
 clean:
 	rm -rf *.o
-	rm -rf *.cpu.o
+	rm -rf *.host.o
 	rm -rf $(BINARIES) $(OBJDUMPS)
 
 clean-all: clean
