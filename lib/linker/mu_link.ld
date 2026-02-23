@@ -13,11 +13,11 @@ SECTIONS
   . = ALIGN(0x1000);
   .tohost : { *(.tohost) }
   . = ALIGN(0x1000);
-  .text : { *(.text) }
+  .text : { *(.text .text.*) }
   . = ALIGN(0x1000);
-  .data : { *(.data) }
+  .data : { *(.data .data.*) }
   . = ALIGN(0x1000);
-  .rodata : { *(.rodata) }
+  .rodata : { *(.rodata .rodata.*) }
 
   /* exception handling.  We don't need this, but the C++ compiler generates
    * them.  Tuck it away after .text */
