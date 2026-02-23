@@ -16,8 +16,8 @@ LLVM_MUON ?= $(realpath ../../llvm/llvm-muon)
 
 MU_CC  = $(LLVM_MUON)/bin/clang
 MU_CXX = $(LLVM_MUON)/bin/clang++
-MU_DP  = $(LLVM_MUON)/bin/llvm-objdump 
-MU_CP  = $(LLVM_MUON)/bin/llvm-objcopy
+MU_OBJDUMP  = $(LLVM_MUON)/bin/llvm-objdump
+MU_OBJCOPY  = $(LLVM_MUON)/bin/llvm-objcopy
 
 CPU_TOOLCHAIN_PREFIX ?= $(RISCV64_TOOLCHAIN_PATH)/bin/$(RISCV64_PREFIX)
 CPU_CC ?= $(CPU_TOOLCHAIN_PREFIX)-gcc
@@ -25,7 +25,7 @@ CPU_CXX ?= $(CPU_TOOLCHAIN_PREFIX)-g++
 CPU_AS ?= $(CPU_TOOLCHAIN_PREFIX)-as
 CPU_LD ?= $(CPU_TOOLCHAIN_PREFIX)-ld
 CPU_LINK ?= $(CPU_CC)
-CPU_DP ?= $(CPU_TOOLCHAIN_PREFIX)-objdump
+CPU_OBJDUMP ?= $(CPU_TOOLCHAIN_PREFIX)-objdump
 CPU_OBJCOPY ?= $(CPU_TOOLCHAIN_PREFIX)-objcopy
 CPU_READELF ?= readelf
 
@@ -79,29 +79,32 @@ endif
 all: $(BINARIES) $(OBJDUMPS)
 
 %.radiance.dump: %.radiance.elf
-	$(MU_DP) -D $< > $@
+	$(MU_OBJDUMP) -D $< > $@
 %.soc.dump: %.soc.elf
-	$(CPU_DP) -D $< > $@
+	$(CPU_OBJDUMP) -D $< > $@
 
 ifneq ($(CONFIG),)
 %.radiance$(CONFIGEXT).dump: %.radiance$(CONFIGEXT).elf
-	$(MU_DP) -D %.radiance$(CONFIGEXT).elf > $@
+	$(MU_OBJDUMP) -D %.radiance$(CONFIGEXT).elf > $@
 endif
 
 OBJCOPY_FLAGS ?= "LOAD,ALLOC,DATA,CONTENTS"
 # BINFILES ?=  args.bin input.a.bin input.b.bin input.c.bin
 BINFILES ?=
+# Optional object files to be linked into *.radiance.elf, e.g. kernel argument
+# tensors
+MU_BIN_OBJS ?=
 
 %.mu.o: %.cpp
 	$(MU_CXX) $(MU_CFLAGS) -DRADIANCE -c $< -o $@
 
-%.radiance.elf: %.mu.o $(MU_LIB_OBJS) $(BINFILES)
-	$(MU_CXX) $(MU_CFLAGS) $< $(MU_LIB_OBJS) $(MU_LDFLAGS) -DRADIANCE -o $@
+%.radiance.elf: %.mu.o $(MU_LIB_OBJS) $(MU_BIN_OBJS) $(BINFILES)
+	$(MU_CXX) $(MU_CFLAGS) $< $(MU_LIB_OBJS) $(MU_BIN_OBJS) $(MU_LDFLAGS) -DRADIANCE -o $@
 	@for bin in $(BINFILES); do \
 		sec=$$(echo $$bin | sed 's/\.bin$$//'); \
-		echo "-$(MU_CP) --update-section .$$sec=$$bin $@"; \
-		$(MU_CP) --set-section-flags .input.a=$(OBJCOPY_FLAGS) $@; \
-		$(MU_CP) --update-section .$$sec=$$bin $@ || true; \
+		echo "-$(MU_OBJCOPY) --update-section .$$sec=$$bin $@"; \
+		$(MU_OBJCOPY) --set-section-flags .input.a=$(OBJCOPY_FLAGS) $@; \
+		$(MU_OBJCOPY) --update-section .$$sec=$$bin $@ || true; \
 	done
 
 ifneq ($(CONFIG),)
