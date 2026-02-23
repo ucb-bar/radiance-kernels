@@ -1,6 +1,6 @@
-PROJECT = address_space
+PROJECT =
 
-MU_SRCS = kernel.cpp
+MU_SRCS =
 
 # no binary files needed
 BINFILES := 
