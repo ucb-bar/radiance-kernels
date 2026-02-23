@@ -11,14 +11,15 @@
 
 #include <stdint.h>
 
-// Device base address of argument buffer space
-#define RAD_DEVICE_ARG_BASE 0x0FFF0000ul
+// Host/device base address of argument buffer space
+#define RAD_HOST_ARG_BASE   0x10FFF0000ull
+#define RAD_DEVICE_ARG_BASE  0x0FFF0000ul
 // Host base address of GPU GMEM(DRAM) address space
 #define RAD_HOST_GPU_DRAM_BASE 0x100000000ul
 
-#define RAD_HOST_GPU_RESET 0x41000000ULL
-#define RAD_HOST_GPU_ALL_FINISHED 0x41000008ULL
-#define RAD_HOST_GPU_CORES 0x41000010ULL
+#define RAD_HOST_GPU_RESET 0x41000000ull
+#define RAD_HOST_GPU_ALL_FINISHED 0x41000008ull
+#define RAD_HOST_GPU_CORES 0x41000010ull
 
 #ifndef RADIANCE_DEVICE
 
