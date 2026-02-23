@@ -20,16 +20,6 @@ MU_CXX = $(LLVM_MUON)/bin/clang++
 MU_OBJDUMP  = $(LLVM_MUON)/bin/llvm-objdump
 MU_OBJCOPY  = $(LLVM_MUON)/bin/llvm-objcopy
 
-HOST_TOOLCHAIN_PREFIX ?= $(RISCV64_TOOLCHAIN_PATH)/bin/$(RISCV64_PREFIX)
-HOST_CC ?= $(HOST_TOOLCHAIN_PREFIX)-gcc
-HOST_CXX ?= $(HOST_TOOLCHAIN_PREFIX)-g++
-HOST_AS ?= $(HOST_TOOLCHAIN_PREFIX)-as
-HOST_LD ?= $(HOST_TOOLCHAIN_PREFIX)-ld
-HOST_LINK ?= $(HOST_CC)
-HOST_OBJDUMP ?= $(HOST_TOOLCHAIN_PREFIX)-objdump
-HOST_OBJCOPY ?= $(HOST_TOOLCHAIN_PREFIX)-objcopy
-HOST_READELF ?= readelf
-
 MU_CFLAGS += --sysroot=$(LLVM_MUON)
 MU_CFLAGS += -Xclang -target-feature -Xclang +vortex
 MU_CFLAGS += -march=rv32im_zfinx_zhinx -mabi=ilp32
@@ -47,14 +37,21 @@ ifdef MU_USE_LIBC
 MU_LDFLAGS += -L$(LLVM_MUON)/lib/riscv32-unknown-elf -lc -lm -Wl,$(LLVM_MUON)/lib/clang/18/lib/riscv32-unknown-elf/libclang_rt.builtins.a
 endif
 
+HOST_TOOLCHAIN_PREFIX ?= $(RISCV64_TOOLCHAIN_PATH)/bin/$(RISCV64_PREFIX)
+HOST_CC ?= $(HOST_TOOLCHAIN_PREFIX)-gcc
+HOST_CXX ?= $(HOST_TOOLCHAIN_PREFIX)-g++
+HOST_AS ?= $(HOST_TOOLCHAIN_PREFIX)-as
+HOST_LD ?= $(HOST_TOOLCHAIN_PREFIX)-ld
+HOST_LINK ?= $(HOST_CC)
+HOST_OBJDUMP ?= $(HOST_TOOLCHAIN_PREFIX)-objdump
+HOST_OBJCOPY ?= $(HOST_TOOLCHAIN_PREFIX)-objcopy
+HOST_READELF ?= readelf
+
 HOST_CFLAGS ?= -march=rv64imafd -mabi=lp64d -mcmodel=medany -ffreestanding -fno-common -fno-builtin-printf \
 	       -I$(RADIANCE_INCLUDE_PATH) -I$(GEMMINI_SW_PATH)
 HOST_CXXFLAGS ?= $(HOST_CFLAGS)
 HOST_LDFLAGS ?= -static -specs=htif_nano.specs
 HOST_LIBS ?=
-
-# CONFIG is supplied from the command line to differentiate ELF files with custom suffixes
-CONFIGEXT = $(if $(CONFIG),.$(CONFIG),)
 
 PROJECT ?= kernel
 
@@ -84,11 +81,6 @@ all: $(BINARIES) $(OBJDUMPS)
 %.soc.dump: %.soc.elf
 	$(HOST_OBJDUMP) -D $< > $@
 
-ifneq ($(CONFIG),)
-%.radiance$(CONFIGEXT).dump: %.radiance$(CONFIGEXT).elf
-	$(MU_OBJDUMP) -D %.radiance$(CONFIGEXT).elf > $@
-endif
-
 OBJCOPY_FLAGS ?= "LOAD,ALLOC,DATA,CONTENTS"
 # BINFILES ?=  args.bin input.a.bin input.b.bin input.c.bin
 BINFILES ?=
@@ -107,11 +99,6 @@ MU_BIN_OBJS ?=
 		$(MU_OBJCOPY) --set-section-flags .input.a=$(OBJCOPY_FLAGS) $@; \
 		$(MU_OBJCOPY) --update-section .$$sec=$$bin $@ || true; \
 	done
-
-ifneq ($(CONFIG),)
-%.radiance$(CONFIGEXT).elf: %.radiance.elf
-	cp $< $@
-endif
 
 ifneq ($(strip $(HOST_SRCS)),)
 HOST_OBJS := $(addsuffix .host.o,$(basename $(HOST_SRCS)))
