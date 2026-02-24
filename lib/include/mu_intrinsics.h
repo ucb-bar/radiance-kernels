@@ -39,6 +39,12 @@ inline float mu_fexp(float arg) {
     return output;
 }
 
+inline float mu_fnexp(float arg) {
+    float output;
+    asm volatile("fnexp.s %0, %1" ::"r"(output), "r"(arg));
+    return output;
+}
+
 // TODO: half?
 
 #endif // __MU_INTRINSICS_H__
