@@ -30,3 +30,25 @@ inline T sum() {
 
   return sum[0];
 }
+
+inline _Float16 exp() {
+  constexpr int ILP = 16;
+  constexpr int N = 2048 / ILP;
+
+  _Float16 x[ILP];
+#pragma unroll ILP
+  for (int j = 0; j < ILP; j++) {
+    x[j] = static_cast<_Float16>(0.001f);
+  }
+
+#pragma unroll 100
+  for (int i = 0; i < N; i++) {
+#pragma unroll ILP
+    for (int j = 0; j < ILP; j++) {
+      asm volatile("fexp.h %0, %0" : "+r"(x[j]) : : "memory");
+      asm volatile("fnexp.h %0, %0" : "+r"(x[j]) : : "memory");
+    }
+  }
+
+  return x[0];
+}
