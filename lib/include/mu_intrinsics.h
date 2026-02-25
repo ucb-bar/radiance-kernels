@@ -28,6 +28,11 @@ inline uint16_t load16_shared(const T *address) {
     return load16_shared(reinterpret_cast<uint32_t>(address));
 }
 
+// Number of threads per warp.
+// This hard-codes architecture detail into kernel, but this allows efficient
+// compile-time unrolling and constant propagation.
+#define MU_NUM_THREADS 16
+
 // This compiles to CSR reads which stalls the pipeline. Use sparingly & cache.
 inline int mu_num_threads() {
     return vx_num_threads();

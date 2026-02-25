@@ -11,16 +11,19 @@ int entry() {
     vx_tmc(-1);
 
     constexpr int DIM = 16;
+    // const auto tid = mu_mhartid; // TODO
 
     _Float16 result[16] = {0};
-    auto tensor = reinterpret_cast<const _Float16 *>(A_in);
+    // auto tensor = reinterpret_cast<const _Float16 *>(A_in);
 
     // get argument data written by host
     auto arg = reinterpret_cast<volatile uint32_t *>(RAD_DEVICE_ARG_BASE);
     auto temp = *arg;
 
+    copy_gmem_to_smem<DIM, DIM>(numpy_a_bin, 0, 0, 128);
+
     // rowmax<1024, 64>(numpy_a_bin, result, 0, 0, 0);
-    rowmax<1024, 64>(0, result, 0, 0, 0);
+    // rowmax<1024, 64>(0, result, 0, 0, 0);
 
     vx_tmc(1);
     vx_tmc(0);

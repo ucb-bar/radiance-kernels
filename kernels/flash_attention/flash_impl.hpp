@@ -8,6 +8,25 @@
 #define B_COL 64
 #define HEADDIM 128
 
+/** Move BF16 tensor data from DMEM->SMEM.
+ *  This is an equivalent memcopy operation to Gemmini DMA that is implemented
+ *  in SIMT.
+ *  Assumes row-major layout for both src and dest. */
+template <uint32_t dim_row, uint32_t dim_col>
+inline void copy_gmem_to_smem(const volatile _Float16 *src_dmem, volatile _Float16 *dest_smem,
+                              const uint32_t tid_in_threadblock,
+                              const uint32_t threads_per_threadblock) {
+    constexpr auto NT = MU_NUM_THREADS;
+    const auto tid_in_warp = tid_in_threadblock % NT;
+    const auto iter = (dim_row * dim_col) / NT;
+
+#pragma unroll 16
+    for (int i = 0; i < iter; i++) {
+        const auto index = NT * i + tid_in_warp;
+        dest_smem[index] = src_dmem[index];
+    }
+}
+
 /** Row-wise max reduction for softmax. */
 template <uint32_t dim_row, uint32_t dim_col>
 inline void rowmax(const _Float16 *tensor, _Float16 *result,
@@ -33,7 +52,7 @@ inline void rowmax(const _Float16 *tensor, _Float16 *result,
     // Single-thread max reduction
     // [ T0'' ]
 
-    const auto NT = mu_num_threads();
+    constexpr auto NT = MU_NUM_THREADS;
     const auto tid_in_warp = tid_in_threadblock % NT;
     const auto row         = tid_in_threadblock / NT;
 
