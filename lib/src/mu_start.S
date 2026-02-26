@@ -26,10 +26,9 @@
 _start:  
 
   # initialize per-thread registers
-  # TODO: re-enable
-  # csrr  t0, VX_CSR_NUM_WARPS  # get num warps
-  # la    t1, init_regs_all
-  # .insn r RISCV_CUSTOM0, 1, 0, x0, t0, t1  # wspawn t0, t1
+  csrr  t0, nw
+  la    t1, init_regs_all
+  .insn r RISCV_CUSTOM0, 1, 0, x0, t0, t1  # wspawn t0, t1
   li    t0, -1
   vx_tmc t0
   jal   init_regs
