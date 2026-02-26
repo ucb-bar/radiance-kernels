@@ -58,7 +58,7 @@ MU_CFLAGS := $(VX_CFLAGS)
 PROJECT = libmuonrt libvortexrt
 
 VX_SRCS = ./src/vx_start.S ./src/vx_syscalls.c ./src/tinyprintf.c ./src/vx_spawn.c
-MU_SRCS = ./src/mu_start.S ./src/vx_syscalls.c ./src/vx_spawn.c
+MU_SRCS = ./src/mu_start.S ./src/mu_schedule.cpp ./src/vx_syscalls.c
 
 VX_OBJS := $(addsuffix .o, $(notdir $(VX_SRCS)))
 MU_OBJS := $(addsuffix .o, $(notdir $(MU_SRCS)))
