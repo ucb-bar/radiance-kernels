@@ -23,7 +23,7 @@ inline void copy_gmem_to_smem(const volatile _Float16 *src_dmem, volatile _Float
 #pragma unroll 16
     for (int i = 0; i < iter; i++) {
         const auto index = NT * i + tid_in_warp;
-        dest_smem[index] = src_dmem[index];
+        dest_smem[index] = load16_shared(&src_dmem[index]);
     }
 }
 

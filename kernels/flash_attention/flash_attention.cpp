@@ -19,7 +19,9 @@ void kernel_entry(void *arg, uint32_t tid_in_threadblock,
     auto host_arg = reinterpret_cast<volatile uint32_t *>(RAD_DEVICE_ARG_BASE);
     auto temp = *host_arg;
 
-    copy_gmem_to_smem<DIM, DIM>(numpy_a_bin, 0, 0, 128);
+    auto dest_gmem = reinterpret_cast<volatile _Float16 *>(0x20000000); // yolo
+    copy_gmem_to_smem<DIM, DIM>(0, dest_gmem, tid_in_threadblock,
+                                threads_per_threadblock);
 
     // rowmax<1024, 64>(numpy_a_bin, result, 0, 0, 0);
     // rowmax<1024, 64>(0, result, 0, 0, 0);
