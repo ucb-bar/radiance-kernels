@@ -52,7 +52,8 @@ static void __attribute__ ((noinline)) mu_schedule_workers() {
  *  Schedules the kernel with persistent thread blocks, i.e. 1 thread block
  *  maximally occupying all cores and warps in each cluster. Therefore, the
  *  kernel grid size is fixed to the total thread slots in HW, i.e.
- *  NUM_CLUSTERS * NUM_CORES * NUM_WARPS * NUM_THREADS. */
+ *  NUM_CLUSTERS * NUM_CORES * NUM_WARPS * NUM_THREADS.
+ *  TODO relax this. */
 void mu_schedule(mu_schedule_callback callback, void *arg) {
     const auto num_warps = vx_num_warps();
 
@@ -71,6 +72,8 @@ void mu_schedule(mu_schedule_callback callback, void *arg) {
         mu_schedule_standalone();
         vx_tmc(1);
     }
+
+    // TODO: add threadblock barrier
 }
 
 } // extern "C"
