@@ -38,6 +38,9 @@ inline std::remove_cv_t<T> load16_shared(const T *address) {
 // compile-time unrolling and constant propagation.
 #define MU_NUM_THREADS 16
 
+// hard-coded block size for now, change if tapeout config changes
+#define MU_BLOCK_SIZE 256
+
 // This compiles to CSR reads which stalls the pipeline. Use sparingly & cache.
 inline int mu_num_threads() {
     return vx_num_threads();
