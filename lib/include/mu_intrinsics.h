@@ -2,6 +2,7 @@
 #define __MU_INTRINSICS_H__
 
 #include <stdint.h>
+#include <type_traits>
 #include <vx_intrinsics.h>
 
 inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {
@@ -24,8 +25,12 @@ inline uint16_t load16_shared(uint32_t address) {
 }
 
 template <typename T>
-inline uint16_t load16_shared(const T *address) {
-    return load16_shared(reinterpret_cast<uint32_t>(address));
+inline std::remove_cv_t<T> load16_shared(const T *address) {
+    // need bit_cast to re-interpret uint16_t bits as _Float16
+    using U = std::remove_cv_t<T>;
+    static_assert(sizeof(U) == sizeof(uint16_t), "load16_shared<T*> expects 16-bit T");
+    uint16_t bits = load16_shared(reinterpret_cast<uint32_t>(address));
+    return __builtin_bit_cast(U, bits);
 }
 
 // Number of threads per warp.
