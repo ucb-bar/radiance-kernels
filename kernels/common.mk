@@ -91,6 +91,9 @@ MU_BIN_OBJS ?=
 %.mu.o: %.cpp
 	$(MU_CXX) $(MU_CFLAGS) -c $< -o $@
 
+%.ll: %.cpp
+	$(MU_CXX) $(MU_CFLAGS) -S -emit-llvm $< -o $@
+
 %.radiance.elf: %.mu.o $(MU_LIB_OBJS) $(MU_BIN_OBJS) $(BINFILES)
 	$(MU_CXX) $(MU_CFLAGS) $< $(MU_LIB_OBJS) $(MU_BIN_OBJS) $(MU_LDFLAGS) -o $@
 	@for bin in $(BINFILES); do \
