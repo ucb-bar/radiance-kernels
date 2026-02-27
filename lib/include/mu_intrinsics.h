@@ -30,6 +30,12 @@ inline uint16_t load16_shared(uint32_t address) {
     return data;
 }
 
+inline uint32_t load32_shared(uint32_t address) {
+    uint32_t data;
+    asm volatile("lh.shared %0, %1(%2)" : "=r"(data) : "I"(0), "r"(address)
+                 : "memory");
+}
+
 template <typename T>
 inline std::remove_cv_t<T> load16_shared(const T *address) {
     // need bit_cast to re-interpret uint16_t bits as _Float16
