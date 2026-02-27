@@ -17,6 +17,12 @@ inline void store64_shared(uint32_t base, uint32_t offset, uint64_t data) {
     store_shared(base, offset + 4, hi);
 }
 
+inline void store_shared_from_global(uint32_t dst, uint32_t src) {
+    uint32_t data;
+    asm volatile("lw.global %0, 0(%1)" : "=r"(data) : "r"(src) : "memory");
+    asm volatile("sw.shared %1, 0(%0)" :: "r"(dst), "r"(data) : "memory");
+}
+
 inline uint16_t load16_shared(uint32_t address) {
     uint16_t data;
     asm volatile("lh.shared %0, %1(%2)" : "=r"(data) : "I"(0), "r"(address)
