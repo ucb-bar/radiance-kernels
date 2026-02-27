@@ -20,6 +20,8 @@ int main() {
 
   load_scale_factors((volatile uint64_t *)0x4008a000, &A_scales_row[0][0], 32);
   load_scale_factors((volatile uint64_t *)0x40088000, &B_scales_col[0][0], 32);
+  load_scale_factors((volatile uint64_t *)0x4008a000, &A_scales_row[0][0], 32);
+  load_scale_factors((volatile uint64_t *)0x40088000, &B_scales_col[0][0], 32);
 
   printf("start GPU\n");
   WRITE_MMIO_32(RAD_HOST_GPU_RESET, 0);

@@ -15,11 +15,11 @@ typedef uint64_t  out_t;    // C_scaled: fp8:e4m3 (1 byte per output)
 // global section that will store fp8 outputs from Gemmini
 static uint64_t C_out_got[DIM][DIM] = {0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF,};
 
-inline void load_scale_factors(volatile uint64_t *sf_mem, const uint8_t *scale_factors, int n) {
-    uint64_t *dword_scale_factors = (uint64_t *)scale_factors;
-    for (size_t i = 0; i < n / 8; i ++) {
-        // do wide stores instead of individual 1-byte stores
-        store64_shared(reinterpret_cast<uint32_t>(&sf_mem[i]), 0, dword_scale_factors[i]);
+static void __attribute__ ((noinline)) load_scale_factors(volatile uint32_t *sf_mem, const uint8_t *scale_factors, int n) {
+    auto word_scale_factors = reinterpret_cast<const uint32_t *>(scale_factors);
+    for (size_t i = 0; i < n / 4; i ++) {
+        // do foll-word stores instead of 1-byte stores
+        store_shared(reinterpret_cast<uint32_t>(&sf_mem[i]), 0, word_scale_factors[i]);
     }
 }
 
@@ -51,10 +51,10 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
     // Load per-element scaling factors into the scale SRAM
     // (C_scale is uint8_t[DIM][DIM], packed row-major)
     // load_scale_factors((const uint64_t *) C_scale, sizeof(C_scale));
-    load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, A_scales_row , 32);
-    load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, B_scales_col , 32);
-    load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_A, A_scales_row , 32);
-    load_scale_factors((volatile uint64_t *) GEMMINI_SF_MEM_B, B_scales_col , 32);
+    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], 32);
+    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], 32);
+    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], 32);
+    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], 32);
 #endif
 
     // MVIN B and A
