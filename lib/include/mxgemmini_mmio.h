@@ -1,12 +1,12 @@
 /** mxgemmini_mmio.h
  *  ================
  *
- *  Macro definitions that implement MMIO interface between Muon - MxGemmini.
+ *  Macro definitions that implement MMIO interface between Muon<->MxGemmini.
  *  Include it *after* gemmini.h so that it correctly overrides APIs such as
  *  ROCC_INSTRUCTION_RS1_RS2.
  *
- *  Note that all of these addresses are within the GPU-local address space,
- *  different from the CPU-global space.
+ *  These are meant to be used from the Muon kernel, and as such the addresses
+ *  are within the GPU-local address space.
  *
  *  @cleanup: These only differ marginally from gemmini_mmio.h.  Merging the
  *  two would be ideal.
