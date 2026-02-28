@@ -47,9 +47,9 @@ void softmax(
   uint32_t chunks_per_block = (row_elems + MU_BLOCK_SIZE - 1) / MU_BLOCK_SIZE;
 
   float *x = args->x + block_elem_idx;
-  float *x_sdata = sdata + block_elem_idx;
-  float *denom_sdata = denom_sdata + MU_BLOCK_SIZE;
-  float *max_sdata = sdata + row_elems;
+  __shared float *x_sdata = sdata + block_elem_idx;
+  __shared float *max_sdata = sdata + row_elems;
+  __shared float *denom_sdata = max_sdata + MU_BLOCK_SIZE;
   
   float max = -INFINITY;
   float denom = 0; 
