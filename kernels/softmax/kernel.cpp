@@ -47,7 +47,7 @@ void softmax(
   uint32_t chunks_per_block = (row_elems + MU_BLOCK_SIZE - 1) / MU_BLOCK_SIZE;
 
   float *x = args->x + block_elem_idx;
-  __shared float *x_sdata = sdata + block_elem_idx;
+  __shared float *x_sdata = sdata;
   __shared float *max_sdata = sdata + row_elems;
   __shared float *denom_sdata = max_sdata + MU_BLOCK_SIZE;
   
@@ -57,10 +57,10 @@ void softmax(
   // load chunk and compute max and denom
   for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
     // load row to smem, fexp in smem
-    uint32_t thread_elem_idx = block_elem_idx + chunk * MU_BLOCK_SIZE + tid;
-    x_sdata[thread_elem_idx] = x[thread_elem_idx];
-    float next_max = fmaxf(x_sdata[thread_elem_idx], max);
-    denom = denom * (next_max - max) + mu_fexp(x_sdata[thread_elem_idx] - next_max);
+    uint32_t idx = chunk * MU_BLOCK_SIZE + tid;
+    x_sdata[idx] = x[idx + block_elem_idx];
+    float next_max = fmaxf(x_sdata[idx], max);
+    denom = denom * (next_max - max) + mu_fexp(x_sdata[idx] - next_max);
     max = next_max;
 
     // next chunk
@@ -87,8 +87,8 @@ void softmax(
   x_sdata -= row_elems;
   // compute softmax for each element chunk by chunk
   for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
-    uint32_t thread_elem_idx = block_elem_idx + chunk * MU_BLOCK_SIZE + tid;
-    x[thread_elem_idx] = mu_fexp(x_sdata[thread_elem_idx] - m) / d;
+    uint32_t idx = chunk * MU_BLOCK_SIZE + tid;
+    x[idx] = mu_fexp(x_sdata[idx + block_elem_idx] - m) / d;
     x += MU_BLOCK_SIZE;
     x_sdata += MU_BLOCK_SIZE;
   }
