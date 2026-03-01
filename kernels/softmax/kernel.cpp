@@ -21,8 +21,8 @@ inline void reduce(__shared float *max_sdata, __shared float *denom_sdata, uint3
       uint32_t idx_a = tid * skip, idx_b = (tid + (stride >> 1)) * skip;
       float max_a = max_sdata[idx_a], max_b = max_sdata[idx_b];
       float next_max = fmaxf(max_a, max_b);
-      denom_sdata[tid] = denom_sdata[idx_a] * mu_fexp(next_max - max_a) + denom_sdata[idx_b] * mu_fexp(next_max - max_b);
-      max_sdata[tid] = next_max;
+      denom_sdata[tid * skip] = denom_sdata[idx_a] * mu_fexp(next_max - max_a) + denom_sdata[idx_b] * mu_fexp(next_max - max_b);
+      max_sdata[tid * skip] = next_max;
     }
   }
 }
@@ -41,10 +41,8 @@ void softmax(
   
 
   uint32_t row_elems = args->cols;
-  uint32_t rows_per_threadblock = (MU_BLOCK_SIZE + row_elems - 1) / row_elems;
-  uint32_t block_row_idx = threadblock_id * rows_per_threadblock;
-  if (block_row_idx >= args->rows) return;
-  uint32_t block_elem_idx = block_row_idx * row_elems;
+  if (threadblock_id >= args->rows) return; // 1 row per threadblock
+  uint32_t block_elem_idx = threadblock_id * row_elems;
   uint32_t chunks_per_block = (row_elems + MU_BLOCK_SIZE - 1) / MU_BLOCK_SIZE;
 
   float *x = args->x + block_elem_idx;
