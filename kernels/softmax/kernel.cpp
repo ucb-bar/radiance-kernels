@@ -43,6 +43,7 @@ void softmax(
   uint32_t row_elems = args->cols;
   uint32_t rows_per_threadblock = (MU_BLOCK_SIZE + row_elems - 1) / row_elems;
   uint32_t block_row_idx = threadblock_id * rows_per_threadblock;
+  if (block_row_idx >= args->rows) return;
   uint32_t block_elem_idx = block_row_idx * row_elems;
   uint32_t chunks_per_block = (row_elems + MU_BLOCK_SIZE - 1) / MU_BLOCK_SIZE;
 
@@ -58,6 +59,7 @@ void softmax(
   for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
     // load row to smem, fexp in smem
     uint32_t idx = chunk * MU_BLOCK_SIZE + tid;
+    if (idx >= row_elems) break;
     x_sdata[idx] = x[idx];
     float next_max = fmaxf(x_sdata[idx], max);
     denom = denom * mu_fexp(next_max - max) + mu_fexp(x_sdata[idx] - next_max);
@@ -81,11 +83,10 @@ void softmax(
   // max and denom in tid 0
   float m = max_sdata[0], d = denom_sdata[0];
 
-  x -= row_elems;
-  x_sdata -= row_elems;
   // compute softmax for each element chunk by chunk
   for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
     uint32_t idx = chunk * MU_BLOCK_SIZE + tid;
+    if (idx >= row_elems) break;
     x[idx] = mu_fexp(x_sdata[idx] - m) / d;
   }
 }
