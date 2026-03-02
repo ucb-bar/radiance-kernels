@@ -7,7 +7,7 @@
 #include <stdint.h>
 
 struct SoftmaxArgs {
-  float* x;
+  __global float* x;
   uint32_t rows;
   uint32_t cols;
 };
@@ -44,7 +44,7 @@ void softmax(
   uint32_t block_elem_idx = threadblock_id * row_elems;
   uint32_t chunks_per_block = (row_elems + MU_BLOCK_SIZE - 1) / MU_BLOCK_SIZE;
 
-  float *x = args->x + block_elem_idx;
+  __global float *x = args->x + block_elem_idx;
   __shared float *x_sdata = sdata;
   __shared float *max_sdata = sdata + row_elems;
   __shared float *denom_sdata = max_sdata + MU_BLOCK_SIZE;
@@ -98,7 +98,12 @@ SoftmaxArgs softmax_args = {
   .cols = 0,
 };
 
+#include "data"
+
 int main() {
+  softmax_args.x = x;
+  softmax_args.rows = rows;
+  softmax_args.cols = cols;
   mu_schedule(softmax, &softmax_args);
   return 0;
 }

@@ -12,8 +12,8 @@ __global float x[] = {
     $x_literals
 };
 
-const uint32_t softmax_rows = $rows;
-const uint32_t softmax_cols = $cols;
+const uint32_t rows = $rows;
+const uint32_t cols = $cols;
 """
 )
 
