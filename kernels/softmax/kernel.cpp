@@ -14,15 +14,14 @@ struct SoftmaxArgs {
 
 __shared float* const sdata = reinterpret_cast<__shared float*>(0x0);
 
-template <uint32_t skip>
 inline void reduce(__shared float *max_sdata, __shared float *denom_sdata, uint32_t tid, uint32_t lane_id) {
   for (uint32_t stride = 2; stride <= MU_NUM_THREADS; stride *= 2) {
     if (lane_id % stride == 0) {
-      uint32_t idx_a = tid * skip, idx_b = (tid + (stride >> 1)) * skip;
+      uint32_t idx_a = tid, idx_b = (tid + (stride >> 1));
       float max_a = max_sdata[idx_a], max_b = max_sdata[idx_b];
       float next_max = fmaxf(max_a, max_b);
-      denom_sdata[tid * skip] = denom_sdata[idx_a] * mu_fexp(next_max - max_a) + denom_sdata[idx_b] * mu_fexp(next_max - max_b);
-      max_sdata[tid * skip] = next_max;
+      denom_sdata[tid] = denom_sdata[idx_a] * mu_fexp(next_max - max_a) + denom_sdata[idx_b] * mu_fexp(next_max - max_b);
+      max_sdata[tid] = next_max;
     }
   }
 }
@@ -68,13 +67,17 @@ void softmax(
   max_sdata[tid] = max;
 
   // warp reduce
-  reduce<1>(max_sdata, denom_sdata, tid, lane_id);
+  reduce(max_sdata, denom_sdata, tid, lane_id);
+
+  // only works because num_warps = num_lanes
+  if (lane_id == 0)
+    max_sdata[warp_id] = max_sdata[tid];
 
   vx_barrier(0, MU_BLOCK_NUM_WARPS);
 
   // block reduce
   if (warp_id == 0)
-    reduce<MU_NUM_THREADS>(max_sdata, denom_sdata, tid, lane_id);
+    reduce(max_sdata, denom_sdata, tid, lane_id);
 
   vx_barrier(0, MU_BLOCK_NUM_WARPS);
 
