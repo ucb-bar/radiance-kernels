@@ -59,15 +59,15 @@ inline int mu_num_threads() {
     return vx_num_threads();
 }
 
-inline float mu_fexp(float arg) {
-    float output;
-    asm volatile("fexp.s %0, %1" ::"r"(output), "r"(arg));
+inline _Float16 mu_fexp(_Float16 arg) {
+    _Float16 output;
+    asm volatile("fexp.h %0, %1" : "=r"(output) : "r"(arg));
     return output;
 }
 
-inline float mu_fnexp(float arg) {
-    float output;
-    asm volatile("fnexp.s %0, %1" ::"r"(output), "r"(arg));
+inline _Float16 mu_fnexp(_Float16 arg) {
+    _Float16 output;
+    asm volatile("fnexp.h %0, %1" : "=r"(output) : "r"(arg));
     return output;
 }
 
