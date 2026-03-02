@@ -14,7 +14,7 @@ struct SoftmaxArgs {
 
 __shared _Float16* const sdata = reinterpret_cast<__shared _Float16*>(0x0);
 
-inline void reduce(__shared _Float16 *max_sdata, __shared _Float16 *denom_sdata, uint32_t tid, uint32_t lane_id) {
+void reduce(__shared _Float16 *max_sdata, __shared _Float16 *denom_sdata, uint32_t tid, uint32_t lane_id) {
   for (uint32_t stride = 2; stride <= MU_NUM_THREADS; stride *= 2) {
     if (lane_id % stride == 0) {
       uint32_t idx_a = tid, idx_b = (tid + (stride >> 1));
@@ -26,7 +26,7 @@ inline void reduce(__shared _Float16 *max_sdata, __shared _Float16 *denom_sdata,
   }
 }
 
-// requires that cols + BLOCK_SIZE * 2 fits in smem (one row + max of one row + denom of one row)
+// requires that cols + BLOCK_SIZE * 3 fits in smem (one row + max of one row + denom of one row + temp in shmem)
 void softmax(
   void* arg,
   uint32_t tid_in_threadblock,
@@ -49,8 +49,8 @@ void softmax(
   __shared _Float16 *max_sdata = sdata + row_elems;
   __shared _Float16 *denom_sdata = max_sdata + MU_BLOCK_SIZE;
   
-  _Float16 max = -INFINITY;
-  _Float16 denom = 0; 
+  denom_sdata[tid] = 0;
+  max_sdata[tid] = -INFINITY;
 
   // load chunk and compute max and denom
   for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
@@ -58,13 +58,10 @@ void softmax(
     uint32_t idx = chunk * MU_BLOCK_SIZE + tid;
     if (idx >= row_elems) break;
     x_sdata[idx] = x[idx];
-    _Float16 next_max = fmaxf(x_sdata[idx], max);
-    denom = denom * mu_fexp(next_max - max) + mu_fexp(x_sdata[idx] - next_max);
-    max = next_max;
+    _Float16 next_max = fmaxf(x_sdata[idx], max_sdata[tid]);
+    denom_sdata[tid] = denom_sdata[tid] * mu_fexp(next_max - max_sdata[tid]) + mu_fexp(x_sdata[idx] - next_max);
+    max_sdata[tid] = next_max;
   }
-
-  denom_sdata[tid] = denom;
-  max_sdata[tid] = max;
 
   // warp reduce
   reduce(max_sdata, denom_sdata, tid, lane_id);
