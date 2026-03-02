@@ -7,19 +7,19 @@
 #include <stdint.h>
 
 struct SoftmaxArgs {
-  __global float* x;
+  __global _Float16* x;
   uint32_t rows;
   uint32_t cols;
 };
 
-__shared float* const sdata = reinterpret_cast<__shared float*>(0x0);
+__shared _Float16* const sdata = reinterpret_cast<__shared _Float16*>(0x0);
 
-inline void reduce(__shared float *max_sdata, __shared float *denom_sdata, uint32_t tid, uint32_t lane_id) {
+inline void reduce(__shared _Float16 *max_sdata, __shared _Float16 *denom_sdata, uint32_t tid, uint32_t lane_id) {
   for (uint32_t stride = 2; stride <= MU_NUM_THREADS; stride *= 2) {
     if (lane_id % stride == 0) {
       uint32_t idx_a = tid, idx_b = (tid + (stride >> 1));
-      float max_a = max_sdata[idx_a], max_b = max_sdata[idx_b];
-      float next_max = fmaxf(max_a, max_b);
+      _Float16 max_a = max_sdata[idx_a], max_b = max_sdata[idx_b];
+      _Float16 next_max = fmaxf(max_a, max_b);
       denom_sdata[tid] = denom_sdata[idx_a] * mu_fexp(next_max - max_a) + denom_sdata[idx_b] * mu_fexp(next_max - max_b);
       max_sdata[tid] = next_max;
     }
@@ -44,13 +44,13 @@ void softmax(
   uint32_t block_elem_idx = threadblock_id * row_elems;
   uint32_t chunks_per_block = (row_elems + MU_BLOCK_SIZE - 1) / MU_BLOCK_SIZE;
 
-  __global float *x = args->x + block_elem_idx;
-  __shared float *x_sdata = sdata;
-  __shared float *max_sdata = sdata + row_elems;
-  __shared float *denom_sdata = max_sdata + MU_BLOCK_SIZE;
+  __global _Float16 *x = args->x + block_elem_idx;
+  __shared _Float16 *x_sdata = sdata;
+  __shared _Float16 *max_sdata = sdata + row_elems;
+  __shared _Float16 *denom_sdata = max_sdata + MU_BLOCK_SIZE;
   
-  float max = -INFINITY;
-  float denom = 0; 
+  _Float16 max = -INFINITY;
+  _Float16 denom = 0; 
 
   // load chunk and compute max and denom
   for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
@@ -58,7 +58,7 @@ void softmax(
     uint32_t idx = chunk * MU_BLOCK_SIZE + tid;
     if (idx >= row_elems) break;
     x_sdata[idx] = x[idx];
-    float next_max = fmaxf(x_sdata[idx], max);
+    _Float16 next_max = fmaxf(x_sdata[idx], max);
     denom = denom * mu_fexp(next_max - max) + mu_fexp(x_sdata[idx] - next_max);
     max = next_max;
   }
@@ -87,7 +87,7 @@ void softmax(
   vx_barrier(0, MU_BLOCK_NUM_WARPS);
 
   // max and denom in tid 0
-  float m = max_sdata[0], inv_d = denom_sdata[0];
+  _Float16 m = max_sdata[0], inv_d = denom_sdata[0];
 
   // compute softmax for each element chunk by chunk
   for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
