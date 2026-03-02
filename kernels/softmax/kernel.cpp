@@ -70,25 +70,30 @@ void softmax(
   reduce(max_sdata, denom_sdata, tid, lane_id);
 
   // only works because num_warps = num_lanes
-  if (lane_id == 0)
+  if (lane_id == 0) {
+    denom_sdata[warp_id] = denom_sdata[tid];
     max_sdata[warp_id] = max_sdata[tid];
+  }
 
   vx_barrier(0, MU_BLOCK_NUM_WARPS);
 
   // block reduce
-  if (warp_id == 0)
+  if (warp_id == 0) {
     reduce(max_sdata, denom_sdata, tid, lane_id);
+    if (lane_id == 0)
+      denom_sdata[0] = 1 / denom_sdata[0]; 
+  }
 
   vx_barrier(0, MU_BLOCK_NUM_WARPS);
 
   // max and denom in tid 0
-  float m = max_sdata[0], d = denom_sdata[0];
+  float m = max_sdata[0], inv_d = denom_sdata[0];
 
   // compute softmax for each element chunk by chunk
   for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
     uint32_t idx = chunk * MU_BLOCK_SIZE + tid;
     if (idx >= row_elems) break;
-    x[idx] = mu_fexp(x_sdata[idx] - m) / d;
+    x[idx] = mu_fexp(x_sdata[idx] - m) * inv_d;
   }
 }
 
