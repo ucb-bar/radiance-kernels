@@ -15,7 +15,7 @@ typedef uint64_t  out_t;    // C_scaled: fp8:e4m3 (1 byte per output)
 // global section that will store fp8 outputs from Gemmini
 static uint64_t C_out_got[DIM][DIM] = {0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF,};
 
-static void __attribute__ ((noinline)) load_scale_factors(volatile uint32_t *sf_mem, const uint8_t *scale_factors, int n) {
+static void load_scale_factors(volatile uint32_t *sf_mem, const uint8_t *scale_factors, int n) {
     auto word_scale_factors = reinterpret_cast<const uint32_t *>(scale_factors);
     for (size_t i = 0; i < n / 4; i ++) {
         // do foll-word stores instead of 1-byte stores
@@ -47,7 +47,7 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
     // We want 1 byte per output element in DRAM
     gemmini_extended_config_st(DIM * sizeof(out_t), NO_ACTIVATION, 1);
 
-#if 0
+#if 1
     // Load per-element scaling factors into the scale SRAM
     // (C_scale is uint8_t[DIM][DIM], packed row-major)
     // load_scale_factors((const uint64_t *) C_scale, sizeof(C_scale));
