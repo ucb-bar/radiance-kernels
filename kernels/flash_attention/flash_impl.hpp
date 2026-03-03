@@ -4,26 +4,30 @@
 #include <stdint.h>
 #include <mu_intrinsics.h>
 
+#define SEQLEN 1024
+#define HEADDIM 64
 #define B_ROW 64
 #define B_COL 64
-#define HEADDIM 128
 
 /** Move BF16 tensor data from DMEM->SMEM.
  *  This is an equivalent memcopy operation to Gemmini DMA that is implemented
  *  in SIMT.
  *  Assumes row-major layout for both src and dest. */
 template <uint32_t dim_row, uint32_t dim_col>
-inline void copy_gmem_to_smem(const volatile _Float16 *src_dmem, volatile _Float16 *dest_smem,
+inline void copy_gmem_to_smem(const volatile _Float16 *src_gmem, volatile _Float16 *dest_smem,
                               const uint32_t tid_in_threadblock,
                               const uint32_t threads_per_threadblock) {
-    constexpr auto NT = MU_NUM_THREADS;
-    const auto tid_in_warp = tid_in_threadblock % NT;
-    const auto iter = (dim_row * dim_col) / NT;
+    // Thread mapping: All warps in a threadblock cooperatively copies a
+    // contiguous chunk of the same size as the threadblock per every "wave".
+    // The number of waves are determined with:
+    const auto iter = (dim_row * dim_col) / threads_per_threadblock;
 
 #pragma unroll 16
     for (int i = 0; i < iter; i++) {
-        const auto index = NT * i + tid_in_warp;
-        dest_smem[index] = load16_shared(&src_dmem[index]);
+        const auto index = (threads_per_threadblock) * i + tid_in_threadblock;
+        const auto data = src_gmem[index];
+        auto smem_address = &dest_smem[index];
+        asm volatile("sh.shared %1, 0(%0)" :: "r"(smem_address), "r"(data) : "memory");
     }
 }
 
