@@ -14,7 +14,7 @@ struct SoftmaxArgs {
 
 __shared _Float16* const sdata = reinterpret_cast<__shared _Float16*>(0x0);
 
-void reduce(__shared _Float16 *max_sdata, __shared _Float16 *denom_sdata, uint32_t tid, uint32_t lane_id) {
+static inline void reduce(__shared _Float16 *max_sdata, __shared _Float16 *denom_sdata, uint32_t tid, uint32_t lane_id) {
   for (uint32_t stride = 2; stride <= MU_NUM_THREADS; stride *= 2) {
     if (lane_id % stride == 0) {
       uint32_t idx_a = tid, idx_b = (tid + (stride >> 1));
@@ -26,7 +26,8 @@ void reduce(__shared _Float16 *max_sdata, __shared _Float16 *denom_sdata, uint32
   }
 }
 
-// requires that cols + BLOCK_SIZE * 3 fits in smem (one row + max of one row + denom of one row + temp in shmem)
+// requires that cols + BLOCK_SIZE * 2 fits in smem (one row + max of one row + denom of one row)
+// requires that you do NOT spawn a threadblock for a non existent row
 void softmax(
   void* arg,
   uint32_t tid_in_threadblock,
@@ -40,7 +41,6 @@ void softmax(
   
 
   uint32_t row_elems = args->cols;
-  if (threadblock_id >= args->rows) return; // 1 row per threadblock
   uint32_t block_elem_idx = threadblock_id * row_elems;
   uint32_t chunks_per_block = (row_elems + MU_BLOCK_SIZE - 1) / MU_BLOCK_SIZE;
 
