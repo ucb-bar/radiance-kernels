@@ -5,6 +5,8 @@
 #include <type_traits>
 #include <vx_intrinsics.h>
 
+#define MU_CSR_CLUSTER_ID 0xCD0
+
 inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {
     asm volatile("sw.shared %2, %1(%0)" :: "r"(base), "I"(offset), "r"(data)
                  : "memory");
@@ -34,6 +36,7 @@ inline uint32_t load32_shared(uint32_t address) {
     uint32_t data;
     asm volatile("lh.shared %0, %1(%2)" : "=r"(data) : "I"(0), "r"(address)
                  : "memory");
+    return data;
 }
 
 template <typename T>
