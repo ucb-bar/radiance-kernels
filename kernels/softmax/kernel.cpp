@@ -20,7 +20,7 @@ static inline void reduce(__shared _Float16 *max_sdata, __shared _Float16 *denom
       uint32_t idx_a = tid, idx_b = (tid + (stride >> 1));
       _Float16 max_a = max_sdata[idx_a], max_b = max_sdata[idx_b];
       _Float16 next_max = fmaxf(max_a, max_b);
-      denom_sdata[tid] = denom_sdata[idx_a] * mu_fexp(next_max - max_a) + denom_sdata[idx_b] * mu_fexp(next_max - max_b);
+      denom_sdata[tid] = denom_sdata[idx_a] * mu_fexp(max_a - next_max) + denom_sdata[idx_b] * mu_fexp(max_b - next_max);
       max_sdata[tid] = next_max;
     }
   }
@@ -61,7 +61,7 @@ void softmax(
     if (idx >= row_elems) break;
     x_sdata[idx] = x[idx];
     _Float16 next_max = fmaxf(x_sdata[idx], max_sdata[tid]);
-    denom_sdata[tid] = denom_sdata[tid] * mu_fexp(next_max - max_sdata[tid]) + mu_fexp(x_sdata[idx] - next_max);
+    denom_sdata[tid] = denom_sdata[tid] * mu_fexp(max_sdata[tid] - next_max) + mu_fexp(x_sdata[idx] - next_max);
     max_sdata[tid] = next_max;
   }
 
@@ -105,7 +105,7 @@ SoftmaxArgs softmax_args = {
 #include "data"
 
 int main() {
-  softmax_args.x = x;
+  softmax_args.x = reinterpret_cast<__global _Float16*>(x_raw);
   softmax_args.rows = rows;
   softmax_args.cols = cols;
   mu_schedule(softmax, &softmax_args);
