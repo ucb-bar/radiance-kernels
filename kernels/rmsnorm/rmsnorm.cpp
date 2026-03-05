@@ -8,21 +8,17 @@
 
 #define EPS 1.0e-6f
 
-void syncthreads() {
-  // barrier id 0, wait for all 2 cores * 8 warps/core = 16 warps to reach it
-  vx_barrier(0, 16);
-}
-
-void warp_reduce(__shared volatile float *sdata, unsigned int lane) {
+// inlining this increases register pressure too much
+__attribute__((noinline)) static void warp_reduce(__shared volatile float *sdata, unsigned int lane) {
   // muon warps are 16-wide
-  sdata[lane] += sdata[lane + 16];
-  sdata[lane] += sdata[lane + 8];
-  sdata[lane] += sdata[lane + 4];
-  sdata[lane] += sdata[lane + 2];
-  sdata[lane] += sdata[lane + 1];
+  if (lane < 8)  sdata[lane] += sdata[lane + 8];
+  if (lane < 4)  sdata[lane] += sdata[lane + 4];
+  if (lane < 2)  sdata[lane] += sdata[lane + 2];
+  if (lane < 1)  sdata[lane] += sdata[lane + 1];
 }
 
-float inv_rms(float sum_squares, size_t n) {
+// inlining this increases register pressure too much
+__attribute__((noinline)) static float inv_rms(float sum_squares, size_t n) {
   return 1.0f / sqrtf(EPS + sum_squares / n);
 }
 
@@ -34,7 +30,7 @@ float inv_rms(float sum_squares, size_t n) {
 // `gamma` dimensions = (D,)
 // assumes 2 cores * 8 warps/core = 16 warps in 1 threadblock
 template <size_t D>
-void rmsnorm2(
+__attribute__((always_inline)) static inline void rmsnorm2(
   __global float* data,
   __global float* __restrict__ gamma,
   uint32_t L,
@@ -47,7 +43,7 @@ void rmsnorm2(
   uint32_t warp = tid_in_threadblock / 16;
   uint32_t lane = tid_in_threadblock % 16;
 
-  __shared float* warp_sdata = reinterpret_cast<__shared float*>(warp * threads_per_warp * sizeof(float));
+  __shared volatile float* warp_sdata = reinterpret_cast<__shared float*>(warp * threads_per_warp * sizeof(float));
 
   uint32_t i = warp;
   while (i < L) {
@@ -56,8 +52,8 @@ void rmsnorm2(
     float accum = 0.0f;
     warp_sdata[lane] = 0.0f;
 
-    for (uint32_t j = lane; j < D; j += threads_per_warp) {
-      float f = warp_data[j];
+    for (uint32_t k = 0; k < (D / threads_per_warp); k += 1) {
+      float f = warp_data[lane + k * threads_per_warp];
       accum += f * f;
     }
 
@@ -73,11 +69,20 @@ void rmsnorm2(
     // IPDOM scheduling should ensure that irms gets the right value...
     
     float irms = warp_sdata[0];
-    for (uint32_t j = lane; j < D; j += threads_per_warp) {
-      warp_data[j] *= gamma[j] * irms;
+
+    // somehow, this strange code shape gets clang to split this into two loops
+    // the first which premultiplies gamma, the second multiplying by irms, sharing the 
+    // same instructions
+    // ¯\_(ツ)_/¯ agentic descent op i suppose
+    __global float* wd = warp_data + lane;
+    __global float* gg = gamma + lane;
+    for (uint32_t k = 0; k < (D / threads_per_warp); ++k) {
+      *wd *= *gg * irms;
+      wd += threads_per_warp;
+      gg += threads_per_warp;
     }
 
-    i += warps_per_threadblock * D;
+    i += warps_per_threadblock;
   }
 }
 
@@ -87,7 +92,7 @@ static struct RmsNormArgs {
   uint32_t L;
 } rmsnorm_args;
 
-void rmsnorm2_entry(void* arg, uint32_t tid_in_threadblock, uint32_t _threads_per_threadblock, uint32_t _threadblock_id) {
+static void rmsnorm2_entry(void* arg, uint32_t tid_in_threadblock, uint32_t _threads_per_threadblock, uint32_t _threadblock_id) {
   const auto* a = reinterpret_cast<const RmsNormArgs*>(arg);
   rmsnorm2<192>(a->data, a->gamma, a->L, tid_in_threadblock);
 }
@@ -97,7 +102,7 @@ void rmsnorm2_entry(void* arg, uint32_t tid_in_threadblock, uint32_t _threads_pe
 int main() {
   rmsnorm_args.data = data;
   rmsnorm_args.gamma = gamma;
-  rmsnorm_args.L = 1024;
+  rmsnorm_args.L = 128;
   mu_schedule(rmsnorm2_entry, &rmsnorm_args);
 
   return 0;

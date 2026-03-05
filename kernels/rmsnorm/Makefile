@@ -8,5 +8,5 @@ HOST_SRCS = host.cpp
 include ../common.mk
 
 rmsnorm.mu.o: data
-data:
+data: rmsnorm.py
 	python3 rmsnorm.py
