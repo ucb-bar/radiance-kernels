@@ -75,8 +75,9 @@ inline _Float16 mu_fnexp(_Float16 arg) {
 }
 
 
+__attribute__((convergent))
 inline void mu_barrier(unsigned barried_id, unsigned num_warps) {
-    asm volatile ("vx_bar %0, %1" :: "r"(barried_id), "r"(num_warps));
+    asm volatile ("vx_bar %0, %1" :: "r"(barried_id), "r"(num_warps) : "memory");
 }
 
 // TODO: half?
