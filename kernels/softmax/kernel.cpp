@@ -74,7 +74,7 @@ void softmax(
     max_sdata[warp_id] = max_sdata[tid];
   }
 
-  vx_barrier(0, MU_BLOCK_NUM_WARPS);
+  mu_barrier(0, MU_BLOCK_NUM_WARPS);
 
   // block reduce
   if (warp_id == 0) {
@@ -83,7 +83,7 @@ void softmax(
       denom_sdata[0] = 1 / denom_sdata[0]; 
   }
 
-  vx_barrier(0, MU_BLOCK_NUM_WARPS);
+  mu_barrier(0, MU_BLOCK_NUM_WARPS);
 
   // max and denom in tid 0
   _Float16 m = max_sdata[0], inv_d = denom_sdata[0];
