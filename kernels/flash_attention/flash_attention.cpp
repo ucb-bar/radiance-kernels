@@ -1,8 +1,8 @@
-#include <radiance.h>
 #include <mu_schedule.h>
+#include <radiance.h>
 
-#include "flash_impl.hpp"
 #include "args.hpp"
+#include "flash_impl.hpp"
 #include "include/matmul_data.h"
 
 extern _Float16 numpy_a_bin[];
@@ -26,7 +26,8 @@ void kernel_entry(void *arg, uint32_t tid_in_threadblock,
                               threads_per_threadblock);
 
     auto rowmax_smem = reinterpret_cast<_Float16 *>(0x10000);
-    rowmax<64, 64>(Q_smem, rowmax_smem, tid_in_threadblock,
+    auto rowmax_scratch_smem = reinterpret_cast<_Float16 *>(0x20000);
+    rowmax<64, 64>(Q_smem, rowmax_smem, rowmax_scratch_smem, tid_in_threadblock,
                    threads_per_threadblock, threadblock_id);
 }
 
