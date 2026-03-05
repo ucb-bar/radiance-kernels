@@ -14,19 +14,20 @@ void kernel_entry(void *arg, uint32_t tid_in_threadblock,
 
     // const auto tid = mu_mhartid; // TODO
 
-    _Float16 result[16] = {0};
     // auto tensor = reinterpret_cast<const _Float16 *>(A_in);
 
     // get argument data written by host
     auto host_arg = reinterpret_cast<volatile uint32_t *>(RAD_DEVICE_ARG_BASE);
     auto temp = *host_arg;
 
-    auto src_gmem = kernel_arg->addr_q;
-    copy_gmem_to_smem<64, 64>(src_gmem, 0 /*dest_smem*/, tid_in_threadblock,
+    auto Q_gmem = kernel_arg->addr_q;
+    _Float16 *Q_smem = 0;
+    copy_gmem_to_smem<64, 64>(Q_gmem, Q_smem, tid_in_threadblock,
                               threads_per_threadblock);
 
-    // rowmax<1024, 64>(numpy_a_bin, result, 0, 0, 0);
-    // rowmax<1024, 64>(0, result, 0, 0, 0);
+    auto rowmax_smem = reinterpret_cast<_Float16 *>(0x10000);
+    rowmax<64, 64>(Q_smem, rowmax_smem, tid_in_threadblock,
+                   threads_per_threadblock, threadblock_id);
 }
 
 int main() {
@@ -38,6 +39,8 @@ int main() {
         .addr_v = reinterpret_cast<_Float16 *>(0x40000000), // FIXME temporary
         .addr_o = reinterpret_cast<_Float16 *>(0x50000000), // FIXME temporary
     };
+
+    // TODO: &arg may come from the CPU
     mu_schedule(kernel_entry, &arg);
 
     return 0;

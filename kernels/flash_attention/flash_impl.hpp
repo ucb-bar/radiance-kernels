@@ -1,7 +1,8 @@
 #ifndef _FLASH_IMPL_H_
 #define _FLASH_IMPL_H_
 
-#include <stdint.h>
+#include <cstdint>
+#include <cmath>
 #include <mu_intrinsics.h>
 
 #define SEQLEN 1024
@@ -9,9 +10,7 @@
 #define B_ROW 64
 #define B_COL 64
 
-/** Move BF16 tensor data from DMEM->SMEM.
- *  This is an equivalent memcopy operation to Gemmini DMA that is implemented
- *  in SIMT.
+/** Move BF16 tensor data from GMEM->SMEM.
  *  Assumes row-major layout for both src and dest. */
 template <uint32_t dim_row, uint32_t dim_col>
 inline void copy_gmem_to_smem(const volatile _Float16 *src_gmem, volatile _Float16 *dest_smem,
@@ -36,7 +35,7 @@ template <uint32_t dim_row, uint32_t dim_col>
 inline void rowmax(const _Float16 *tensor, _Float16 *result,
                    const uint32_t tid_in_threadblock,
                    const uint32_t threads_per_threadblock,
-                   const uint32_t threadblock_id_in_cluster) {
+                   const uint32_t threadblock_id) {
     // Thread mapping scheme
     // ---------------------
     //
@@ -65,15 +64,13 @@ inline void rowmax(const _Float16 *tensor, _Float16 *result,
     _Float16 max_per_thread = load16_shared(elem_addr);
     for (int i = 0; i < iter; i++) {
         const auto elem = load16_shared(elem_addr);
-        if (elem > max_per_thread) {
-            max_per_thread = elem;
-        }
+        max_per_thread = fmax(elem, max_per_thread);
         elem_addr += NT;
     }
 
     // TODO: threadblock barrier here
-
-    result[0] = max_per_thread;
+    auto result_addr = &result[row * NT + tid_in_warp];
+    asm volatile("sh.shared %1, 0(%0)" :: "r"(result_addr), "r"(max_per_thread) : "memory");
 }
 
 #endif
