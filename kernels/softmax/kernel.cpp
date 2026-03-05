@@ -49,12 +49,14 @@ void softmax(
   __shared _Float16 *max_sdata = sdata + row_elems;
   __shared _Float16 *denom_sdata = max_sdata + MU_BLOCK_SIZE;
   
-  denom_sdata[tid] = 0;
-  max_sdata[tid] = -INFINITY;
+  // init from first valid element to avoid 0 * exp(+inf) on first step
+  // require that each row is a multiple of block size
+  x_sdata[tid] = x[tid];
+  max_sdata[tid] = x_sdata[tid];
+  denom_sdata[tid] = (_Float16)0x1.0000000000000p+0;
 
-  // load chunk and compute max and denom
-  for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
-    // load row to smem, fexp in smem
+  // repeat for remaining chunks
+  for (uint32_t chunk = 1; chunk < chunks_per_block; chunk++) {
     uint32_t idx = chunk * MU_BLOCK_SIZE + tid;
     if (idx >= row_elems) break;
     x_sdata[idx] = x[idx];
