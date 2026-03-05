@@ -21,6 +21,11 @@
 #define RAD_HOST_GPU_ALL_FINISHED 0x41000008ull
 #define RAD_HOST_GPU_CORES 0x41000010ull
 
+/** Convert GPU-local GMEM address to CPU-addressable global address */
+inline uint64_t rad_device_to_host_address(uint32_t addr) {
+    return (static_cast<uint64_t>(addr) | RAD_HOST_GPU_DRAM_BASE);
+}
+
 #ifndef RADIANCE_DEVICE
 
 // Host-only interfaces
