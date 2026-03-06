@@ -39,7 +39,6 @@ void softmax(
   uint32_t warp_id = tid_in_threadblock / 16;
   uint32_t tid = tid_in_threadblock;
   
-
   uint32_t row_elems = args->cols;
   uint32_t block_elem_idx = threadblock_id * row_elems;
   uint32_t chunks_per_block = (row_elems + MU_BLOCK_SIZE - 1) / MU_BLOCK_SIZE;
