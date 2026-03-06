@@ -5,6 +5,9 @@
 #include <type_traits>
 #include <vx_intrinsics.h>
 
+// You need to use __builtin_bit_cast(_Float16, ONE_BF16_BITS) for the compiler to correctly emit it.
+#define ONE_BF16_BITS ((uint16_t)0x3f80)
+
 #define MU_CSR_CLUSTER_ID 0xCD0
 
 inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {
