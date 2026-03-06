@@ -6,8 +6,8 @@ from string import Template
 import torch
 
 
-ROWS = 4
-COLS = 1024
+ROWS = 2
+COLS = 4096
 SEED = 0
 
 
