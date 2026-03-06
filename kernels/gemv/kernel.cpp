@@ -84,6 +84,11 @@ GEMVArgs gemv_args = {
 #include "data"
 
 int main() {
+  gemv_args.A = reinterpret_cast<__global _Float16*>(A_raw);
+  gemv_args.x = reinterpret_cast<__global _Float16*>(x_raw);
+  gemv_args.y = reinterpret_cast<__global _Float16*>(y_raw);
+  gemv_args.m = m;
+  gemv_args.n = n;
   mu_schedule(gemv, &gemv_args);
   return 0;
 }
