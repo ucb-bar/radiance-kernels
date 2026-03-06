@@ -37,7 +37,7 @@ inline uint16_t load16_shared(uint32_t address) {
 
 inline uint32_t load32_shared(uint32_t address) {
     uint32_t data;
-    asm volatile("lh.shared %0, %1(%2)" : "=r"(data) : "I"(0), "r"(address)
+    asm volatile("lw.shared %0, %1(%2)" : "=r"(data) : "I"(0), "r"(address)
                  : "memory");
     return data;
 }
@@ -49,6 +49,10 @@ inline std::remove_cv_t<T> load16_shared(const T *address) {
     static_assert(sizeof(U) == sizeof(uint16_t), "load16_shared<T*> expects 16-bit T");
     uint16_t bits = load16_shared(reinterpret_cast<uint32_t>(address));
     return __builtin_bit_cast(U, bits);
+}
+
+inline void mu_fence() {
+    asm volatile("fence");
 }
 
 // Number of threads per warp.
