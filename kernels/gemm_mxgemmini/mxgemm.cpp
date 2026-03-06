@@ -7,12 +7,13 @@
 #include "include/matmul_data_mx_fp8.h"
 #include "mxgemmini_mmio.h"
 
-constexpr auto TILE_M = 64;
-constexpr auto TILE_N = 64;
-constexpr auto TILE_K = 64;
+constexpr auto TILE_M = 128;
+constexpr auto TILE_N = 128;
+constexpr auto TILE_K = 128;
 constexpr auto PE_TILES_I = TILE_M / DIM;
 constexpr auto PE_TILES_J = TILE_N / DIM;
 constexpr auto PE_TILES_K = TILE_K / DIM;
+constexpr auto SCALE_FAC_DIM = TILE_M * TILE_K / 32;
 
 // TODO: cleanup
 typedef uint8_t elem_t;   // A_in: lower 8 bits = fp8:e4m3, upper bits zero
@@ -22,12 +23,26 @@ typedef uint64_t  out_t;    // C_scaled: fp8:e4m3 (1 byte per output)
 // global section that will store fp8 outputs from Gemmini
 static uint64_t C_out_got[DIM][DIM] = {0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF,};
 
-static inline void load_scale_factors(volatile uint32_t *sf_mem, const uint8_t *scale_factors, int n) {
-    auto word_scale_factors = reinterpret_cast<const uint32_t *>(scale_factors);
-    for (size_t i = 0; i < n / 4; i ++) {
-        // do full-word stores instead of 1-byte stores
-        store_shared(reinterpret_cast<uint32_t>(&sf_mem[i]), 0, word_scale_factors[i]);
+static void load_scale_factors(volatile uint32_t *sf_mem,
+                               const uint8_t *scale_factors, int n) {
+  // asm volatile ("load_scale_factors_start_%=:" :: );
+  auto word_scale_factors = reinterpret_cast<const uint32_t *>(scale_factors);
+
+  constexpr auto ILP = 8;
+  uint32_t unrolled[ILP];
+
+#pragma unroll 4
+    for (size_t i = 0; i < n / 4; i += ILP) {
+#pragma unroll
+        for (int j = 0; j < ILP; j++) {
+            // do full-word stores instead of 1-byte stores
+            unrolled[j] = word_scale_factors[i + j];
+        }
+        for (int j = 0; j < ILP; j++) {
+            store_shared(reinterpret_cast<uint32_t>(&sf_mem[i + j]), 0, unrolled[j]);
+        }
     }
+    // asm volatile ("load_scale_factors_end_%=:" :: );
 }
 
 static inline void configure_mxgemmini() {
@@ -60,9 +75,9 @@ static inline void configure_mxgemmini() {
     gemmini_fence();
 }
 
-static inline void copy_a_b_gmem_to_smem(const uint32_t tile_i,
-                                         const uint32_t tile_j,
-                                         const uint32_t tile_k) {
+static inline void copy_gmem_to_smem_async(const uint32_t tile_i,
+                                           const uint32_t tile_j,
+                                           const uint32_t tile_k) {
   // Gemmini expects the full A/B tensor to be stored in block-level
   // row-major layout, i.e.:
   // The tensor is partitioned into DIM x DIM tiles.
@@ -147,7 +162,7 @@ static inline void copy_a_b_gmem_to_smem(const uint32_t tile_i,
 #endif
 }
 
-static inline void matmul_smem_tile() {
+static inline void matmul_tile_async() {
     uint32_t acc_addr = (1u << (ADDR_LEN - 1));
     gemmini_loop_ws_spad(
         PE_TILES_I, PE_TILES_J, PE_TILES_K, // loop bounds for I, J, K (single 16×16 PE tile)
@@ -171,36 +186,70 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
         return;
     }
 
+    // FIXME
+    static uint32_t scale_factors[16] = {
+        0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000,  // e.g. 1.0f in IEEE754
+        0x40000000, 0x40000000, 0x40000000, 0x40000000,  // e.g. 2.0f
+        0x3F000000, 0x3F000000, 0x3F000000, 0x3F000000,  // e.g. 0.5f
+        0x3FC00000, 0x3FC00000, 0x3FC00000, 0x3FC00000,  // e.g. 1.5f
+    };
+
     static out_t C_hw[DIM][DIM] = {0};  // fp8 outputs from HW
+
+    const uint32_t dim_k = 512; // FIXME export to somewhere
 
     configure_mxgemmini();
 
+    // -----------------
+    // Initiate pipeline
+    // -----------------
+    //
+    int tile_k = 0;
+    copy_gmem_to_smem_async(0, 0/*FIXME*/, tile_k);
+
+    // wait for GMEM->SMEM copy
+    gemmini_fence();
+
     // Load scaling factors from GMEM to the scale SRAM
     // load_scale_factors((const uint64_t *) C_scale, sizeof(C_scale));
-    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], 32);
-    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], 32);
-    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], 32);
-    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], 32);
+    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], SCALE_FAC_DIM);
+    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], SCALE_FAC_DIM);
+    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], SCALE_FAC_DIM);
+    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], SCALE_FAC_DIM);
 
-    // initiate pipeline
-    int tile_k = 0;
-    // copy_a_b_gmem_to_smem(0, 0/*FIXME*/, tile_k);
+    // wait for scale factor write
+    mu_fence();
 
-    // // wait for GMEM->SMEM copy
-    // gemmini_fence();
+    // ------------------------------
+    // Main software-pipelined K-loop
+    // ------------------------------
+    //
+    asm volatile ("main_matmul_k_loop_start_%=:" :: );
 
-    const uint32_t dim_k = 512; // FIXME export to somewhere
     for (; (tile_k * TILE_K) < dim_k; tile_k++) {
+        matmul_tile_async();
+
         // NOTE: This results in an unnecessary move-in at the last K tile
-        copy_a_b_gmem_to_smem(0, 0, tile_k);
+        copy_gmem_to_smem_async(0, 0, tile_k + 1);
 
-        // wait for compute and GMEM->SMEM copy
+        // FIXME: fix double-buffer index
+        load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], SCALE_FAC_DIM);
+        load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], SCALE_FAC_DIM);
+
+        gemmini_mxquant_config_mvout(
+            rad_device_to_host_address(0x20000000) /*FIXME*/,
+            PE_TILES_I, PE_TILES_J, PE_TILES_K, 0 /*FIXME*/, 0);
+
+        // wait for scale factor write
+        mu_fence();
+
+        // wait for previous-tile compute and current-tile GMEM->SMEM copy
         gemmini_fence();
-
-        matmul_smem_tile();
     }
 
     gemmini_fence();
+
+    asm volatile ("main_matmul_k_loop_end_%=:" :: );
 
 #if 0
     // read back C_out_got from DMEM to generate some traces
