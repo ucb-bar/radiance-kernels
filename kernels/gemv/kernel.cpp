@@ -6,7 +6,7 @@
 #include <math.h>
 #include <stdint.h>
 
-struct SoftmaxArgs {
+struct GEMVArgs {
   __global _Float16* A;
   __global _Float16* x;
   uint32_t m;
@@ -22,13 +22,13 @@ void gemv(
   uint32_t threads_per_threadblock,
   uint32_t threadblock_id
 ) {
-  auto* args = reinterpret_cast<SoftmaxArgs*>(arg);
+  auto* args = reinterpret_cast<GEMVArgs*>(arg);
   uint32_t lane_id = tid_in_threadblock % 16;
   uint32_t warp_id = tid_in_threadblock / 16;
   uint32_t tid = tid_in_threadblock;
 }
 
-SoftmaxArgs gemv_args = {
+GEMVArgs gemv_args = {
   .A = nullptr,
   .x = nullptr,
   .m = 0,
