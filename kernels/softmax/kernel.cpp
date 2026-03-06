@@ -53,7 +53,7 @@ void softmax(
   // require that each row is a multiple of block size
   x_sdata[tid] = x[tid];
   max_sdata[tid] = x_sdata[tid];
-  denom_sdata[tid] = (_Float16)0x1.0000000000000p+0;
+  denom_sdata[tid] = __builtin_bit_cast(_Float16, ONE_BF16_BITS);
 
   // repeat for remaining chunks
   for (uint32_t chunk = 1; chunk < chunks_per_block; chunk++) {
@@ -80,7 +80,7 @@ void softmax(
   if (warp_id == 0) {
     reduce(max_sdata, denom_sdata, tid, lane_id);
     if (lane_id == 0)
-      denom_sdata[0] = 1 / denom_sdata[0]; 
+      denom_sdata[0] = __builtin_bit_cast(_Float16, ONE_BF16_BITS) / denom_sdata[0];
   }
 
   mu_barrier(0, MU_BLOCK_NUM_WARPS);
