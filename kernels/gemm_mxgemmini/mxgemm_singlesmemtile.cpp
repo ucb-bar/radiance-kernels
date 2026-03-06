@@ -4,7 +4,7 @@
 #include <mu_intrinsics.h>
 
 #include "include/gemmini.h"
-#include "include/matmul_data.h"
+#include "include/matmul_data_mx_fp8.h"
 #include "mxgemmini_mmio.h"
 
 // TODO: cleanup
@@ -42,21 +42,44 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
     // We want 1 byte per output element in DRAM
     gemmini_extended_config_st(DIM * sizeof(out_t), NO_ACTIVATION, 1);
 
-#if 1
     // Load per-element scaling factors into the scale SRAM
     // (C_scale is uint8_t[DIM][DIM], packed row-major)
     // load_scale_factors((const uint64_t *) C_scale, sizeof(C_scale));
     load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], 32);
-    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], 32);
     load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], 32);
     load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], 32);
-#endif
+    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], 32);
 
     // MVIN B and A
-    // Note gemmini needs CPU-global addresses for mvin
-    gemmini_config_ld(DIM * sizeof(elem_t));
-    gemmini_mvin(rad_device_to_host_address(reinterpret_cast<uint32_t>(B_in)), 1 * DIM);
-    gemmini_mvin(rad_device_to_host_address(reinterpret_cast<uint32_t>(A_in)), 0 * DIM);
+    gemmini_config_ld(MATMUL_M * sizeof(elem_t));
+
+    int tiles_I = MATMUL_M / DIM;
+    int tiles_J = MATMUL_N / DIM;
+    int tiles_K = MATMUL_K / DIM;
+
+    uint32_t a_base = 0;
+    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+    // A layout: for each i row, store all k tiles contiguously
+    // A tile (i,k) -> a_base + (i * tiles_K + k) * DIM
+    for (int i = 0; i < tiles_I; i++) {
+        for (int k = 0; k < tiles_K; k++) {
+            elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_M + k * DIM;
+            uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
+            // Note gemmini needs CPU-global addresses for mvin
+            gemmini_extended_mvin(rad_device_to_host_address(reinterpret_cast<uint32_t>(dram_ptr)), sp_addr, DIM, DIM);
+        }
+    }
+
+    // B layout: for each k row, store all j tiles contiguously
+    // B tile (k,j) -> b_base + (k * tiles_J + j) * DIM
+    for (int j = 0; j < tiles_J; j++) {
+        for (int k = 0; k < tiles_K; k++) {
+            elem_t *dram_ptr = ((elem_t*)B_in) + j * DIM * MATMUL_M + k * DIM;
+            uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
+            gemmini_extended_mvin(rad_device_to_host_address(reinterpret_cast<uint32_t>(dram_ptr)), sp_addr, DIM, DIM);
+        }
+    }
 
     uint32_t acc_addr = (1u << (ADDR_LEN - 1));
     //  gemmini_preload(1 * DIM, acc_addr);  // Read B from spad addr 1*DIM, results -> acc_addr
@@ -71,10 +94,10 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
     //  gemmini_mvout_spad(0, acc_addr);
 
     gemmini_loop_ws_spad(
-        1, 1, 1,              // I=1, J=1, K=1 (single 16×16 tile)
+        2, 2, 2,              // I=1, J=1, K=1 (single 16×16 tile)
         0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
         0 * DIM,              // A scratchpad address
-        2 * DIM,              // B scratchpad address
+        BANK_NUM * BANK_ROWS,              // B scratchpad address
         0,                    // D (bias) - none
         acc_addr,             // C accumulator address
         false, false,         // A_transpose, B_transpose
@@ -84,10 +107,9 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
         false,                // is_resadd
         0x38);                // skips
 
-    //  gemmini_mvout_spad(0, acc_addr);
+    // gemmini_mvout_spad(0, acc_addr);
 
-    // Single fence at the end, like your fp6 test
-    // gemmini_fence();
+    gemmini_fence();
 
 #if 0
     // read back C_out_got from DMEM to generate some traces
