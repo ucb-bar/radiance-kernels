@@ -20,12 +20,16 @@
 #define GEMMINI_SF_MEM_B (GEMMINI_SF_MEM)
 
 #define GEMMINI_CTRL        0x00084000
+#define GEMMINI_INST_OFFSET 0x0
 #define GEMMINI_RS1_OFFSET  0x10
 #define GEMMINI_RS2_OFFSET  0x18
-#define GEMMINI_INST_OFFSET 0x0
+#define GEMMINI_BUSY_OFFSET  0x20
+#define GEMMINI_OCCUPANCY_OFFSET  0x28
+#define GEMMINI_INST_ADDR  (GEMMINI_CTRL + GEMMINI_INST_OFFSET)
 #define GEMMINI_RS1_ADDR   (GEMMINI_CTRL + GEMMINI_RS1_OFFSET)
 #define GEMMINI_RS2_ADDR   (GEMMINI_CTRL + GEMMINI_RS2_OFFSET)
-#define GEMMINI_INST_ADDR  (GEMMINI_CTRL + GEMMINI_INST_OFFSET)
+#define GEMMINI_BUSY_ADDR  (GEMMINI_CTRL + GEMMINI_BUSY_OFFSET)
+#define GEMMINI_OCCUPANCY_ADDR (GEMMINI_CTRL + GEMMINI_OCCUPANCY_OFFSET)
 
 template <typename T>
 inline uint64_t gemmini_arg_to_u64(T value) {
@@ -44,3 +48,30 @@ inline uint64_t gemmini_arg_to_u64(T value) {
     store64_shared(GEMMINI_CTRL, GEMMINI_RS2_OFFSET, gemmini_arg_to_u64(rs2)); \
     store_shared  (GEMMINI_CTRL, GEMMINI_INST_OFFSET, (0x7B) | (0 << 7) | (3 << 12) | (1 << 15) | (2 << 20) | ((funct) << 25)); \
 }
+
+// synchronization
+// ---------------
+
+#define gemmini_status() ({uint32_t status; asm volatile ("csrr %0, 0xacc" : "=r" (status)); status;})
+#undef gemmini_fence
+inline void gemmini_fence() {
+    while (load32_shared(GEMMINI_BUSY_ADDR) != 0) {
+        asm volatile("nop");
+    }
+}
+inline void gemmini_fence_outstanding(const int n) {
+    while (load32_shared(GEMMINI_OCCUPANCY_ADDR) > n) {
+        asm volatile("nop");
+    }
+}
+
+// MMIO helpers
+// ------------
+
+#define loop_matmul_skips(skip_lda, skip_ldb, skip_ldd, skip_ex, skip_stc) \
+  (((skip_lda) | ((skip_ldb) << 1) | ((skip_ldd) << 2) | ((skip_ex) << 3) | ((skip_stc) << 4)) << 3)
+
+#define sp_tiled_matmul_full_spad_ws(A_sp_addr_start, B_sp_addr_start, D_sp_addr_start, C_dst_sp_addr_start,\
+  I, J, K, pad_I, pad_J, pad_K, a_transpose, b_transpose, full_C, low_D, acc, act, skips) \
+  gemmini_loop_ws_spad(I, J, K, pad_I, pad_J, pad_K, A_sp_addr_start, (B_sp_addr_start) + (K) * (J) * DIM, NULL, \
+  C_dst_sp_addr_start, a_transpose, b_transpose, full_C, low_D, acc, act, 0, 0, false, skips)
