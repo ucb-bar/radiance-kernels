@@ -18,7 +18,7 @@ static uint64_t C_out_got[DIM][DIM] = {0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEA
 static void load_scale_factors(volatile uint32_t *sf_mem, const uint8_t *scale_factors, int n) {
     auto word_scale_factors = reinterpret_cast<const uint32_t *>(scale_factors);
     for (size_t i = 0; i < n / 4; i ++) {
-        // do foll-word stores instead of 1-byte stores
+        // do full-word stores instead of 1-byte stores
         store_shared(reinterpret_cast<uint32_t>(&sf_mem[i]), 0, word_scale_factors[i]);
     }
 }
@@ -30,44 +30,123 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
         return;
     }
 
-    // ---- Buffers ----
-    // Inputs come from MATMUL_DATA_H: A_in[16][16], B_in[16][16]
     static out_t C_hw[DIM][DIM] = {0};  // fp8 outputs from HW
 
-    // ---------- Run Gemmini (fp8 WS test) ----------
     gemmini_flush(0);
-    //  gemmini_config_ex(WEIGHT_STATIONARY, 0, 0);
-    gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false, 0, 0, 3, 0);
+    gemmini_extended3_config_ex(
+        WEIGHT_STATIONARY, // dataflow
+        0, 0, ACC_SCALE_IDENTITY, // sys_act, sys_shift, sys_acc_scale
+        1, 1, // C_stride, A_stride
+        0, 0, // A_transpose, B_transpose
+        false, // set_only:strides
+        0, // act_mx_fmt
+        0, // wgt_mx_fmt
+        3, // out_mx_fmt
+        0  // uselut
+    );
 
-    // We want 1 byte per output element in DRAM
-    gemmini_extended_config_st(DIM * sizeof(out_t), NO_ACTIVATION, 1);
-
-    // Load per-element scaling factors into the scale SRAM
-    // (C_scale is uint8_t[DIM][DIM], packed row-major)
+    // Load scaling factors from GMEM to the scale SRAM
     // load_scale_factors((const uint64_t *) C_scale, sizeof(C_scale));
     load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], 32);
     load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], 32);
     load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], 32);
     load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], 32);
 
-    // MVIN B and A
-    gemmini_config_ld(MATMUL_M * sizeof(elem_t));
+    constexpr auto TILE_M = 32;
+    constexpr auto TILE_N = 32;
+    constexpr auto TILE_K = 32;
 
-    int tiles_I = MATMUL_M / DIM;
-    int tiles_J = MATMUL_N / DIM;
-    int tiles_K = MATMUL_K / DIM;
+    // Configure move-in strides for B and A
+    // gemmini_config_ld(TILE_M * sizeof(elem_t)); // nicolas's
+    gemmini_extended3_config_ld(TILE_K * sizeof(elem_t), MVIN_SCALE_IDENTITY,
+                                false, 0);
+    gemmini_extended3_config_ld(TILE_N * sizeof(elem_t), MVIN_SCALE_IDENTITY,
+                                false, 1);
 
-    uint32_t a_base = 0;
-    uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+    // Configure move-out for C
+    // We want 1 byte per output element in DRAM
+    // gemmini_extended_config_st(DIM * sizeof(out_t), NO_ACTIVATION, 1); // nicolas's
+    gemmini_extended_config_st(TILE_N * sizeof(elem_t), NO_ACTIVATION, 1 /*TODO: what is this?*/);
+
+    gemmini_fence();
+
+    constexpr auto tiles_I = TILE_M / DIM;
+    constexpr auto tiles_J = TILE_N / DIM;
+    constexpr auto tiles_K = TILE_K / DIM;
+
+    // Gemmini spad address is in DIM elems (16 fp8), not bytes
+    const uint32_t a_base = 0;
+    // Put B at the end of the spad
+    const uint32_t b_base = BANK_NUM * BANK_ROWS - tiles_K * tiles_J * DIM;
+
+    // Gemmini expects the full A/B tensor to be stored in block-level
+    // row-major layout, i.e.:
+    // The tensor is partitioned into DIM x DIM tiles.
+    // Tiles are ordered row-by-row in memory (all tile columns of tile-row 0,
+    // then tile-row 1, etc.), and each tile is stored contiguously.
+
+    uint32_t acc_addr = (1u << (ADDR_LEN - 1));
+
+#define GEMMINI_DMA 1
+#if GEMMINI_DMA
+    // config GMEM address for A and B
+    // inst: 0x1420b07b
+    ROCC_INSTRUCTION_RS1_RS2(
+        XCUSTOM_ACC,
+        rad_device_to_host_address(reinterpret_cast<uint32_t>(A_in)),
+        rad_device_to_host_address(reinterpret_cast<uint32_t>(B_in)),
+        k_LOOP_WS_CONFIG_ADDRS_AB)
+
+    gemmini_fence();
+
+    // TODO: config DRAM strides
+    // inst: 0x1820b07b
+    ROCC_INSTRUCTION_RS1_RS2(
+        XCUSTOM_ACC,
+        (uint64_t)(TILE_K), // FIXME
+        (uint64_t)(TILE_N), // FIXME
+        k_LOOP_WS_CONFIG_STRIDES_AB)
+
+    gemmini_fence();
+
+    // gemmini_loop_ws_spad issues three instructions:
+    //
+    // 1. configure loop bounds (inst: 0x1220b07b, funct: k_LOOP_WS_CONFIG_BOUNDS)
+    // 2. configure spad addresses (inst: 0x3020b07b, funct: k_LOOP_WS_CONFIG_SPAD_AB)
+    // 3. compute loop ws with skips (inst: 0x1020b07b, funct: k_LOOP_WS)
+    constexpr uint32_t skips_mvin =
+      loop_matmul_skips(/*skip_lda=*/0, /*skip_ldb=*/0, /*skip_ldd=*/1,
+                        /*skip_ex=*/1, /*skip_stc=*/1);
+    constexpr auto DONTCARE = 0;
+
+    gemmini_loop_ws_spad(
+        tiles_I, tiles_J, tiles_K, // loop bounds for I, J, K (single 16×16 PE tile)
+        0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
+        0 * DIM,              // A scratchpad address
+        BANK_NUM * BANK_ROWS, // B scratchpad address
+        0,                    // D (bias) - none
+        acc_addr,             // C accumulator address
+        false, false,         // A_transpose, B_transpose
+        false, false, false,  // full_C, low_D, ex_accumulate
+        NO_ACTIVATION,        // activation
+        0, 0,                 // a_spad_id, b_spad_id
+        false,                // is_resadd
+        skips_mvin);        // skips
+
+    // wait for GMEM->SMEM move-in
+    gemmini_fence();
+
+#else
 
     // A layout: for each i row, store all k tiles contiguously
     // A tile (i,k) -> a_base + (i * tiles_K + k) * DIM
     for (int i = 0; i < tiles_I; i++) {
         for (int k = 0; k < tiles_K; k++) {
-            elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * MATMUL_M + k * DIM;
+            elem_t *dram_ptr = ((elem_t*)A_in) + i * DIM * TILE_M + k * DIM;
             uint32_t sp_addr = a_base + (i * tiles_K + k) * DIM;
             // Note gemmini needs CPU-global addresses for mvin
             gemmini_extended_mvin(rad_device_to_host_address(reinterpret_cast<uint32_t>(dram_ptr)), sp_addr, DIM, DIM);
+            gemmini_fence();
         }
     }
 
@@ -75,29 +154,19 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
     // B tile (k,j) -> b_base + (k * tiles_J + j) * DIM
     for (int j = 0; j < tiles_J; j++) {
         for (int k = 0; k < tiles_K; k++) {
-            elem_t *dram_ptr = ((elem_t*)B_in) + j * DIM * MATMUL_M + k * DIM;
+            elem_t *dram_ptr = ((elem_t*)B_in) + j * DIM * TILE_M + k * DIM;
             uint32_t sp_addr = b_base + (j * tiles_K + k) * DIM;
             gemmini_extended_mvin(rad_device_to_host_address(reinterpret_cast<uint32_t>(dram_ptr)), sp_addr, DIM, DIM);
+            gemmini_fence();
         }
     }
-
-    uint32_t acc_addr = (1u << (ADDR_LEN - 1));
-    //  gemmini_preload(1 * DIM, acc_addr);  // Read B from spad addr 1*DIM, results -> acc_addr
-    //
-    //  // Compute: A (from spad 0*DIM) × B (preloaded) -> accumulator (at acc_addr)
-    //  gemmini_config_ld(DIM * sizeof(elem_t));
-    //  gemmini_compute_preloaded(0 * DIM, GARBAGE_ADDR);
-    //
-    //  uint32_t mvout_addr = acc_addr & ~(1 << (ADDR_LEN - 2));  // Clear accumulate bit
-    //  mvout_addr |= (1 << 29);  // Set full row bit
-    ////  gemmini_mvout((void *) C_hw, mvout_addr);
-    //  gemmini_mvout_spad(0, acc_addr);
+#endif
 
     gemmini_loop_ws_spad(
-        2, 2, 2,              // I=1, J=1, K=1 (single 16×16 tile)
+        tiles_I, tiles_J, tiles_K, // loop bounds for I, J, K (single 16×16 PE tile)
         0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
         0 * DIM,              // A scratchpad address
-        BANK_NUM * BANK_ROWS,              // B scratchpad address
+        BANK_NUM * BANK_ROWS, // B scratchpad address
         0,                    // D (bias) - none
         acc_addr,             // C accumulator address
         false, false,         // A_transpose, B_transpose
@@ -107,8 +176,7 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
         false,                // is_resadd
         0x38);                // skips
 
-    // gemmini_mvout_spad(0, acc_addr);
-
+    // wait for matmul completion
     gemmini_fence();
 
 #if 0
