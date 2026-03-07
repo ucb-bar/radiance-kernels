@@ -10,7 +10,9 @@ typedef void (*mu_schedule_callback)(void *arg,
                                      uint32_t threads_per_threadblock,
                                      uint32_t threadblock_id);
 
-void mu_schedule(mu_schedule_callback entry_point, void * arg);
+void mu_schedule(mu_schedule_callback entry_point,
+                 void * arg,
+                 const uint32_t occupancy);
 
 } // extern "C"
 

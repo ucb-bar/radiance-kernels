@@ -102,6 +102,6 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
 }
 
 int main() {
-    mu_schedule(mxgemm, nullptr);
+    mu_schedule(mxgemm, nullptr, vx_num_warps());
     return 0;
 }

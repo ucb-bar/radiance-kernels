@@ -88,6 +88,6 @@ int main() {
   gemv_args.y = reinterpret_cast<__global _Float16*>(y_raw);
   gemv_args.m = m;
   gemv_args.n = n;
-  mu_schedule(gemv, &gemv_args);
+  mu_schedule(gemv, &gemv_args, vx_num_warps());
   return 0;
 }

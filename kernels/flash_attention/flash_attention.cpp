@@ -42,7 +42,7 @@ int main() {
     };
 
     // TODO: &arg may come from the CPU
-    mu_schedule(kernel_entry, &arg);
+    mu_schedule(kernel_entry, &arg, vx_num_warps());
 
     return 0;
 }

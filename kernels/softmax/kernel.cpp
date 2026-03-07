@@ -107,6 +107,6 @@ int main() {
   softmax_args.x = reinterpret_cast<__global _Float16*>(x_raw);
   softmax_args.rows = rows;
   softmax_args.cols = cols;
-  mu_schedule(softmax, &softmax_args);
+  mu_schedule(softmax, &softmax_args, vx_num_warps());
   return 0;
 }

@@ -103,7 +103,7 @@ int main() {
   rmsnorm_args.data = data;
   rmsnorm_args.gamma = gamma;
   rmsnorm_args.L = 128;
-  mu_schedule(rmsnorm2_entry, &rmsnorm_args);
+  mu_schedule(rmsnorm2_entry, &rmsnorm_args, vx_num_warps());
 
   return 0;
 }
