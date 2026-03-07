@@ -45,7 +45,6 @@ void gemv(
   __global _Float16 *x = args->x;
   __global _Float16 *y = args->y;
 
-
   _Float16 accum = A[tid] * x[tid];
 
   for (uint32_t chunk = 1; chunk < chunks_per_block; chunk++) {
