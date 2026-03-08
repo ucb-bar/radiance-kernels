@@ -45,9 +45,9 @@ static void __attribute__ ((noinline)) mu_schedule_standalone() {
     const auto tid_global = threads_per_cluster * cluster_id + tid_in_cluster;
 
     // 1-threadblock-to-1-cluster
-    const uint32_t threads_per_threadblock = threads_per_cluster;
-    const uint32_t tid_in_threadblock = tid_global % threads_per_threadblock;
-    const uint32_t threadblock_id = tid_global / threads_per_threadblock;
+    const auto threads_per_threadblock = threads_per_cluster;
+    const auto tid_in_threadblock = tid_global % threads_per_threadblock;
+    const auto threadblock_id = tid_global / threads_per_threadblock;
 
     const auto callback = context.callback;
     auto arg = context.arg;
@@ -86,6 +86,7 @@ void mu_schedule(mu_schedule_callback callback, void *arg, const uint32_t occupa
     if (core_id == 0 && thread_id == 0) {
         schedule_context.callback = callback;
         schedule_context.arg = arg;
+        schedule_context.occupancy = occupancy;
     }
 
     // fence & barrier to ensure ordering on context
