@@ -28,7 +28,7 @@ static void __attribute__ ((noinline)) mu_schedule_standalone() {
     // TODO: clid not supported in assembler
     asm volatile("csrr %0, %1" : "=r"(cluster_id) : "i"(MU_CSR_CLUSTER_ID));
     const auto core_id_in_cluster = vx_core_id();
-    const auto cores_per_cluster = vx_num_cores();
+    const auto cores_per_cluster = MU_NUM_CORES;
     const auto global_core_id = cluster_id * cores_per_cluster + core_id_in_cluster;
 
     const auto &context = schedule_context;
@@ -91,7 +91,7 @@ void mu_schedule(mu_schedule_callback callback, void *arg, const uint32_t occupa
     // fence & barrier to ensure ordering on context
     mu_fence();
     // mu_schedule is entered from every core's warp 0
-    mu_barrier(0, vx_num_cores());
+    mu_barrier(0, MU_NUM_CORES);
 
     // schedule worker threads & manager thread
     vx_wspawn(occupancy, mu_schedule_workers);

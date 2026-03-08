@@ -55,12 +55,10 @@ inline void mu_fence() {
     asm volatile("fence");
 }
 
-// Number of threads per warp.
-// This hard-codes architecture detail into kernel, but this allows efficient
+// This hard-codes hardware config into kernel, but this allows efficient
 // compile-time unrolling and constant propagation.
 #define MU_NUM_THREADS 16
-
-// hard-coded sizes for now, change if tapeout config changes
+#define MU_NUM_CORES 2
 #define MU_BLOCK_NUM_WARPS 16
 #define MU_BLOCK_SIZE MU_BLOCK_NUM_WARPS * MU_NUM_THREADS
 
