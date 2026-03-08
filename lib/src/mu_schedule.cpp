@@ -20,9 +20,8 @@ struct Context {
 };
 
 /* Since vx_wspawn can only enter a function with no arguments, we need a
- * persistent state to restore contexts such as kernel arguments.
- * This is set to per-core to prevent racy writes. */
-static Context schedule_context[NUM_CORES_MAX];
+ * persistent state to restore contexts such as kernel arguments. */
+static Context schedule_context;
 
 static void __attribute__ ((noinline)) mu_schedule_standalone() {
     uint32_t cluster_id = 0;
@@ -32,7 +31,7 @@ static void __attribute__ ((noinline)) mu_schedule_standalone() {
     const auto cores_per_cluster = vx_num_cores();
     const auto global_core_id = cluster_id * cores_per_cluster + core_id_in_cluster;
 
-    const auto &context = schedule_context[core_id_in_cluster];
+    const auto &context = schedule_context;
     const auto occupancy = context.occupancy;
 
     // thread_id mapping is core-round-robin, i.e. warp 4k+0 maps to core 0,
@@ -81,10 +80,18 @@ static void mu_schedule_manager() {
  *  TODO relax this. */
 void mu_schedule(mu_schedule_callback callback, void *arg, const uint32_t occupancy) {
     const auto core_id = vx_core_id();
-    schedule_context[core_id].callback = callback;
-    schedule_context[core_id].arg = arg;
+    const auto thread_id = vx_thread_id();
+    // update kernel launch context
+    // elect a single thread per cluster to prevent racy writes
+    if (core_id == 0 && thread_id == 0) {
+        schedule_context.callback = callback;
+        schedule_context.arg = arg;
+    }
 
-    // TODO: fence here?
+    // fence & barrier to ensure ordering on context
+    mu_fence();
+    // mu_schedule is entered from every core's warp 0
+    mu_barrier(0, vx_num_cores());
 
     // schedule worker threads & manager thread
     vx_wspawn(occupancy, mu_schedule_workers);
