@@ -48,21 +48,26 @@ void softmax(
   __shared _Float16 *max_sdata = sdata + row_elems;
   __shared _Float16 *denom_sdata = max_sdata + MU_BLOCK_SIZE;
   
-  // init from first valid element to avoid 0 * exp(+inf) on first step
-  // require that each row is a multiple of block size
+  // pass 1 max
   x_sdata[tid] = x[tid];
-  max_sdata[tid] = x_sdata[tid];
-  denom_sdata[tid] = __builtin_bit_cast(_Float16, ONE_BF16_BITS);
-
-  // repeat for remaining chunks
+  _Float16 max = x_sdata[tid];
   for (uint32_t chunk = 1; chunk < chunks_per_block; chunk++) {
     uint32_t idx = chunk * MU_BLOCK_SIZE + tid;
     if (idx >= row_elems) break;
     x_sdata[idx] = x[idx];
-    _Float16 next_max = fmaxf(x_sdata[idx], max_sdata[tid]);
-    denom_sdata[tid] = denom_sdata[tid] * mu_fexp(max_sdata[tid] - next_max) + mu_fexp(x_sdata[idx] - next_max);
-    max_sdata[tid] = next_max;
+    max = fmaxf(x_sdata[idx], max);
   }
+
+  // pass 2 denom
+  _Float16 denom = (_Float16)0;
+  for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
+    uint32_t idx = chunk * MU_BLOCK_SIZE + tid;
+    if (idx >= row_elems) break;
+    denom += mu_fexp(x_sdata[idx] - max);
+  }
+
+  max_sdata[tid] = max;
+  denom_sdata[tid] = denom;
 
   // warp reduce
   reduce(max_sdata, denom_sdata, tid, lane_id);
@@ -87,7 +92,7 @@ void softmax(
   // max and denom in tid 0
   _Float16 m = max_sdata[0], inv_d = denom_sdata[0];
 
-  // compute softmax for each element chunk by chunk
+  // pass 3 compute softmax for each element chunk by chunk
   for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
     uint32_t idx = chunk * MU_BLOCK_SIZE + tid;
     if (idx >= row_elems) break;
