@@ -7,6 +7,8 @@
 #include "include/matmul_data_mx_fp8.h"
 #include "mxgemmini_mmio.h"
 
+// Tiling parameters -----------------------------------------------------------
+
 constexpr auto TILE_M = 128;
 constexpr auto TILE_N = 128;
 constexpr auto TILE_K = 128;
@@ -14,6 +16,13 @@ constexpr auto PE_TILES_I = TILE_M / DIM;
 constexpr auto PE_TILES_J = TILE_N / DIM;
 constexpr auto PE_TILES_K = TILE_K / DIM;
 constexpr auto SCALE_FAC_DIM = TILE_M * TILE_K / 32;
+
+// Performance benchmark options -----------------------------------------------
+// disable GMEM->SMEM DMA copy and have MxGemmini work on stale data in SMEM
+constexpr bool DISABLE_DMA_MOVE_IN = false;
+// disable scale-factor write & fence from the GPU
+constexpr bool DISABLE_SCALE_FACTOR_UPDATE = true;
+
 
 // TODO: cleanup
 typedef uint8_t elem_t;   // A_in: lower 8 bits = fp8:e4m3, upper bits zero
@@ -78,12 +87,14 @@ static inline void configure_mxgemmini() {
 
 static inline void copy_gmem_to_smem_async(const uint32_t tile_i,
                                            const uint32_t tile_j,
-                                           const uint32_t tile_k) {
-  // Gemmini expects the full A/B tensor to be stored in block-level
-  // row-major layout, i.e.:
-  // The tensor is partitioned into DIM x DIM tiles.
-  // Tiles are ordered row-by-row in memory (all tile columns of tile-row 0,
-  // then tile-row 1, etc.), and each tile is stored contiguously.
+                                           const uint32_t tile_k /* FIXME: unused */) {
+    asm volatile ("copy_gmem_to_smem_async_start_%=:" :: );
+
+    // Gemmini expects the full A/B tensor to be stored in block-level
+    // row-major layout, i.e.:
+    // The tensor is partitioned into DIM x DIM tiles.
+    // Tiles are ordered row-by-row in memory (all tile columns of tile-row 0,
+    // then tile-row 1, etc.), and each tile is stored contiguously.
 
 #define GEMMINI_DMA 1
 #if GEMMINI_DMA
@@ -161,9 +172,20 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i,
         }
     }
 #endif
+
+    asm volatile ("copy_gmem_to_smem_async_end_%=:" :: );
 }
 
-static inline void matmul_tile_async() {
+/** Asynchronously kick off loop FSM matmul compute operation in MxGemmini.
+ *  Move out accumulator data to SMEM if `acc_move_out` is true. */
+// TODO: SMEM tile must be double-buffered
+static inline void matmul_tile_async(const bool acc_move_out) {
+    asm volatile ("matmul_tile_async_start_%=:" :: );
+
+    const uint32_t skip_stc = acc_move_out ? 0 : 1;
+    const uint32_t skips_compute =
+      loop_matmul_skips(/*skip_lda=*/1, /*skip_ldb=*/1, /*skip_ldd=*/1,
+                        /*skip_ex=*/0, /*skip_stc=*/skip_stc);
     uint32_t acc_addr = (1u << (ADDR_LEN - 1));
     gemmini_loop_ws_spad(
         PE_TILES_I, PE_TILES_J, PE_TILES_K, // loop bounds for I, J, K (single 16×16 PE tile)
@@ -177,7 +199,9 @@ static inline void matmul_tile_async() {
         NO_ACTIVATION,        // activation
         0, 0,                 // a_spad_id, b_spad_id
         false,                // is_resadd
-        0x38);                // skips
+        skips_compute);       // skips
+
+    asm volatile ("matmul_tile_async_end_%=:" :: );
 }
 
 void mxgemm(void *arg, uint32_t tid_in_threadblock,
@@ -209,7 +233,7 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
     copy_gmem_to_smem_async(0, 0/*FIXME*/, tile_k);
 
     // wait for GMEM->SMEM copy
-    gemmini_fence();
+    // gemmini_fence();
 
     // Load scaling factors from GMEM to the scale SRAM
     // load_scale_factors((const uint64_t *) C_scale, sizeof(C_scale));
@@ -227,24 +251,43 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
     //
     asm volatile ("main_matmul_k_loop_start_%=:" :: );
 
+    //                 ┌───┐   ┌───┐
+    //             ┌───────────┐
+    //         ┌───────┐
+    // Loop 1: M0->M1->C0->M0->C1->M1->C0
+    //         ┌───┐   ┌───┐   ┌───┐
+    // Loop 2: M0->C0->M1->C1->M0->C0->...
+    //
+    // FIXME: below is not possible in current fence_ready():
+    // Operations of the same type are serialized (e.g. M0->M1->M2); therefore
+    // no need to fence against previous same-double-buffer op.
     for (; (tile_k * TILE_K) < dim_k; tile_k++) {
-        matmul_tile_async();
+        const auto last_k = ((tile_k + 1) * TILE_K) >= dim_k;
 
-        // NOTE: This results in an unnecessary move-in at the last K tile
-        copy_gmem_to_smem_async(0, 0, tile_k + 1);
+        // TODO: This results in an unnecessary move-in at the last K tile
+        if constexpr (!DISABLE_DMA_MOVE_IN) {
+            // gemmini_fence_ready();
+            copy_gmem_to_smem_async(0, 0, tile_k + 1);
+        }
 
         // FIXME: fix double-buffer index
-        load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], SCALE_FAC_DIM);
-        load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], SCALE_FAC_DIM);
+        if constexpr (!DISABLE_SCALE_FACTOR_UPDATE) {
+            load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], SCALE_FAC_DIM);
+            load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], SCALE_FAC_DIM);
 
-        gemmini_mxquant_config_mvout(
-            rad_device_to_host_address(0x20000000) /*FIXME*/,
-            PE_TILES_I, PE_TILES_J, PE_TILES_K, 0 /*FIXME*/, 0);
+            // ensure scale factor write -> mxgemmini kickoff ordering
+            mu_fence();
 
-        // wait for scale factor write
-        mu_fence();
+            // configure scalefac->PE double-buffer read; inst: 0x3420b07b
+            // gemmini_mxquant_config_mvout(
+            //     rad_device_to_host_address(0x20000000) /*FIXME*/,
+            //     PE_TILES_I, PE_TILES_J, PE_TILES_K, 0 /*FIXME*/, 0);
+        }
 
-        // wait for previous-tile compute and current-tile GMEM->SMEM copy
+        // TODO: SMEM tile must be double-buffered
+        // gemmini_fence_ready();
+        matmul_tile_async(last_k);
+
         gemmini_fence();
     }
 
