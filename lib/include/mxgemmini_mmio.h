@@ -21,11 +21,13 @@
 
 #define GEMMINI_CTRL        0x00084000
 #define GEMMINI_INST_OFFSET 0x0
+#define GEMMINI_READY_OFFSET  0x08
 #define GEMMINI_RS1_OFFSET  0x10
 #define GEMMINI_RS2_OFFSET  0x18
 #define GEMMINI_BUSY_OFFSET  0x20
 #define GEMMINI_OCCUPANCY_OFFSET  0x28
 #define GEMMINI_INST_ADDR  (GEMMINI_CTRL + GEMMINI_INST_OFFSET)
+#define GEMMINI_READY_ADDR  (GEMMINI_CTRL + GEMMINI_READY_OFFSET)
 #define GEMMINI_RS1_ADDR   (GEMMINI_CTRL + GEMMINI_RS1_OFFSET)
 #define GEMMINI_RS2_ADDR   (GEMMINI_CTRL + GEMMINI_RS2_OFFSET)
 #define GEMMINI_BUSY_ADDR  (GEMMINI_CTRL + GEMMINI_BUSY_OFFSET)
@@ -59,8 +61,15 @@ inline void gemmini_fence() {
         asm volatile("nop");
     }
 }
-inline void gemmini_fence_outstanding(const int n) {
+inline void gemmini_fence_waitcount(const int n) {
     while (load32_shared(GEMMINI_OCCUPANCY_ADDR) > n) {
+        asm volatile("nop");
+    }
+}
+// spin-lock until MMIO interface is ready to accept new commands, instead of
+// waiting for all previous commands to complete
+inline void gemmini_fence_ready() {
+    while (load32_shared(GEMMINI_READY_ADDR) == 0) {
         asm volatile("nop");
     }
 }
