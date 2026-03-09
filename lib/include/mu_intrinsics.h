@@ -59,9 +59,10 @@ inline void mu_fence() {
 // compile-time unrolling and constant propagation.
 #define MU_NUM_THREADS 16
 #define MU_NUM_CORES 2
-#define MU_BLOCK_NUM_WARPS 16
-#define MU_BLOCK_SIZE MU_BLOCK_NUM_WARPS * MU_NUM_THREADS
-#define MU_DOUBLE_BLOCK_SIZE MU_BLOCK_SIZE * 2
+#define MU_NUM_MAX_WARPS 8
+#define MU_BLOCK_NUM_WARPS(n) (MU_NUM_CORES * (n))
+#define MU_BLOCK_SIZE(n) (MU_BLOCK_NUM_WARPS(n) * MU_NUM_THREADS)
+#define MU_DOUBLE_BLOCK_SIZE(n) (MU_BLOCK_SIZE(n) * 2)
 
 // This compiles to CSR reads which stalls the pipeline. Use sparingly & cache.
 inline int mu_num_threads() {
