@@ -9,9 +9,9 @@
 
 // Tiling parameters -----------------------------------------------------------
 
-constexpr auto TILE_M = 128;
-constexpr auto TILE_N = 128;
-constexpr auto TILE_K = 128;
+constexpr auto TILE_M = 64;
+constexpr auto TILE_N = 64;
+constexpr auto TILE_K = 64;
 constexpr auto PE_TILES_I = TILE_M / DIM;
 constexpr auto PE_TILES_J = TILE_N / DIM;
 constexpr auto PE_TILES_K = TILE_K / DIM;
@@ -21,7 +21,7 @@ constexpr auto SCALE_FAC_DIM = TILE_M * TILE_K / 32;
 // disable GMEM->SMEM DMA copy and have MxGemmini work on stale data in SMEM
 constexpr bool DISABLE_DMA_MOVE_IN = false;
 // disable scale-factor write & fence from the GPU
-constexpr bool DISABLE_SCALE_FACTOR_UPDATE = true;
+constexpr bool DISABLE_SCALE_FACTOR_UPDATE = false;
 
 
 // TODO: cleanup
@@ -123,6 +123,8 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i,
     // 1. configure loop bounds (inst: 0x1220b07b, funct: k_LOOP_WS_CONFIG_BOUNDS)
     // 2. configure spad addresses (inst: 0x3020b07b, funct: k_LOOP_WS_CONFIG_SPAD_AB)
     // 3. compute loop ws with skips (inst: 0x1020b07b, funct: k_LOOP_WS)
+    //
+    // TODO: skip re-configuring of loop bounds
     constexpr uint32_t skips_mvin =
       loop_matmul_skips(/*skip_lda=*/0, /*skip_ldb=*/0, /*skip_ldd=*/1,
                         /*skip_ex=*/1, /*skip_stc=*/1);
@@ -270,6 +272,11 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
             copy_gmem_to_smem_async(0, 0, tile_k + 1);
         }
 
+        // TODO: SMEM tile must be double-buffered
+        // gemmini_fence_ready();
+        matmul_tile_async(last_k);
+
+        // update scale factors between async kickoff & fence to hide latency
         // FIXME: fix double-buffer index
         if constexpr (!DISABLE_SCALE_FACTOR_UPDATE) {
             load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], SCALE_FAC_DIM);
@@ -279,14 +286,12 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
             mu_fence();
 
             // configure scalefac->PE double-buffer read; inst: 0x3420b07b
-            // gemmini_mxquant_config_mvout(
-            //     rad_device_to_host_address(0x20000000) /*FIXME*/,
-            //     PE_TILES_I, PE_TILES_J, PE_TILES_K, 0 /*FIXME*/, 0);
+            gemmini_mxquant_config_mvout(
+                rad_device_to_host_address(0x20000000) /*FIXME*/,
+                PE_TILES_I, PE_TILES_J, PE_TILES_K, 0 /*FIXME*/, 0);
         }
 
-        // TODO: SMEM tile must be double-buffered
-        // gemmini_fence_ready();
-        matmul_tile_async(last_k);
+        // TODO: add LUT loading
 
         gemmini_fence();
     }
