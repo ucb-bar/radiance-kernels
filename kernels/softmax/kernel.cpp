@@ -7,7 +7,7 @@
 #include <stdint.h>
 
 struct SoftmaxArgs {
-  __global _Float16* x;
+  __global float* x;
   uint32_t rows;
   uint32_t cols;
 };
@@ -40,30 +40,30 @@ void softmax(
   uint32_t tid = tid_in_threadblock;
   
   uint32_t row_elems = args->cols;
-  uint32_t block_elem_idx = threadblock_id * row_elems;
-  uint32_t chunks_per_block = (row_elems + MU_BLOCK_SIZE - 1) / MU_BLOCK_SIZE;
+  uint32_t block_elem_idx = threadblock_id * row_elems / 2;
+  uint32_t chunks_per_block = (row_elems + MU_DOUBLE_BLOCK_SIZE - 1) / MU_DOUBLE_BLOCK_SIZE;
 
-  __global _Float16 *x = args->x + block_elem_idx;
+  __global float *x = args->x + block_elem_idx;
   __shared _Float16 *x_sdata = sdata;
   __shared _Float16 *max_sdata = sdata + row_elems;
-  __shared _Float16 *denom_sdata = max_sdata + MU_BLOCK_SIZE;
+  __shared _Float16 *denom_sdata = max_sdata + MU_DOUBLE_BLOCK_SIZE;
   
   // pass 1 max
-  x_sdata[tid] = x[tid];
-  _Float16 max = x_sdata[tid];
+  ((float*)x_sdata)[tid] = x[tid];
+  _Float16 max = fmaxf(x_sdata[2*tid], x_sdata[2*tid + 1]);
   for (uint32_t chunk = 1; chunk < chunks_per_block; chunk++) {
     uint32_t idx = chunk * MU_BLOCK_SIZE + tid;
-    if (idx >= row_elems) break;
-    x_sdata[idx] = x[idx];
-    max = fmaxf(x_sdata[idx], max);
+    if (2*idx >= row_elems) break;
+    ((float*)x_sdata)[idx] = x[idx];
+    max = fmaxf(fmaxf(x_sdata[2*idx], x_sdata[2*idx + 1]), max);
   }
 
   // pass 2 denom
   _Float16 denom = (_Float16)0;
   for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
     uint32_t idx = chunk * MU_BLOCK_SIZE + tid;
-    if (idx >= row_elems) break;
-    denom += mu_fexp(x_sdata[idx] - max);
+    if (2 * idx >= row_elems) break;
+    denom += mu_fexp(x_sdata[2*idx] - max) + mu_fexp(x_sdata[2*idx + 1] - max);
   }
 
   max_sdata[tid] = max;
@@ -95,8 +95,10 @@ void softmax(
   // pass 3 compute softmax for each element chunk by chunk
   for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
     uint32_t idx = chunk * MU_BLOCK_SIZE + tid;
-    if (idx >= row_elems) break;
-    x[idx] = mu_fexp(x_sdata[idx] - m) * inv_d;
+    if (2*idx >= row_elems) break;
+    x_sdata[2*idx] = mu_fexp(x_sdata[2*idx] - m) * inv_d;
+    x_sdata[2*idx + 1] = mu_fexp(x_sdata[2*idx + 1] - m) * inv_d;
+    x[idx] = ((float *)x_sdata)[idx];
   }
 }
 
@@ -109,7 +111,7 @@ SoftmaxArgs softmax_args = {
 #include "data"
 
 int main() {
-  softmax_args.x = reinterpret_cast<__global _Float16*>(x_raw);
+  softmax_args.x = reinterpret_cast<__global float*>(x_raw);
   softmax_args.rows = rows;
   softmax_args.cols = cols;
   mu_schedule(softmax, &softmax_args, vx_num_warps());
