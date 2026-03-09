@@ -61,6 +61,7 @@ inline void mu_fence() {
 #define MU_NUM_CORES 2
 #define MU_BLOCK_NUM_WARPS 16
 #define MU_BLOCK_SIZE MU_BLOCK_NUM_WARPS * MU_NUM_THREADS
+#define MU_DOUBLE_BLOCK_SIZE MU_BLOCK_SIZE * 2
 
 // This compiles to CSR reads which stalls the pipeline. Use sparingly & cache.
 inline int mu_num_threads() {
