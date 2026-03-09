@@ -23,8 +23,9 @@ typedef uint64_t  out_t;    // C_scaled: fp8:e4m3 (1 byte per output)
 // global section that will store fp8 outputs from Gemmini
 static uint64_t C_out_got[DIM][DIM] = {0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF,};
 
-static void load_scale_factors(volatile uint32_t *sf_mem,
-                               const uint8_t *scale_factors, int n) {
+static void __attribute__((noinline))
+load_scale_factors(volatile uint32_t *sf_mem, const uint8_t *scale_factors,
+                   int n) {
   // asm volatile ("load_scale_factors_start_%=:" :: );
   auto word_scale_factors = reinterpret_cast<const uint32_t *>(scale_factors);
 
@@ -182,7 +183,7 @@ static inline void matmul_tile_async() {
 void mxgemm(void *arg, uint32_t tid_in_threadblock,
             uint32_t threads_per_threadblock,
             uint32_t threadblock_id) {
-    if (!(tid_in_threadblock == 0 && threadblock_id == 0)) {
+    if (!tid_in_threadblock == 0) {
         return;
     }
 
