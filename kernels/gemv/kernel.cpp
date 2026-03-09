@@ -6,6 +6,12 @@
 #include <math.h>
 #include <stdint.h>
 
+#define NUM_WARPS 8
+#define DOUBLE_BLOCK_SIZE MU_DOUBLE_BLOCK_SIZE(NUM_WARPS)
+#define BLOCK_SIZE MU_BLOCK_SIZE(NUM_WARPS)
+#define BLOCK_NUM_WARPS MU_BLOCK_NUM_WARPS(NUM_WARPS)
+#define THREAD_DIV MU_NUM_MAX_WARPS / NUM_WARPS
+
 struct GEMVArgs {
   __global _Float16* A;
   __global _Float16* x;
@@ -16,8 +22,9 @@ struct GEMVArgs {
 
 __shared _Float16* const sdata = reinterpret_cast<__shared _Float16*>(0x0);
 
+template <uint32_t MAX_STRIDE>
 static inline void reduce(uint32_t tid, uint32_t lane_id) {
-  for (uint32_t stride = 2; stride <= MU_NUM_THREADS; stride *= 2) {
+  for (uint32_t stride = 2; stride <= MAX_STRIDE; stride *= 2) {
     if (lane_id % stride == 0)
       sdata[tid] = sdata[tid] + sdata[tid + (stride >> 1)];
   }
@@ -39,7 +46,7 @@ void gemv(
 
   uint32_t row_elems = args->n;
   uint32_t block_elem_idx = threadblock_id * row_elems;
-  uint32_t chunks_per_block = (row_elems + MU_BLOCK_SIZE - 1) / MU_BLOCK_SIZE;
+  uint32_t chunks_per_block = (row_elems + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
   __global _Float16 *A = args->A + block_elem_idx;
   __global _Float16 *x = args->x;
@@ -48,7 +55,7 @@ void gemv(
   _Float16 accum = A[tid] * x[tid];
 
   for (uint32_t chunk = 1; chunk < chunks_per_block; chunk++) {
-    uint32_t idx = chunk * MU_BLOCK_SIZE + tid;
+    uint32_t idx = chunk * BLOCK_SIZE + tid;
     if (idx >= row_elems) break;
     accum += A[idx] * x[idx];
   }
@@ -56,17 +63,17 @@ void gemv(
   sdata[tid] = accum;
 
   // warp reduce
-  reduce(tid, lane_id);
+  reduce<MU_NUM_THREADS>(tid, lane_id);
 
   // block reduce = warp reduce only works when num_warps = num_lanes
   if (lane_id == 0)
     sdata[warp_id] = sdata[tid];
 
-  mu_barrier(0, MU_BLOCK_NUM_WARPS);
+  mu_barrier(0, BLOCK_NUM_WARPS);
 
   // block reduce
   if (warp_id == 0) {
-    reduce(tid, lane_id);
+    reduce<MU_NUM_THREADS / THREAD_DIV>(tid, lane_id);
     if (lane_id == 0)
       y[threadblock_id] = sdata[0];
   }
@@ -88,6 +95,6 @@ int main() {
   gemv_args.y = reinterpret_cast<__global _Float16*>(y_raw);
   gemv_args.m = m;
   gemv_args.n = n;
-  mu_schedule(gemv, &gemv_args, vx_num_warps());
+  mu_schedule(gemv, &gemv_args, NUM_WARPS);
   return 0;
 }
