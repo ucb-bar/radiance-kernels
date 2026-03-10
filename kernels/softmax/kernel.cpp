@@ -58,7 +58,7 @@ void softmax(
   __shared _Float16 *denom_sdata = max_sdata + DOUBLE_BLOCK_SIZE;
   
   // pass 1 max + denom
-  ((float*)x_sdata)[tid] = x[tid];
+  ((__shared float*)x_sdata)[tid] = x[tid];
   _Float16 max = fmaxf(x_sdata[2*tid], x_sdata[2*tid + 1]);
   _Float16 denom = mu_fexp(x_sdata[2*tid] - max) + mu_fexp(x_sdata[2*tid + 1] - max);
 
@@ -66,7 +66,7 @@ void softmax(
   for (uint32_t chunk = 1; chunk < chunks_per_block; chunk++) {
     uint32_t idx = chunk * BLOCK_SIZE + tid;
     if (2*idx >= row_elems) break;
-    ((float*)x_sdata)[idx] = x[idx];
+    ((__shared float*)x_sdata)[idx] = x[idx];
     _Float16 next_max = fmaxf(fmaxf(x_sdata[2*idx], x_sdata[2*idx + 1]), max);
     denom = denom * mu_fexp(max - next_max) + mu_fexp(x_sdata[2*idx] - next_max) + mu_fexp(x_sdata[2*idx + 1] - next_max);
     max = next_max;
@@ -105,7 +105,7 @@ void softmax(
     if (2*idx >= row_elems) break;
     x_sdata[2*idx] = mu_fexp(x_sdata[2*idx] - m) * inv_d;
     x_sdata[2*idx + 1] = mu_fexp(x_sdata[2*idx + 1] - m) * inv_d;
-    x[idx] = ((float *)x_sdata)[idx];
+    x[idx] = ((__shared float *)x_sdata)[idx];
   }
 }
 
