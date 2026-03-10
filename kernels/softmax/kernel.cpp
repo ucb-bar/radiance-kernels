@@ -22,15 +22,16 @@ struct SoftmaxArgs {
 __shared uint32_t* const sdata = reinterpret_cast<__shared uint32_t*>(0x0);
 
 template <uint32_t MAX_STRIDE>
-static inline void reduce(__shared uint32_t *max_sdata, __shared uint32_t *denom_sdata, uint32_t tid, uint32_t lane_id) {
+static inline void reduce(__shared uint32_t *buf_sdata, uint32_t tid, uint32_t lane_id) {
   for (uint32_t stride = 2; stride <= MAX_STRIDE; stride *= 2) {
     if (lane_id % stride == 0) {
       uint32_t idx_a = tid, idx_b = (tid + (stride >> 1));
-      _Float16 max_a = __builtin_bit_cast(_Float16, (uint16_t) max_sdata[idx_a]), max_b = __builtin_bit_cast(_Float16, (uint16_t) max_sdata[idx_b]);
-      _Float16 next_max = fmaxf(max_a, max_b);
-      _Float16 denom = denom_sdata[idx_a] * mu_fexp(max_a - next_max) + denom_sdata[idx_b] * mu_fexp(max_b - next_max);
-      denom_sdata[tid] = (uint32_t) __builtin_bit_cast(uint16_t, denom);
-      max_sdata[tid] = (uint32_t) __builtin_bit_cast(uint16_t, next_max);
+      uint32_t buf_a = buf_sdata[idx_a], buf_b = buf_sdata[idx_b];
+      _Float16 max_a = __builtin_bit_cast(_Float16, (uint16_t) buf_a), max_b = __builtin_bit_cast(_Float16, (uint16_t) buf_b);
+      _Float16 denom_a = __builtin_bit_cast(_Float16, (uint16_t) (buf_a >> 16)), denom_b = __builtin_bit_cast(_Float16, (uint16_t) (buf_b >> 16));
+      _Float16 max = fmaxf(max_a, max_b);
+      _Float16 denom = denom_a * mu_fexp(max_a - max) + denom_b * mu_fexp(max_b - max);
+      buf_sdata[tid] = ((uint32_t) __builtin_bit_cast(uint16_t, max)) | ((uint32_t) __builtin_bit_cast(uint16_t, denom) << 16);
     }
   }
 }
@@ -55,8 +56,7 @@ void softmax(
 
   __global uint32_t *x = args->x + block_elem_idx;
   __shared uint32_t *x_sdata = sdata;
-  __shared uint32_t *max_sdata = sdata + row_elems;
-  __shared uint32_t *denom_sdata = max_sdata + DOUBLE_BLOCK_SIZE;
+  __shared uint32_t *buf_sdata = sdata + row_elems;
   
   // pass 1 max + denom
   uint32_t x_fp32 = x[tid];
@@ -78,31 +78,34 @@ void softmax(
     max = next_max;
   }
 
-  max_sdata[tid] = (uint32_t) __builtin_bit_cast(uint16_t, max);
-  denom_sdata[tid] = (uint32_t) __builtin_bit_cast(uint16_t, denom);
+  buf_sdata[tid] = ((uint32_t) __builtin_bit_cast(uint16_t, max)) | ((uint32_t) __builtin_bit_cast(uint16_t, denom) << 16);
 
   // warp reduce
-  reduce<MU_NUM_THREADS>(max_sdata, denom_sdata, tid, lane_id);
+  reduce<MU_NUM_THREADS>(buf_sdata, tid, lane_id);
 
   // only works because num_warps = num_lanes
   if (lane_id == 0) {
-    denom_sdata[warp_id] = denom_sdata[tid];
-    max_sdata[warp_id] = max_sdata[tid];
+    buf_sdata[warp_id] = buf_sdata[tid];
   }
 
   mu_barrier(0, BLOCK_NUM_WARPS);
 
   // block reduce
   if (warp_id == 0) {
-    reduce<MU_NUM_THREADS / THREAD_DIV>(max_sdata, denom_sdata, tid, lane_id);
-    if (lane_id == 0)
-      denom_sdata[0] = (uint32_t) __builtin_bit_cast(uint16_t, __builtin_bit_cast(_Float16, ONE_BF16_BITS) / __builtin_bit_cast(_Float16, (uint16_t) denom_sdata[0]));
+    reduce<MU_NUM_THREADS / THREAD_DIV>(buf_sdata, tid, lane_id);
+    if (lane_id == 0) {
+      uint32_t buf = buf_sdata[0];
+      _Float16 denom = __builtin_bit_cast(_Float16, (uint16_t) (buf >> 16));
+      uint32_t inv_denom = (uint32_t) __builtin_bit_cast(uint16_t, __builtin_bit_cast(_Float16, ONE_BF16_BITS) / denom);
+      buf_sdata[0] = (buf & 0xFFFF) | (inv_denom << 16); 
+    }
   }
 
   mu_barrier(0, BLOCK_NUM_WARPS);
 
   // max and denom in tid 0
-  _Float16 m = __builtin_bit_cast(_Float16, (uint16_t) max_sdata[0]), inv_d = __builtin_bit_cast(_Float16, (uint16_t) denom_sdata[0]);
+  uint32_t buf = buf_sdata[0];
+  _Float16 m = __builtin_bit_cast(_Float16, (uint16_t) buf), inv_d = __builtin_bit_cast(_Float16, (uint16_t) (buf >> 16));
 
   // pass 2 compute softmax for each element chunk by chunk
   for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
