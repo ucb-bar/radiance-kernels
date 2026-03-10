@@ -14,23 +14,23 @@
 #define THREAD_DIV (MU_NUM_MAX_WARPS / NUM_WARPS)
 
 struct SoftmaxArgs {
-  __global float* x;
+  __global uint32_t* x;
   uint32_t rows;
   uint32_t cols;
 };
 
-__shared _Float16* const sdata = reinterpret_cast<__shared _Float16*>(0x0);
+__shared uint32_t* const sdata = reinterpret_cast<__shared uint32_t*>(0x0);
 
 template <uint32_t MAX_STRIDE>
-static inline void reduce(__shared _Float16 *max_sdata, __shared _Float16 *denom_sdata, uint32_t tid, uint32_t lane_id) {
-  #pragma clang loop unroll_count(4)
+static inline void reduce(__shared uint32_t *max_sdata, __shared uint32_t *denom_sdata, uint32_t tid, uint32_t lane_id) {
   for (uint32_t stride = 2; stride <= MAX_STRIDE; stride *= 2) {
     if (lane_id % stride == 0) {
       uint32_t idx_a = tid, idx_b = (tid + (stride >> 1));
-      _Float16 max_a = max_sdata[idx_a], max_b = max_sdata[idx_b];
+      _Float16 max_a = __builtin_bit_cast(_Float16, (uint16_t) max_sdata[idx_a]), max_b = __builtin_bit_cast(_Float16, (uint16_t) max_sdata[idx_b]);
       _Float16 next_max = fmaxf(max_a, max_b);
-      denom_sdata[tid] = denom_sdata[idx_a] * mu_fexp(max_a - next_max) + denom_sdata[idx_b] * mu_fexp(max_b - next_max);
-      max_sdata[tid] = next_max;
+      _Float16 denom = denom_sdata[idx_a] * mu_fexp(max_a - next_max) + denom_sdata[idx_b] * mu_fexp(max_b - next_max);
+      denom_sdata[tid] = (uint32_t) __builtin_bit_cast(uint16_t, denom);
+      max_sdata[tid] = (uint32_t) __builtin_bit_cast(uint16_t, next_max);
     }
   }
 }
@@ -49,31 +49,37 @@ void softmax(
   uint32_t tid = tid_in_threadblock;
   
   uint32_t row_elems = args->cols;
-  uint32_t block_elem_idx = threadblock_id * row_elems / 2;
+  uint32_t row_elems_fp32 = args->cols / 2;
+  uint32_t block_elem_idx = threadblock_id * row_elems_fp32;
   uint32_t chunks_per_block = (row_elems + DOUBLE_BLOCK_SIZE - 1) / DOUBLE_BLOCK_SIZE;
 
-  __global float *x = args->x + block_elem_idx;
-  __shared _Float16 *x_sdata = sdata;
-  __shared _Float16 *max_sdata = sdata + row_elems;
-  __shared _Float16 *denom_sdata = max_sdata + DOUBLE_BLOCK_SIZE;
+  __global uint32_t *x = args->x + block_elem_idx;
+  __shared uint32_t *x_sdata = sdata;
+  __shared uint32_t *max_sdata = sdata + row_elems;
+  __shared uint32_t *denom_sdata = max_sdata + DOUBLE_BLOCK_SIZE;
   
   // pass 1 max + denom
-  ((__shared float*)x_sdata)[tid] = x[tid];
-  _Float16 max = fmaxf(x_sdata[2*tid], x_sdata[2*tid + 1]);
-  _Float16 denom = mu_fexp(x_sdata[2*tid] - max) + mu_fexp(x_sdata[2*tid + 1] - max);
+  uint32_t x_fp32 = x[tid];
+  x_sdata[tid] = x_fp32;
+  _Float16 x0 = __builtin_bit_cast(_Float16, (uint16_t) (x_fp32 >> 16));
+  _Float16 x1 = __builtin_bit_cast(_Float16, (uint16_t) (x_fp32 & 0xFFFF));
+  _Float16 max = fmaxf(x0, x1);
+  _Float16 denom = mu_fexp(x0 - max) + mu_fexp(x1 - max);
 
-  #pragma clang loop unroll_count(4)
   for (uint32_t chunk = 1; chunk < chunks_per_block; chunk++) {
     uint32_t idx = chunk * BLOCK_SIZE + tid;
-    if (2*idx >= row_elems) break;
-    ((__shared float*)x_sdata)[idx] = x[idx];
-    _Float16 next_max = fmaxf(fmaxf(x_sdata[2*idx], x_sdata[2*idx + 1]), max);
-    denom = denom * mu_fexp(max - next_max) + mu_fexp(x_sdata[2*idx] - next_max) + mu_fexp(x_sdata[2*idx + 1] - next_max);
+    if (idx >= row_elems_fp32) break;
+    x_fp32 = x[idx];
+    x_sdata[idx] = x_fp32;
+    x0 = __builtin_bit_cast(_Float16, (uint16_t) (x_fp32 >> 16));
+    x1 = __builtin_bit_cast(_Float16, (uint16_t) (x_fp32 & 0xFFFF));
+    _Float16 next_max = fmaxf(fmaxf(x0, x1), max);
+    denom = denom * mu_fexp(max - next_max) + mu_fexp(x0 - next_max) + mu_fexp(x1 - next_max);
     max = next_max;
   }
 
-  max_sdata[tid] = max;
-  denom_sdata[tid] = denom;
+  max_sdata[tid] = (uint32_t) __builtin_bit_cast(uint16_t, max);
+  denom_sdata[tid] = (uint32_t) __builtin_bit_cast(uint16_t, denom);
 
   // warp reduce
   reduce<MU_NUM_THREADS>(max_sdata, denom_sdata, tid, lane_id);
@@ -90,22 +96,25 @@ void softmax(
   if (warp_id == 0) {
     reduce<MU_NUM_THREADS / THREAD_DIV>(max_sdata, denom_sdata, tid, lane_id);
     if (lane_id == 0)
-      denom_sdata[0] = __builtin_bit_cast(_Float16, ONE_BF16_BITS) / denom_sdata[0];
+      denom_sdata[0] = (uint32_t) __builtin_bit_cast(uint16_t, __builtin_bit_cast(_Float16, ONE_BF16_BITS) / __builtin_bit_cast(_Float16, (uint16_t) denom_sdata[0]));
   }
 
   mu_barrier(0, BLOCK_NUM_WARPS);
 
   // max and denom in tid 0
-  _Float16 m = max_sdata[0], inv_d = denom_sdata[0];
+  _Float16 m = __builtin_bit_cast(_Float16, (uint16_t) max_sdata[0]), inv_d = __builtin_bit_cast(_Float16, (uint16_t) denom_sdata[0]);
 
   // pass 2 compute softmax for each element chunk by chunk
-  #pragma clang loop unroll_count(4)
   for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
     uint32_t idx = chunk * BLOCK_SIZE + tid;
-    if (2*idx >= row_elems) break;
-    x_sdata[2*idx] = mu_fexp(x_sdata[2*idx] - m) * inv_d;
-    x_sdata[2*idx + 1] = mu_fexp(x_sdata[2*idx + 1] - m) * inv_d;
-    x[idx] = ((__shared float *)x_sdata)[idx];
+    if (idx >= row_elems_fp32) break;
+    x_fp32 = x_sdata[idx];
+    x0 = __builtin_bit_cast(_Float16, (uint16_t) (x_fp32 >> 16));
+    x1 = __builtin_bit_cast(_Float16, (uint16_t) (x_fp32 & 0xFFFF));
+    uint32_t x0_new = (uint32_t) __builtin_bit_cast(uint16_t, mu_fexp(x0 - m) * inv_d);
+    uint32_t x1_new = (uint32_t) __builtin_bit_cast(uint16_t, mu_fexp(x1 - m) * inv_d);
+    uint32_t x_new = x0_new | (x1_new << 16);
+    x[idx] = x_new;
   }
 }
 
@@ -118,7 +127,7 @@ SoftmaxArgs softmax_args = {
 #include "data"
 
 int main() {
-  softmax_args.x = reinterpret_cast<__global float*>(x_raw);
+  softmax_args.x = reinterpret_cast<__global uint32_t*>(x_raw);
   softmax_args.rows = rows;
   softmax_args.cols = cols;
   mu_schedule(softmax, &softmax_args, NUM_WARPS);
