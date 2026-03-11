@@ -62,16 +62,13 @@ void softmax(
     __shared uint32_t *buf_sdata = sdata + row_elems;
     
     // pass 1 max + denom
-    uint32_t x_fp32 = x[tid];
-    x_sdata[tid] = x_fp32;
-    auto [x1, x0] = unpack_bf16x2(x_fp32);
-    _Float16 max = fmaxf(x0, x1);
-    _Float16 denom = mu_fexp(x0 - max) + mu_fexp(x1 - max);
+    _Float16 max = as_bf16(NEG_INF_BF16_BITS); // -inf in bf16
+    _Float16 denom = 0; // 0
 
-    for (uint32_t chunk = 1; chunk < chunks_per_block; chunk++) {
+    for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
       uint32_t idx = chunk * BLOCK_SIZE + tid;
       if (idx >= row_elems_fp32) break;
-      x_fp32 = x[idx];
+      uint32_t x_fp32 = x[idx];
       x_sdata[idx] = x_fp32;
       auto [x1_next, x0_next] = unpack_bf16x2(x_fp32);
       _Float16 next_max = fmaxf(fmaxf(x0_next, x1_next), max);
