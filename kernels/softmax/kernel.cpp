@@ -26,12 +26,11 @@ static inline void reduce(__shared uint32_t *buf_sdata, uint32_t tid, uint32_t l
   for (uint32_t stride = 2; stride <= MAX_STRIDE; stride *= 2) {
     if (lane_id % stride == 0) {
       uint32_t idx_a = tid, idx_b = (tid + (stride >> 1));
-      uint32_t buf_a = buf_sdata[idx_a], buf_b = buf_sdata[idx_b];
-      _Float16 max_a = __builtin_bit_cast(_Float16, (uint16_t) buf_a), max_b = __builtin_bit_cast(_Float16, (uint16_t) buf_b);
-      _Float16 denom_a = __builtin_bit_cast(_Float16, (uint16_t) (buf_a >> 16)), denom_b = __builtin_bit_cast(_Float16, (uint16_t) (buf_b >> 16));
+      auto [max_a, denom_a] = unpack_bf16x2(buf_sdata[idx_a]);
+      auto [max_b, denom_b] = unpack_bf16x2(buf_sdata[idx_b]);
       _Float16 max = fmaxf(max_a, max_b);
       _Float16 denom = denom_a * mu_fexp(max_a - max) + denom_b * mu_fexp(max_b - max);
-      buf_sdata[tid] = ((uint32_t) __builtin_bit_cast(uint16_t, max)) | ((uint32_t) __builtin_bit_cast(uint16_t, denom) << 16);
+      buf_sdata[tid] = pack_bf16x2(max, denom);
     }
   }
 }
@@ -65,8 +64,7 @@ void softmax(
     // pass 1 max + denom
     uint32_t x_fp32 = x[tid];
     x_sdata[tid] = x_fp32;
-    _Float16 x0 = __builtin_bit_cast(_Float16, (uint16_t) (x_fp32 >> 16));
-    _Float16 x1 = __builtin_bit_cast(_Float16, (uint16_t) (x_fp32 & 0xFFFF));
+    auto [x1, x0] = unpack_bf16x2(x_fp32);
     _Float16 max = fmaxf(x0, x1);
     _Float16 denom = mu_fexp(x0 - max) + mu_fexp(x1 - max);
 
@@ -75,14 +73,13 @@ void softmax(
       if (idx >= row_elems_fp32) break;
       x_fp32 = x[idx];
       x_sdata[idx] = x_fp32;
-      x0 = __builtin_bit_cast(_Float16, (uint16_t) (x_fp32 >> 16));
-      x1 = __builtin_bit_cast(_Float16, (uint16_t) (x_fp32 & 0xFFFF));
-      _Float16 next_max = fmaxf(fmaxf(x0, x1), max);
-      denom = denom * mu_fexp(max - next_max) + mu_fexp(x0 - next_max) + mu_fexp(x1 - next_max);
+      auto [x1_next, x0_next] = unpack_bf16x2(x_fp32);
+      _Float16 next_max = fmaxf(fmaxf(x0_next, x1_next), max);
+      denom = denom * mu_fexp(max - next_max) + mu_fexp(x0_next - next_max) + mu_fexp(x1_next - next_max);
       max = next_max;
     }
 
-    buf_sdata[tid] = ((uint32_t) __builtin_bit_cast(uint16_t, max)) | ((uint32_t) __builtin_bit_cast(uint16_t, denom) << 16);
+    buf_sdata[tid] = pack_bf16x2(max, denom);
 
     // warp reduce
     reduce<MU_NUM_THREADS>(buf_sdata, tid, lane_id);
@@ -98,30 +95,23 @@ void softmax(
     if (warp_id == 0) {
       reduce<MU_NUM_THREADS / THREAD_DIV>(buf_sdata, tid, lane_id);
       if (lane_id == 0) {
-        uint32_t buf = buf_sdata[0];
-        _Float16 denom = __builtin_bit_cast(_Float16, (uint16_t) (buf >> 16));
-        uint32_t inv_denom = (uint32_t) __builtin_bit_cast(uint16_t, __builtin_bit_cast(_Float16, ONE_BF16_BITS) / denom);
-        buf_sdata[0] = (buf & 0xFFFF) | (inv_denom << 16); 
+        auto [max_final, denom_final] = unpack_bf16x2(buf_sdata[0]);
+        _Float16 inv_denom = as_bf16(ONE_BF16_BITS) / denom_final;
+        buf_sdata[0] = pack_bf16x2(max_final, inv_denom);
       }
     }
 
     mu_barrier(0, BLOCK_NUM_WARPS);
 
-    // max and denom in tid 0
-    uint32_t buf = buf_sdata[0];
-    _Float16 m = __builtin_bit_cast(_Float16, (uint16_t) buf), inv_d = __builtin_bit_cast(_Float16, (uint16_t) (buf >> 16));
+    // max and inv_denom in tid 0
+    auto [m, inv_d] = unpack_bf16x2(buf_sdata[0]);
 
     // pass 2 compute softmax for each element chunk by chunk
     for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
       uint32_t idx = chunk * BLOCK_SIZE + tid;
       if (idx >= row_elems_fp32) break;
-      x_fp32 = x_sdata[idx];
-      x0 = __builtin_bit_cast(_Float16, (uint16_t) (x_fp32 >> 16));
-      x1 = __builtin_bit_cast(_Float16, (uint16_t) (x_fp32 & 0xFFFF));
-      uint32_t x0_new = (uint32_t) __builtin_bit_cast(uint16_t, mu_fexp(x0 - m) * inv_d);
-      uint32_t x1_new = (uint32_t) __builtin_bit_cast(uint16_t, mu_fexp(x1 - m) * inv_d);
-      uint32_t x_new = x0_new | (x1_new << 16);
-      x[idx] = x_new;
+      auto [lo, hi] = unpack_bf16x2(x_sdata[idx]);
+      x[idx] = pack_bf16x2(mu_fexp(lo - m) * inv_d, mu_fexp(hi - m) * inv_d);
     }
 
     mu_barrier(0, BLOCK_NUM_WARPS);
