@@ -62,7 +62,7 @@ inline void mu_fence() {
 #define MU_NUM_THREADS 16
 #define MU_NUM_CORES 2
 #define MU_NUM_MAX_WARPS 8
-#define MU_NUM_CLUSTERS 2
+#define MU_NUM_CLUSTERS 1
 #define MU_BLOCK_NUM_WARPS(n) (MU_NUM_CORES * (n))
 #define MU_BLOCK_SIZE(n) (MU_BLOCK_NUM_WARPS(n) * MU_NUM_THREADS)
 #define MU_DOUBLE_BLOCK_SIZE(n) (MU_BLOCK_SIZE(n) * 2)
