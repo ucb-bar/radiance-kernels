@@ -90,4 +90,19 @@ inline void mu_barrier(unsigned barried_id, unsigned num_warps) {
 
 // TODO: half?
 
+static inline _Float16 as_bf16(uint16_t bits) {
+  return __builtin_bit_cast(_Float16, bits);
+}
+
+struct bf16x2 { _Float16 lo, hi; };
+
+static inline bf16x2 unpack_bf16x2(uint32_t packed) {
+  return { as_bf16((uint16_t)packed), as_bf16((uint16_t)(packed >> 16)) };
+}
+
+static inline uint32_t pack_bf16x2(_Float16 lo, _Float16 hi) {
+  return (uint32_t)__builtin_bit_cast(uint16_t, lo)
+       | ((uint32_t)__builtin_bit_cast(uint16_t, hi) << 16);
+}
+
 #endif // __MU_INTRINSICS_H__
