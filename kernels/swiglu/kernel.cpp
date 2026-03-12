@@ -18,7 +18,8 @@ struct SWIGLUArgs {
 };
 
 static inline _Float16 sigmoid(_Float16 x) {
-    return 1 / (1 + mu_fnexp(x));
+    _Float16 one = as_bf16(ONE_BF16_BITS);
+    return one / (one + mu_fnexp(x));
 }
 
 // C[i,j] = swish(A[i,j]) * B[i,j] where swish(x) = x * sigmoid(x)
