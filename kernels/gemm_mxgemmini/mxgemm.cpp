@@ -35,15 +35,15 @@ static uint64_t C_out_got[DIM][DIM] = {0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEA
 static void __attribute__((noinline))
 load_scale_factors(volatile uint32_t *sf_mem, const uint8_t *scale_factors,
                    int n) {
-  // asm volatile ("load_scale_factors_start_%=:" :: );
-  auto word_scale_factors = reinterpret_cast<const uint32_t *>(scale_factors);
+    // asm volatile ("load_scale_factors_start_%=:" :: );
+    auto word_scale_factors = reinterpret_cast<const uint32_t *>(scale_factors);
 
-  constexpr auto ILP = 8;
-  uint32_t unrolled[ILP];
-
-#pragma unroll 4
+    // unroll in registers to reduce back-to-back WAW/WAR
+    constexpr auto ILP = 8;
+    uint32_t unrolled[ILP];
+    #pragma unroll 4
     for (size_t i = 0; i < n / 4; i += ILP) {
-#pragma unroll
+        #pragma unroll
         for (int j = 0; j < ILP; j++) {
             // do full-word stores instead of 1-byte stores
             unrolled[j] = word_scale_factors[i + j];
@@ -77,10 +77,26 @@ static inline void configure_mxgemmini() {
                                 false, 1);
 
     // Configure move-out for C
-    // We want 1 byte per output element in DRAM
+    // We want 1 byte per output element in GMEM
     // gemmini_extended_config_st(DIM * sizeof(out_t), NO_ACTIVATION, 1); // nicolas's
     gemmini_extended_config_st(TILE_N * sizeof(elem_t), NO_ACTIVATION, 1 /*TODO: what is this?*/);
 
+    // Configure loop bounds for the FSM
+    // This only needs to be done once since the kernel does not change the
+    // SMEM tile size
+    gemmini_loop_ws_config_bounds(
+        PE_TILES_I, PE_TILES_J, PE_TILES_K, // loop bounds for I, J, K (single 16×16 PE tile)
+        0, 0, 0 // pad_I=0, pad_J=0, pad_K=0
+    );
+
+    // wait for configuration finish
+    gemmini_fence();
+
+    // NOTE: we need to run this twice to configure the two FSMs
+    gemmini_loop_ws_config_bounds(
+        PE_TILES_I, PE_TILES_J, PE_TILES_K, // loop bounds for I, J, K (single 16×16 PE tile)
+        0, 0, 0 // pad_I=0, pad_J=0, pad_K=0
+    );
     // wait for configuration finish
     gemmini_fence();
 }
@@ -98,7 +114,7 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i,
 
 #define GEMMINI_DMA 1
 #if GEMMINI_DMA
-    // config GMEM address for A and B
+    // Configure GMEM address for A and B
     // inst: 0x1420b07b
     ROCC_INSTRUCTION_RS1_RS2(
         XCUSTOM_ACC,
@@ -106,17 +122,15 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i,
         rad_device_to_host_address(reinterpret_cast<uint32_t>(B_in)),
         k_LOOP_WS_CONFIG_ADDRS_AB)
 
-    // gemmini_fence();
-
-    // TODO: config DRAM strides
-    // inst: 0x1820b07b
+    // Configure loop FSM GMEM move-in strides for A and B
+    // This only needs to be done once since the kernel does not change the
+    // SMEM tile size
+    // FIXME: Moving this out of the loop breaks addresses?
     ROCC_INSTRUCTION_RS1_RS2(
         XCUSTOM_ACC,
-        (uint64_t)(TILE_K),
+        (uint64_t)(TILE_K), // TODO: this might be wrong
         (uint64_t)(TILE_N),
-        k_LOOP_WS_CONFIG_STRIDES_AB)
-
-    // gemmini_fence();
+        k_LOOP_WS_CONFIG_STRIDES_AB /* 0x1820b07b */)
 
     // gemmini_loop_ws_spad issues three instructions:
     //
@@ -133,8 +147,8 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i,
     gemmini_loop_ws_spad(
         PE_TILES_I, PE_TILES_J, PE_TILES_K, // loop bounds for I, J, K (single 16×16 PE tile)
         0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
-        0 * DIM,              // A scratchpad address
-        BANK_NUM * BANK_ROWS, // B scratchpad address
+        0 * DIM,              // A scratchpad address (TODO: double-buffer)
+        BANK_NUM * BANK_ROWS, // B scratchpad address (TODO: double-buffer)
         0,                    // D (bias) - none
         DONTCARE,             // C accumulator address
         false, false,         // A_transpose, B_transpose
@@ -179,8 +193,8 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i,
 }
 
 /** Asynchronously kick off loop FSM matmul compute operation in MxGemmini.
- *  Move out accumulator data to SMEM if `acc_move_out` is true. */
-// TODO: SMEM tile must be double-buffered
+ *  Move out accumulator data to SMEM if `acc_move_out` is true.
+ *  TODO: double-buffer */
 static inline void matmul_tile_async(const bool acc_move_out) {
     asm volatile ("matmul_tile_async_start_%=:" :: );
 
@@ -209,7 +223,7 @@ static inline void matmul_tile_async(const bool acc_move_out) {
 void mxgemm(void *arg, uint32_t tid_in_threadblock,
             uint32_t threads_per_threadblock,
             uint32_t threadblock_id) {
-    if (!tid_in_threadblock == 0) {
+    if (tid_in_threadblock != 0) {
         return;
     }
 
