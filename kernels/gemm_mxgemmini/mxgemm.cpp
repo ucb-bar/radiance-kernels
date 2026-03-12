@@ -44,7 +44,7 @@ typedef uint64_t  out_t;    // C_scaled: fp8:e4m3 (1 byte per output)
 static uint64_t C_out_got[DIM][DIM] = {0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF,};
 
 static void __attribute__((noinline))
-load_scale_factors(volatile uint32_t *sf_mem, const uint8_t *scale_factors,
+load_scale_factors(volatile __shared uint32_t *sf_mem, const uint8_t *scale_factors,
                    int n) {
     // asm volatile ("load_scale_factors_start_%=:" :: );
     auto word_scale_factors = reinterpret_cast<const uint32_t *>(scale_factors);
@@ -60,7 +60,7 @@ load_scale_factors(volatile uint32_t *sf_mem, const uint8_t *scale_factors,
             unrolled[j] = word_scale_factors[i + j];
         }
         for (int j = 0; j < ILP; j++) {
-            store_shared(reinterpret_cast<uint32_t>(&sf_mem[i + j]), 0, unrolled[j]);
+            sf_mem[i + j] = unrolled[j];
         }
     }
     // asm volatile ("load_scale_factors_end_%=:" :: );
@@ -300,10 +300,10 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
 
     // Load scaling factors from GMEM to the scale SRAM
     // load_scale_factors((const uint64_t *) C_scale, sizeof(C_scale));
-    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], SCALE_FAC_DIM);
-    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], SCALE_FAC_DIM);
-    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], SCALE_FAC_DIM);
-    load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], SCALE_FAC_DIM);
+    load_scale_factors(reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], SCALE_FAC_DIM);
+    load_scale_factors(reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], SCALE_FAC_DIM);
+    load_scale_factors(reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], SCALE_FAC_DIM);
+    load_scale_factors(reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], SCALE_FAC_DIM);
 
     asm volatile ("load_lut_start_%=:" :: );
 
@@ -360,8 +360,8 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
         // update scale factors between async kickoff & fence to hide latency
         // FIXME: fix double-buffer index
         if constexpr (!DISABLE_SCALE_FACTOR_UPDATE) {
-            load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], SCALE_FAC_DIM);
-            load_scale_factors(reinterpret_cast<uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], SCALE_FAC_DIM);
+            load_scale_factors(reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], SCALE_FAC_DIM);
+            load_scale_factors(reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], SCALE_FAC_DIM);
 
             // ensure scale factor write -> mxgemmini kickoff ordering
             mu_fence();
