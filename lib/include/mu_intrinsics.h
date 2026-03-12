@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <type_traits>
 #include <vx_intrinsics.h>
+#include "shared_mem.h"
 
 // You need to use __builtin_bit_cast(_Float16, ONE_BF16_BITS) for the compiler to correctly emit it.
 // use as_bf16 to quickly convert
