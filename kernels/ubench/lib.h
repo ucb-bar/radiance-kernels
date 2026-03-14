@@ -60,7 +60,7 @@ inline T load_gmem_coalesced(const volatile __global T *base) {
 
     const auto tid = vx_thread_id();
 
-    #pragma unroll UNROLL;
+    #pragma unroll UNROLL
     for (int i = 0; i < N; i += ILP * NT) {
         T val[ILP];
         #pragma unroll
@@ -68,6 +68,75 @@ inline T load_gmem_coalesced(const volatile __global T *base) {
             // const uint32_t index = i + j * NT + tid;
             const uint32_t index = tid;
             val[j] = base[index];
+        }
+    }
+
+    return 0;
+}
+
+template <uint32_t N, typename T>
+inline T store_gmem_coalesced(volatile __global T *base) {
+    constexpr int ILP = 16;
+    constexpr int UNROLL = 8;
+    constexpr auto NT = MU_NUM_THREADS;
+    static_assert(UNROLL * ILP * NT < N);
+
+    const auto tid = vx_thread_id();
+
+    #pragma unroll UNROLL
+    for (int i = 0; i < N; i += ILP * NT) {
+        T val[ILP];
+        #pragma unroll
+        for (int j = 0; j < ILP; j++) {
+            // const uint32_t index = i + j * NT + tid;
+            const uint32_t index = tid;
+            base[index] = 0xdeadbeef;
+        }
+    }
+
+    return 0;
+}
+
+template <uint32_t N, typename T>
+inline T load_smem(const volatile __shared T *base) {
+    constexpr int ILP = 16;
+    constexpr int UNROLL = 8;
+    constexpr auto NT = MU_NUM_THREADS;
+    static_assert(UNROLL * ILP * NT < N);
+
+    const auto tid = vx_thread_id();
+
+    #pragma unroll UNROLL
+    for (int i = 0; i < N; i += ILP * NT) {
+        T val[ILP];
+        #pragma unroll
+        for (int j = 0; j < ILP; j++) {
+            // const uint32_t index = i + j * NT + tid;
+            const uint32_t index = tid;
+            val[j] = base[index];
+        }
+    }
+
+    return 0;
+}
+
+template <uint32_t N, typename T>
+inline T store_smem(volatile __shared T *base) {
+    constexpr int ILP = 16;
+    constexpr int UNROLL = 8;
+    constexpr auto NT = MU_NUM_THREADS;
+    static_assert(UNROLL * ILP * NT < N);
+
+    const auto tid = vx_thread_id();
+
+    #pragma unroll UNROLL
+    for (int i = 0; i < N; i += ILP * NT) {
+        T val[ILP];
+        #pragma unroll
+        for (int j = 0; j < ILP; j++) {
+            // const uint32_t index = i + j * NT + tid;
+            const uint32_t index = tid;
+            base[index] = 0xdeadbeef;
         }
     }
 

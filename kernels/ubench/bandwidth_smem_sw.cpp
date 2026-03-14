@@ -8,8 +8,8 @@ int main() {
 
     constexpr auto N = 1 << 18;
     // text region
-    const auto base = reinterpret_cast<const volatile __global uint32_t *>(0x10000000);
-    load_gmem_coalesced<N>(base);
+    const auto base = reinterpret_cast<volatile __shared uint32_t *>(0x0);
+    store_smem<N>(base);
 
     return 0;
 }
