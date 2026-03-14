@@ -57,6 +57,14 @@ inline std::remove_cv_t<T> load16_shared(const T *address) {
 inline void mu_fence() {
     asm volatile("fence");
 }
+__attribute__((convergent))
+inline void mu_fence_smem() {
+    asm volatile ("fence.s" ::: "memory");
+}
+__attribute__((convergent))
+inline void mu_barrier(unsigned barried_id, unsigned num_warps) {
+    asm volatile ("vx_bar %0, %1" :: "r"(barried_id), "r"(num_warps) : "memory");
+}
 
 // This hard-codes hardware config into kernel, but this allows efficient
 // compile-time unrolling and constant propagation.
@@ -85,11 +93,6 @@ inline _Float16 mu_fnexp(_Float16 arg) {
     return output;
 }
 
-
-__attribute__((convergent))
-inline void mu_barrier(unsigned barried_id, unsigned num_warps) {
-    asm volatile ("vx_bar %0, %1" :: "r"(barried_id), "r"(num_warps) : "memory");
-}
 
 // TODO: half?
 
