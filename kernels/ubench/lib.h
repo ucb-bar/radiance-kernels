@@ -1,6 +1,6 @@
 #include <stdint.h>
 #include <type_traits>
-#include <vx_intrinsics.h>
+#include <mu_intrinsics.h>
 
 template <typename T>
 inline T sum() {
@@ -49,4 +49,28 @@ inline _Float16 exp() {
   }
 
   return x[0];
+}
+
+template <typename T>
+inline T load_gmem_coalesced(const volatile __global T *base) {
+    constexpr int ILP = 16;
+    constexpr int N = 1 << 18;
+    constexpr int UNROLL = 8;
+    constexpr auto NT = MU_NUM_THREADS;
+    static_assert(UNROLL * ILP * NT < N);
+
+    const auto tid = vx_thread_id();
+
+    #pragma unroll UNROLL;
+    for (int i = 0; i < N; i += ILP * NT) {
+        T val[ILP];
+        #pragma unroll
+        for (int j = 0; j < ILP; j++) {
+            // const uint32_t index = i + j * NT + tid;
+            const uint32_t index = tid;
+            val[j] = base[index];
+        }
+    }
+
+    return 0;
 }
