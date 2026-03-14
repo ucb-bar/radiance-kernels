@@ -98,6 +98,7 @@ void softmax(
       }
     }
 
+    mu_fence_smem();
     mu_barrier(0, BLOCK_NUM_WARPS);
 
     // max and inv_denom in tid 0
