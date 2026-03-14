@@ -6,9 +6,10 @@
 int main() {
     vx_tmc(-1);
 
+    constexpr auto N = 1 << 18;
     // text region
     const auto base = reinterpret_cast<const volatile __global uint32_t *>(0x10000000);
-    load_gmem_coalesced(base);
+    load_gmem_coalesced<N>(base);
 
     vx_tmc(1);
 
