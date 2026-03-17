@@ -11,6 +11,9 @@
 #define ONE_BF16_BITS ((uint16_t)0x3f80)
 #define NEG_INF_BF16_BITS ((uint16_t) 0xFF80)
 
+// 128 KiB SMEM
+#define MU_SMEM_SIZE_BYTES (128 << 10)
+
 #define MU_CSR_CLUSTER_ID 0xCD0
 
 inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {
@@ -54,8 +57,9 @@ inline std::remove_cv_t<T> load16_shared(const T *address) {
     return __builtin_bit_cast(U, bits);
 }
 
+__attribute__((convergent))
 inline void mu_fence() {
-    asm volatile("fence");
+    asm volatile ("fence" ::: "memory");
 }
 __attribute__((convergent))
 inline void mu_fence_smem() {
