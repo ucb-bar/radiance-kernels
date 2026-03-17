@@ -4,6 +4,10 @@
 #include "lib.h"
 
 int main() {
+    if (vx_core_id() != 0) {
+        return 0;
+    }
+
     vx_tmc(-1);
 
     constexpr auto N = 1 << 18;
