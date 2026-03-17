@@ -6,6 +6,8 @@
 #include "include/gemmini.h"
 // #include "include/matmul_data_mx_fp8.h"
 #include "include/matmul_fp8_64x64.h"
+// #include "include/matmul_fp8_128x128x256.h"
+// #include "include/matmul_fp8_128x128.h"
 // #include "include/matmul_data_mx_lut_hw.h"
 #include "mxgemmini_mmio.h"
 
@@ -95,7 +97,7 @@ static inline void configure_mxgemmini() {
         GEMMINI_FORMAT, // A dtype
         GEMMINI_FORMAT, // B dtype
         GEMMINI_FORMAT_FULL, // C dtype
-        0  // uselut
+        USE_LUT  // uselut
     );
     // ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC,
     //   ((uint64_t)acc_scale_t_to_acc_scale_t_bits((acc_scale_t)ACC_SCALE_IDENTITY) << 32)
@@ -116,7 +118,6 @@ static inline void configure_mxgemmini() {
     //   k_CONFIG);
 
     // Configure GMEM move-in strides for A and B
-    // gemmini_config_ld(TILE_M * sizeof(elem_t)); // nicolas's
     gemmini_extended3_config_ld(
         TILE_K * sizeof(uint8_t) / VALUES_PER_BYTE,
         MVIN_SCALE_IDENTITY, false, 0
@@ -233,10 +234,10 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
     gemmini_loop_ws_spad(
         PE_TILES_I, PE_TILES_J, PE_TILES_K, // loop bounds for I, J, K (single 16×16 PE tile)
         0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
-        a_spad_addr,          // A scratchpad address in rows (TODO: double-buffer)
-        b_spad_addr,          // B scratchpad address in rows (TODO: double-buffer)
+        a_spad_addr,          // A scratchpad address in rows
+        b_spad_addr,          // B scratchpad address in rows
         0,                    // D (bias) - none
-        DONTCARE,             // C scratchpad address
+        DONTCARE,             // C scratchpad address in rows
         false, false,         // A_transpose, B_transpose
         false, false, false,  // full_C, low_D, ex_accumulate
         NO_ACTIVATION,        // activation
@@ -281,7 +282,6 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
 
 /** Asynchronously kick off loop FSM matmul compute operation in MxGemmini.
  *  Move out accumulator data to SMEM if `acc_move_out` is true.
- *  TODO: double-buffer */
 static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_out) {
     asm volatile ("matmul_tile_async_start_%=:" :: );
 
@@ -297,10 +297,10 @@ static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_
     gemmini_loop_ws_spad(
         PE_TILES_I, PE_TILES_J, PE_TILES_K, // loop bounds for I, J, K (single 16×16 PE tile)
         0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
-        a_spad_addr,          // A scratchpad address
-        b_spad_addr,          // B scratchpad address
+        a_spad_addr,          // A scratchpad address in rows
+        b_spad_addr,          // B scratchpad address in rows
         0,                    // D (bias) - none
-        acc_addr,             // C scratchpad address
+        acc_addr,             // C scratchpad address in rows
         false, false,         // A_transpose, B_transpose
         false, false, false,  // full_C, low_D, ex_accumulate
         NO_ACTIVATION,        // activation
@@ -386,17 +386,19 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
         const auto last_k = ((tile_k + 1) * TILE_K) >= dim_k;
         const auto odd_k = (tile_k & 1);
 
+        // GMEM->SMEM DMA for the next tile_k
         // TODO: This results in an unnecessary move-in at the last K tile
         if constexpr (!DISABLE_DMA_MOVE_IN) {
             // gemmini_fence_ready();
             copy_gmem_to_smem_async(0, 0, tile_k + 1);
         }
 
-        // TODO: SMEM tile must be double-buffered
+        // asynchrously kick off matmul for this tile_k
         // gemmini_fence_ready();
         matmul_tile_async(tile_k, last_k);
 
-        // update scale factors between async kickoff & fence to hide latency
+        // update scale factors for the next tile_k
+        // make sure to place this between tile_async and fence to hide latency
         // FIXME: fix double-buffer index
         if constexpr (!DISABLE_SCALE_FACTOR_UPDATE) {
             // TODO: double-buffer
