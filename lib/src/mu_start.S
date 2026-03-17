@@ -26,7 +26,12 @@
 _start:  
 
   # initialize per-thread registers
+  # extern "C" uint32_t __mu_num_init_warps = xxxx; do this to set max warps spawned.
+  la    t0, __mu_num_warps
+  lw    t0, 0(t0)
+  bnez  t0, skip_nw
   csrr  t0, nw
+skip_nw:
   la    t1, init_regs_all
   .insn r RISCV_CUSTOM0, 1, 0, x0, t0, t1  # wspawn t0, t1
   li    t0, -1
@@ -117,5 +122,10 @@ vx_wspawn_wait:
 	.global __dso_handle
 	.weak __dso_handle
 __dso_handle:
+	.long	0
+
+	.global __mu_num_warps
+	.weak __mu_num_warps
+__mu_num_warps:
 	.long	0
 
