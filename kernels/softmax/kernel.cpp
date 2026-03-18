@@ -24,15 +24,23 @@ struct SoftmaxArgs {
 __shared uint32_t* const sdata = reinterpret_cast<__shared uint32_t*>(0x0);
 
 template <uint32_t MAX_STRIDE>
-static inline void reduce(__shared uint32_t *buf_sdata, uint32_t tid, uint32_t lane_id) {
+static inline void reduce_max(__shared uint32_t *buf_sdata, uint32_t tid, uint32_t lane_id) {
   for (uint32_t stride = 2; stride <= MAX_STRIDE; stride *= 2) {
     if (lane_id % stride == 0) {
-      uint32_t idx_a = tid, idx_b = (tid + (stride >> 1));
-      auto [max_a, denom_a] = unpack_bf16x2(buf_sdata[idx_a]);
-      auto [max_b, denom_b] = unpack_bf16x2(buf_sdata[idx_b]);
-      _Float16 max = fmaxf(max_a, max_b);
-      _Float16 denom = denom_a * mu_fexp(max_a - max) + denom_b * mu_fexp(max_b - max);
-      buf_sdata[tid] = pack_bf16x2(max, denom);
+      _Float16 a = as_bf16((uint16_t)buf_sdata[tid]);
+      _Float16 b = as_bf16((uint16_t)buf_sdata[tid + (stride >> 1)]);
+      buf_sdata[tid] = (uint32_t)__builtin_bit_cast(uint16_t, (_Float16)fmaxf(a, b));
+    }
+  }
+}
+
+template <uint32_t MAX_STRIDE>
+static inline void reduce_sum(__shared uint32_t *buf_sdata, uint32_t tid, uint32_t lane_id) {
+  for (uint32_t stride = 2; stride <= MAX_STRIDE; stride *= 2) {
+    if (lane_id % stride == 0) {
+      _Float16 a = as_bf16((uint16_t)buf_sdata[tid]);
+      _Float16 b = as_bf16((uint16_t)buf_sdata[tid + (stride >> 1)]);
+      buf_sdata[tid] = (uint32_t)__builtin_bit_cast(uint16_t, a + b);
     }
   }
 }
@@ -54,7 +62,6 @@ void softmax(
   uint32_t row_elems = args->cols;
   uint32_t row_elems_fp32 = args->cols / 2;
 
-  #pragma unroll 8
   for (uint32_t row = 0; row < rows_per_block; row++) {
     uint32_t block_elem_idx = (threadblock_id * rows_per_block + row) * row_elems_fp32;
     uint32_t chunks_per_block = (row_elems + DOUBLE_BLOCK_SIZE - 1) / DOUBLE_BLOCK_SIZE;
@@ -63,50 +70,67 @@ void softmax(
     __shared uint32_t *x_sdata = sdata;
     __shared uint32_t *buf_sdata = sdata + row_elems;
     
-    // pass 1 max + denom
-    _Float16 max = as_bf16(NEG_INF_BF16_BITS); // -inf in bf16
-    _Float16 denom = 0; // 0
+    // pass 1: find max
+    _Float16 max = as_bf16(NEG_INF_BF16_BITS);
 
     for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
       uint32_t idx = chunk * BLOCK_SIZE + tid;
       if (idx >= row_elems_fp32) break;
       uint32_t x_fp32 = x[idx];
       x_sdata[idx] = x_fp32;
-      auto [x1_next, x0_next] = unpack_bf16x2(x_fp32);
-      _Float16 next_max = fmaxf(fmaxf(x0_next, x1_next), max);
-      denom = denom * mu_fexp(max - next_max) + mu_fexp(x0_next - next_max) + mu_fexp(x1_next - next_max);
-      max = next_max;
+      auto [x1, x0] = unpack_bf16x2(x_fp32);
+      max = fmaxf(fmaxf(x0, x1), max);
     }
 
-    buf_sdata[tid] = pack_bf16x2(max, denom);
+    buf_sdata[tid] = (uint32_t)__builtin_bit_cast(uint16_t, max);
 
-    // warp reduce
-    reduce<MU_NUM_THREADS>(buf_sdata, tid, lane_id);
-
-    // only works because num_warps = num_lanes
-    if (lane_id == 0) {
+    // warp reduce max
+    reduce_max<MU_NUM_THREADS>(buf_sdata, tid, lane_id);
+    if (lane_id == 0)
       buf_sdata[warp_id] = buf_sdata[tid];
-    }
-
     mu_barrier(0, BLOCK_NUM_WARPS);
 
-    // block reduce
-    if (warp_id == 0) {
-      reduce<MU_NUM_THREADS / THREAD_DIV>(buf_sdata, tid, lane_id);
-      if (lane_id == 0) {
-        auto [max_final, denom_final] = unpack_bf16x2(buf_sdata[0]);
-        _Float16 inv_denom = as_bf16(ONE_BF16_BITS) / denom_final;
-        buf_sdata[0] = pack_bf16x2(max_final, inv_denom);
-      }
-    }
-
+    // block reduce max
+    if (warp_id == 0)
+      reduce_max<MU_NUM_THREADS / THREAD_DIV>(buf_sdata, tid, lane_id);
     mu_fence_smem();
     mu_barrier(0, BLOCK_NUM_WARPS);
 
-    // max and inv_denom in tid 0
-    auto [m, inv_d] = unpack_bf16x2(buf_sdata[0]);
+    _Float16 m = as_bf16((uint16_t)buf_sdata[0]);
 
-    // pass 2 compute softmax for each element chunk by chunk
+    // pass 2: compute denom with known max
+    _Float16 denom = 0;
+
+    for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
+      uint32_t idx = chunk * BLOCK_SIZE + tid;
+      if (idx >= row_elems_fp32) break;
+      auto [x1, x0] = unpack_bf16x2(x_sdata[idx]);
+      denom += mu_fexp(x0 - m) + mu_fexp(x1 - m);
+    }
+
+    buf_sdata[tid] = (uint32_t)__builtin_bit_cast(uint16_t, denom);
+
+    // warp reduce denom
+    reduce_sum<MU_NUM_THREADS>(buf_sdata, tid, lane_id);
+    if (lane_id == 0)
+      buf_sdata[warp_id] = buf_sdata[tid];
+    mu_barrier(0, BLOCK_NUM_WARPS);
+
+    // block reduce denom
+    if (warp_id == 0) {
+      reduce_sum<MU_NUM_THREADS / THREAD_DIV>(buf_sdata, tid, lane_id);
+      if (lane_id == 0) {
+        _Float16 denom_final = as_bf16((uint16_t)buf_sdata[0]);
+        _Float16 inv_denom = as_bf16(ONE_BF16_BITS) / denom_final;
+        buf_sdata[0] = (uint32_t)__builtin_bit_cast(uint16_t, inv_denom);
+      }
+    }
+    mu_fence_smem();
+    mu_barrier(0, BLOCK_NUM_WARPS);
+
+    _Float16 inv_d = as_bf16((uint16_t)buf_sdata[0]);
+
+    // pass 3: compute softmax output
     for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
       uint32_t idx = chunk * BLOCK_SIZE + tid;
       if (idx >= row_elems_fp32) break;
