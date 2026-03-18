@@ -116,4 +116,6 @@ static inline uint32_t pack_bf16x2(_Float16 lo, _Float16 hi) {
        | ((uint32_t)__builtin_bit_cast(uint16_t, hi) << 16);
 }
 
+#define LABEL(name) asm volatile(#name ":" ::: "memory")
+
 #endif // __MU_INTRINSICS_H__
