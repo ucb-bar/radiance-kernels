@@ -13,6 +13,8 @@
 // only works for powers of 2 reduction, otherwise you have to manually write your own reduction
 #define THREAD_DIV (MU_NUM_MAX_WARPS / NUM_WARPS)
 
+extern "C" uint32_t __mu_num_warps = MU_BLOCK_NUM_WARPS(NUM_WARPS);
+
 struct SoftmaxArgs {
   __global uint32_t* x;
   uint32_t rows;
