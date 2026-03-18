@@ -62,6 +62,7 @@ void softmax(
   uint32_t row_elems = args->cols;
   uint32_t row_elems_fp32 = args->cols / 2;
 
+  #pragma unroll
   for (uint32_t row = 0; row < rows_per_block; row++) {
     uint32_t block_elem_idx = (threadblock_id * rows_per_block + row) * row_elems_fp32;
     uint32_t chunks_per_block = (row_elems + DOUBLE_BLOCK_SIZE - 1) / DOUBLE_BLOCK_SIZE;
@@ -73,9 +74,9 @@ void softmax(
     // pass 1: find max
     _Float16 max = as_bf16(NEG_INF_BF16_BITS);
 
+    #pragma unroll
     for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
       uint32_t idx = chunk * BLOCK_SIZE + tid;
-      if (idx >= row_elems_fp32) break;
       uint32_t x_fp32 = x[idx];
       x_sdata[idx] = x_fp32;
       auto [x1, x0] = unpack_bf16x2(x_fp32);
@@ -101,9 +102,9 @@ void softmax(
     // pass 2: compute denom with known max
     _Float16 denom = 0;
 
+    #pragma unroll
     for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
       uint32_t idx = chunk * BLOCK_SIZE + tid;
-      if (idx >= row_elems_fp32) break;
       auto [x1, x0] = unpack_bf16x2(x_sdata[idx]);
       denom += mu_fexp(x0 - m) + mu_fexp(x1 - m);
     }
@@ -131,9 +132,9 @@ void softmax(
     _Float16 inv_d = as_bf16((uint16_t)buf_sdata[0]);
 
     // pass 3: compute softmax output
+    #pragma unroll
     for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
       uint32_t idx = chunk * BLOCK_SIZE + tid;
-      if (idx >= row_elems_fp32) break;
       auto [lo, hi] = unpack_bf16x2(x_sdata[idx]);
       x[idx] = pack_bf16x2(mu_fexp(lo - m) * inv_d, mu_fexp(hi - m) * inv_d);
     }
