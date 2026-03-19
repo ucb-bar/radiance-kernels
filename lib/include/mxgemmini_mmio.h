@@ -15,10 +15,6 @@
 #include <mu_intrinsics.h>
 #include <type_traits>
 
-#define GEMMINI_SF_MEM    0x00088000
-#define GEMMINI_SF_MEM_A (GEMMINI_SF_MEM + 0x2000)
-#define GEMMINI_SF_MEM_B (GEMMINI_SF_MEM)
-
 #define GEMMINI_CTRL        0x00084000
 #define GEMMINI_INST_OFFSET 0x0
 #define GEMMINI_READY_OFFSET  0x08
@@ -40,6 +36,17 @@
 #define GEMMINI_LUT0_ADDR (GEMMINI_CTRL + GEMMINI_LUT0_OFFSET)
 #define GEMMINI_LUT1_ADDR (GEMMINI_CTRL + GEMMINI_LUT1_OFFSET)
 #define GEMMINI_LUT2_ADDR (GEMMINI_CTRL + GEMMINI_LUT2_OFFSET)
+
+// scale-factor memory
+#define GEMMINI_SF_MEM             0x00088000
+#define GEMMINI_SF_MEM_SIZE        0x2000
+#define GEMMINI_SF_MEM_BUFFER_SIZE (0x4000 / 4)
+#define GEMMINI_SF_MEM_A          (GEMMINI_SF_MEM + 0x2000)
+#define GEMMINI_SF_MEM_B          (GEMMINI_SF_MEM)
+
+// requantizer interface
+#define GEMMINI_REQUANT      0x00040000
+#define GEMMINI_REQUANT_SIZE 0x40000
 
 template <typename T>
 inline uint64_t gemmini_arg_to_u64(T value) {
