@@ -26,7 +26,7 @@ void gemm(
   uint32_t threads_per_threadblock,
   uint32_t threadblock_id
 ) {
-  auto* args = reinterpret_cast<SoftmaxArgs*>(arg);
+  auto* args = reinterpret_cast<GEMMArgs*>(arg);
   uint32_t lane_id = tid_in_threadblock % 16;
   uint32_t warp_id = tid_in_threadblock / 16;
   uint32_t tid = tid_in_threadblock;
