@@ -120,8 +120,8 @@ inline T load_smem(const volatile __shared T *base) {
     return 0;
 }
 
-template <uint32_t N, typename T>
-inline T store_smem(volatile __shared T *base) {
+template <uint32_t N, bool zero_stride = true, typename T>
+inline T store_smem(volatile __shared T *base, const T data) {
     constexpr int ILP = 16;
     constexpr int UNROLL = 8;
     constexpr auto NT = MU_NUM_THREADS;
@@ -134,9 +134,10 @@ inline T store_smem(volatile __shared T *base) {
         T val[ILP];
         #pragma unroll
         for (int j = 0; j < ILP; j++) {
-            // const uint32_t index = i + j * NT + tid;
-            const uint32_t index = tid;
-            base[index] = 0xdeadbeef;
+            const uint32_t index = zero_stride ?
+                                   tid :
+                                   i + j * NT + tid;
+            base[index] = data;
         }
     }
 

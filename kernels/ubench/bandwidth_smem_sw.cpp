@@ -13,7 +13,7 @@ int main() {
     constexpr auto N = 1 << 18;
     // text region
     const auto base = reinterpret_cast<volatile __shared uint32_t *>(0x0);
-    store_smem<N>(base);
+    store_smem<N>(base, 0xdeadbeef);
 
     return 0;
 }
