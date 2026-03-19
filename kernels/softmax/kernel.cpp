@@ -7,13 +7,14 @@
 #include <stdint.h>
 
 #define NUM_WARPS 4
+#define ILP 4
 #define DOUBLE_BLOCK_SIZE MU_DOUBLE_BLOCK_SIZE(NUM_WARPS)
 #define BLOCK_SIZE MU_BLOCK_SIZE(NUM_WARPS)
 #define BLOCK_NUM_WARPS MU_BLOCK_NUM_WARPS(NUM_WARPS)
 // only works for powers of 2 reduction, otherwise you have to manually write your own reduction
 #define THREAD_DIV (MU_NUM_MAX_WARPS / NUM_WARPS)
 
-extern "C" uint32_t __mu_num_warps = MU_BLOCK_NUM_WARPS(NUM_WARPS);
+extern "C" uint32_t __mu_num_warps = NUM_WARPS;
 
 struct SoftmaxArgs {
   __global uint32_t* x;
@@ -72,16 +73,34 @@ void softmax(
     __shared uint32_t *buf_sdata = sdata + row_elems;
     
     // pass 1: find max
-    _Float16 max = as_bf16(NEG_INF_BF16_BITS);
+    _Float16 max_acc[ILP];
+    uint32_t x_fp32[ILP];
+    #pragma unroll ILP
+    for (int i = 0; i < ILP; i++)
+      max_acc[i] = as_bf16(NEG_INF_BF16_BITS);
 
     #pragma unroll
-    for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
-      uint32_t idx = chunk * BLOCK_SIZE + tid;
-      uint32_t x_fp32 = x[idx];
-      x_sdata[idx] = x_fp32;
-      auto [x1, x0] = unpack_bf16x2(x_fp32);
-      max = fmaxf(fmaxf(x0, x1), max);
+    for (uint32_t chunk = 0; chunk < chunks_per_block; chunk += ILP) {
+      #pragma unroll ILP
+      for (int i = 0; i < ILP; i++) {
+        uint32_t idx = (chunk + i) * BLOCK_SIZE + tid;
+        x_fp32[i] = x[idx];
+      }
+      for (int i = 0; i < ILP; i++) {
+        uint32_t idx = (chunk + i) * BLOCK_SIZE + tid;
+        x_sdata[idx] = x_fp32[i];
+      }
+      for (int i = 0; i < ILP; i++) {
+        uint32_t idx = (chunk + i) * BLOCK_SIZE + tid;
+        auto [x1, x0] = unpack_bf16x2(x_fp32[i]);
+        max_acc[i] = fmaxf(fmaxf(x0, x1), max_acc[i]);
+      }
     }
+
+    _Float16 max = max_acc[0];
+    #pragma unroll ILP
+    for (int i = 1; i < ILP; i++)
+      max = fmaxf(max, max_acc[i]);
 
     buf_sdata[tid] = (uint32_t)__builtin_bit_cast(uint16_t, max);
 
@@ -100,14 +119,33 @@ void softmax(
     _Float16 m = as_bf16((uint16_t)buf_sdata[0]);
 
     // pass 2: compute denom with known max
-    _Float16 denom = 0;
+    _Float16 denom_acc[ILP];
+    #pragma unroll ILP
+    for (int i = 0; i < ILP; i++)
+      denom_acc[i] = 0;
 
+    uint32_t xss[ILP];
+    _Float16 x0s[ILP], x1s[ILP];
     #pragma unroll
-    for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
-      uint32_t idx = chunk * BLOCK_SIZE + tid;
-      auto [x1, x0] = unpack_bf16x2(x_sdata[idx]);
-      denom += mu_fexp(x0 - m) + mu_fexp(x1 - m);
+    for (uint32_t chunk = 0; chunk < chunks_per_block; chunk += ILP) {
+      #pragma unroll ILP
+      for (int i = 0; i < ILP; i++) {
+        uint32_t idx = (chunk + i) * BLOCK_SIZE + tid;
+        xss[i] = x_sdata[idx];
+      }
+      for (int i = 0; i < ILP; i++) {
+        auto [x1, x0] = unpack_bf16x2(xss[i]);
+        x0s[i] = x0; x1s[i] = x1;
+      }
+      for (int i = 0; i < ILP; i++) {
+        denom_acc[i] += mu_fexp(x0s[i] - m) + mu_fexp(x1s[i] - m);
+      }
     }
+
+    _Float16 denom = denom_acc[0];
+    #pragma unroll ILP
+    for (int i = 1; i < ILP; i++)
+      denom += denom_acc[i];
 
     buf_sdata[tid] = (uint32_t)__builtin_bit_cast(uint16_t, denom);
 
@@ -132,11 +170,30 @@ void softmax(
     _Float16 inv_d = as_bf16((uint16_t)buf_sdata[0]);
 
     // pass 3: compute softmax output
+    uint32_t sh_ld[ILP], exps[ILP];
+    _Float16 lows[ILP], his[ILP];
     #pragma unroll
-    for (uint32_t chunk = 0; chunk < chunks_per_block; chunk++) {
-      uint32_t idx = chunk * BLOCK_SIZE + tid;
-      auto [lo, hi] = unpack_bf16x2(x_sdata[idx]);
-      x[idx] = pack_bf16x2(mu_fexp(lo - m) * inv_d, mu_fexp(hi - m) * inv_d);
+    for (uint32_t chunk = 0; chunk < chunks_per_block; chunk += ILP) {
+      #pragma unroll ILP
+      for (uint32_t i = 0; i < ILP; i++) {
+        uint32_t idx = (chunk + i) * BLOCK_SIZE + tid;
+        sh_ld[i] = x_sdata[idx];
+      }
+      #pragma unroll ILP
+      for (uint32_t i = 0; i < ILP; i++) {
+        auto [lo, hi] = unpack_bf16x2(sh_ld[i]);
+        lows[i] = lo; his[i] = hi;
+      }
+      #pragma unroll ILP
+      for (uint32_t i = 0; i < ILP; i++) {
+        uint32_t idx = (chunk + i) * BLOCK_SIZE + tid;
+        exps[i] = pack_bf16x2(mu_fexp(lows[i] - m) * inv_d, mu_fexp(his[i] - m) * inv_d);
+      }
+      #pragma unroll ILP
+      for (uint32_t i = 0; i < ILP; i++) {
+        uint32_t idx = (chunk + i) * BLOCK_SIZE + tid;
+        x[idx] = exps[i];
+      }
     }
 
     mu_barrier(0, BLOCK_NUM_WARPS);
