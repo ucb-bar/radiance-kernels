@@ -108,6 +108,7 @@ void softmax(
     reduce_max<MU_NUM_THREADS>(buf_sdata, tid, lane_id);
     if (lane_id == 0)
       buf_sdata[warp_id] = buf_sdata[tid];
+    mu_fence_smem();
     mu_barrier(0, BLOCK_NUM_WARPS);
 
     // block reduce max
@@ -153,6 +154,7 @@ void softmax(
     reduce_sum<MU_NUM_THREADS>(buf_sdata, tid, lane_id);
     if (lane_id == 0)
       buf_sdata[warp_id] = buf_sdata[tid];
+    mu_fence_smem();
     mu_barrier(0, BLOCK_NUM_WARPS);
 
     // block reduce denom
