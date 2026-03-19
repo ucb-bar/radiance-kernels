@@ -20,7 +20,7 @@ struct GEMMArgs {
 };
 
 // C = A * B where A is MxK, B is KxN, C is MxN (all bf16)
-void gemm(
+static inline void gemm(
   void* arg,
   uint32_t tid_in_threadblock,
   uint32_t threads_per_threadblock,

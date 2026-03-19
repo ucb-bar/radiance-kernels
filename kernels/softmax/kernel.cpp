@@ -48,7 +48,7 @@ static inline void reduce_sum(__shared uint32_t *buf_sdata, uint32_t tid, uint32
 
 // requires that cols + BLOCK_SIZE * 2 fits in smem (one row + max of one row + denom of one row)
 // requires that you do NOT spawn a threadblock for a non existent row
-void softmax(
+static inline void softmax(
   void* arg,
   uint32_t tid_in_threadblock,
   uint32_t threads_per_threadblock,
