@@ -36,7 +36,7 @@ constexpr auto GEMMINI_FORMAT_FP4 = 2;
 constexpr auto GEMMINI_FORMAT_FULL = 3;
 
 // Performance benchmark options -----------------------------------------------
-constexpr bool GEMMINI_DMA = false;
+constexpr bool GEMMINI_DMA = true;
 // disable GMEM->SMEM DMA copy and have MxGemmini work on stale data in SMEM
 constexpr bool DISABLE_DMA_MOVE_IN = false;
 // disable scale-factor write & fence from the GPU
@@ -142,7 +142,7 @@ static inline void configure_mxgemmini() {
         0, // B double-buffer toggle
         QUANT_LUT_UPDATE_GRANULARITY);
 
-    // Configure loop bounds for the FSM
+    // Configure loop bounds for the loop FSM
     // This only needs to be done once since the kernel does not change the
     // SMEM tile size
     gemmini_loop_ws_config_bounds(
@@ -185,9 +185,19 @@ static inline uint32_t calculate_spad_addr(const uint32_t tile_k) {
     }
 }
 
-// template <bool is_b>
-// static inline uint32_t calculate_scale_factor_addr(const uint32_t tile_k) {
-// }
+template <bool is_b>
+static inline __shared uint32_t *calculate_scale_factor_addr(const uint32_t tile_k) {
+    const uint32_t odd_k = (tile_k & 1);
+    const uint32_t dbuf_offset = odd_k ? GEMMINI_SF_MEM_BUFFER_SIZE : 0;
+    auto a_sf_addr = reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_A + dbuf_offset);
+    auto b_sf_addr = reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_B + dbuf_offset);
+
+    if constexpr (is_b) {
+        return b_sf_addr;
+    } else {
+        return a_sf_addr;
+    }
+}
 
 static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unused */,
                                            const uint32_t tile_j /* FIXME: unused */,
@@ -203,92 +213,92 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
     const uint32_t a_spad_addr_start = calculate_spad_addr<false>(tile_k);
     const uint32_t b_spad_addr_end = calculate_spad_addr<true>(tile_k);
 
-#if GEMMINI_DMA
-    // Configure GMEM address for A and B
-    // inst: 0x1420b07b
-    ROCC_INSTRUCTION_RS1_RS2(
-        XCUSTOM_ACC,
+    if constexpr (GEMMINI_DMA) {
+        // Configure GMEM address for A and B
+        // inst: 0x1420b07b
+        ROCC_INSTRUCTION_RS1_RS2(
+            XCUSTOM_ACC,
 #if USE_LUT // FIXME: remove
-        rad_device_to_host_address(reinterpret_cast<uint32_t>(A_in_hw)),
+            rad_device_to_host_address(reinterpret_cast<uint32_t>(A_in_hw)),
 #else
-        rad_device_to_host_address(reinterpret_cast<uint32_t>(A_in)),
+            rad_device_to_host_address(reinterpret_cast<uint32_t>(A_in)),
 #endif
-        rad_device_to_host_address(reinterpret_cast<uint32_t>(B_in)),
-        k_LOOP_WS_CONFIG_ADDRS_AB)
+            rad_device_to_host_address(reinterpret_cast<uint32_t>(B_in)),
+            k_LOOP_WS_CONFIG_ADDRS_AB)
 
-    // Configure loop FSM GMEM move-in strides for A and B
-    // This only needs to be done once since the kernel does not change the
-    // SMEM tile size
-    // FIXME: However, moving this out of the loop breaks addresses?
-    ROCC_INSTRUCTION_RS1_RS2(
-        XCUSTOM_ACC,
-        (uint64_t)(TILE_K),
-        (uint64_t)(TILE_N),
-        k_LOOP_WS_CONFIG_STRIDES_AB /* 0x1820b07b */)
+        // Configure loop FSM GMEM move-in strides for A and B
+        // This only needs to be done once since the kernel does not change the
+        // SMEM tile size
+        // FIXME: However, moving this out of the loop breaks addresses?
+        ROCC_INSTRUCTION_RS1_RS2(
+            XCUSTOM_ACC,
+            (uint64_t)(TILE_K),
+            (uint64_t)(TILE_N),
+            k_LOOP_WS_CONFIG_STRIDES_AB /* 0x1820b07b */)
 
-    // gemmini_loop_ws_spad issues three instructions:
-    //
-    // 1. configure loop bounds (inst: 0x1220b07b, funct: k_LOOP_WS_CONFIG_BOUNDS)
-    // 2. configure spad addresses (inst: 0x3020b07b, funct: k_LOOP_WS_CONFIG_SPAD_AB)
-    // 3. compute loop ws with skips (inst: 0x1020b07b, funct: k_LOOP_WS)
-    //
-    // TODO: skip re-configuring of loop bounds
-    constexpr uint32_t skips_mvin =
-      loop_matmul_skips(/*skip_lda=*/0, /*skip_ldb=*/0, /*skip_ldd=*/1,
-                        /*skip_ex=*/1, /*skip_stc=*/1);
-    constexpr auto DONTCARE = 0;
+        // gemmini_loop_ws_spad issues three instructions:
+        //
+        // 1. configure loop bounds (inst: 0x1220b07b, funct: k_LOOP_WS_CONFIG_BOUNDS)
+        // 2. configure spad addresses (inst: 0x3020b07b, funct: k_LOOP_WS_CONFIG_SPAD_AB)
+        // 3. compute loop ws with skips (inst: 0x1020b07b, funct: k_LOOP_WS)
+        //
+        // TODO: skip re-configuring of loop bounds
+        constexpr uint32_t skips_mvin =
+            loop_matmul_skips(/*skip_lda=*/0, /*skip_ldb=*/0, /*skip_ldd=*/1,
+                              /*skip_ex=*/1, /*skip_stc=*/1);
+        constexpr auto DONTCARE = 0;
 
-    gemmini_loop_ws_spad(
-        PE_TILES_I, PE_TILES_J, PE_TILES_K, // loop bounds for I, J, K (single 16×16 PE tile)
-        0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
-        a_spad_addr_start,    // A scratchpad address in rows (grows upward)
-        b_spad_addr_end,      // B scratchpad address in rows (grows downward)
-        0,                    // D (bias) - none
-        DONTCARE,             // C scratchpad address in rows
-        false, false,         // A_transpose, B_transpose
-        false, false, false,  // full_C, low_D, ex_accumulate
-        NO_ACTIVATION,        // activation
-        0, 0,                 // a_spad_id, b_spad_id
-        false,                // is_resadd
-        skips_mvin);        // skips
+        gemmini_loop_ws_spad(
+            PE_TILES_I, PE_TILES_J, PE_TILES_K, // loop bounds for I, J, K (single 16×16 PE tile)
+            0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
+            a_spad_addr_start,    // A scratchpad address in rows (grows upward)
+            b_spad_addr_end,      // B scratchpad address in rows (grows downward)
+            0,                    // D (bias) - none
+            DONTCARE,             // C scratchpad address in rows
+            false, false,         // A_transpose, B_transpose
+            false, false, false,  // full_C, low_D, ex_accumulate
+            NO_ACTIVATION,        // activation
+            0, 0,                 // a_spad_id, b_spad_id
+            false,                // is_resadd
+            skips_mvin);        // skips
 
-#else
+    } else { // GEMMINI_DMA
 
-    gemmini_config_ld(
-        TILE_K * sizeof(uint8_t) / VALUES_PER_BYTE
-    );
+        gemmini_config_ld(
+            TILE_K * sizeof(uint8_t) / VALUES_PER_BYTE
+        );
 
-    // A layout: for each i row, store all k tiles contiguously
-    // A tile (i,k) -> a_base + (i * tiles_K + k) * DIM
-    for (int i = 0; i < PE_TILES_I; i++) {
+        // A layout: for each i row, store all k tiles contiguously
+        // A tile (i,k) -> a_base + (i * tiles_K + k) * DIM
+        for (int i = 0; i < PE_TILES_I; i++) {
+            for (int k = 0; k < PE_TILES_K; k++) {
+                // FIXME: TILE_K may have to be GEMM_K
+                const uint8_t *dram_ptr = ((uint8_t*)A_in) + i * DIM * TILE_K + k * DIM;
+                const uint32_t sp_addr = a_spad_addr_start + (i * PE_TILES_K + k) * DIM;
+                // Note gemmini needs CPU-global addresses for mvin
+                gemmini_extended_mvin(rad_device_to_host_address(
+                    reinterpret_cast<uint32_t>(dram_ptr)),
+                                      sp_addr, DIM, DIM);
+            }
+        }
+
+        gemmini_config_ld(
+            TILE_N * sizeof(uint8_t) / VALUES_PER_BYTE
+        );
+
+        // B layout: for each k row, store all j tiles contiguously
+        // B tile (k,j) -> b_base + (k * tiles_J + j) * DIM
         for (int k = 0; k < PE_TILES_K; k++) {
-            // FIXME: TILE_K may have to be GEMM_K
-            const uint8_t *dram_ptr = ((uint8_t*)A_in) + i * DIM * TILE_K + k * DIM;
-            const uint32_t sp_addr = a_spad_addr_start + (i * PE_TILES_K + k) * DIM;
-            // Note gemmini needs CPU-global addresses for mvin
-            gemmini_extended_mvin(rad_device_to_host_address(
-                                      reinterpret_cast<uint32_t>(dram_ptr)),
-                                  sp_addr, DIM, DIM);
+            for (int j = 0; j < PE_TILES_J; j++) {
+                const uint8_t *dram_ptr = ((uint8_t*)B_in) + k * DIM * TILE_N + j * DIM;
+                const uint32_t b_spad_addr_start = b_spad_addr_end - PE_TILES_K * PE_TILES_J * DIM;
+                const uint32_t sp_addr = b_spad_addr_start + (k * PE_TILES_J + j) * DIM;
+                gemmini_extended_mvin(rad_device_to_host_address(
+                    reinterpret_cast<uint32_t>(dram_ptr)),
+                                      sp_addr, DIM, DIM);
+            }
         }
     }
-
-    gemmini_config_ld(
-        TILE_N * sizeof(uint8_t) / VALUES_PER_BYTE
-    );
-
-    // B layout: for each k row, store all j tiles contiguously
-    // B tile (k,j) -> b_base + (k * tiles_J + j) * DIM
-    for (int k = 0; k < PE_TILES_K; k++) {
-        for (int j = 0; j < PE_TILES_J; j++) {
-            const uint8_t *dram_ptr = ((uint8_t*)B_in) + k * DIM * TILE_N + j * DIM;
-            const uint32_t b_spad_addr_start = b_spad_addr_end - PE_TILES_K * PE_TILES_J * DIM;
-            const uint32_t sp_addr = b_spad_addr_start + (k * PE_TILES_J + j) * DIM;
-            gemmini_extended_mvin(rad_device_to_host_address(
-                                      reinterpret_cast<uint32_t>(dram_ptr)),
-                                  sp_addr, DIM, DIM);
-        }
-    }
-#endif
 
     asm volatile ("copy_gmem_to_smem_async_end_%=:" :: );
 }
@@ -349,8 +359,8 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
 
     // Load scaling factors from GMEM to the scale SRAM
     // load_scale_factors((const uint64_t *) C_scale, sizeof(C_scale));
-    load_scale_factors(reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], SCALE_FAC_DIM);
-    load_scale_factors(reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], SCALE_FAC_DIM);
+    load_scale_factors(calculate_scale_factor_addr<false>(tile_k), &A_scales_row[0][0], SCALE_FAC_DIM);
+    load_scale_factors(calculate_scale_factor_addr<true> (tile_k), &B_scales_col[0][0], SCALE_FAC_DIM);
 
     asm volatile ("load_lut_start_%=:" :: );
 
@@ -416,8 +426,10 @@ void mxgemm(void *arg, uint32_t tid_in_threadblock,
         // FIXME: fix double-buffer index
         if constexpr (!DISABLE_SCALE_FACTOR_UPDATE) {
             // TODO: double-buffer
-            load_scale_factors(reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_A), &A_scales_row[0][0], SCALE_FAC_DIM);
-            load_scale_factors(reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_B), &B_scales_col[0][0], SCALE_FAC_DIM);
+            load_scale_factors(calculate_scale_factor_addr<false>(tile_k + 1),
+                               &A_scales_row[0][0], SCALE_FAC_DIM);
+            load_scale_factors(calculate_scale_factor_addr<true>(tile_k + 1),
+                               &B_scales_col[0][0], SCALE_FAC_DIM);
 
             // fence scale factor and LUT writes before next Gemmini compute
             mu_fence_smem();
