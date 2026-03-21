@@ -12,27 +12,30 @@
 
 // Tiling parameters -----------------------------------------------------------
 
-constexpr auto GEMM_K = 1024;
-constexpr auto TILE_M = 128;
-constexpr auto TILE_N = 128;
-constexpr auto TILE_K = 512;
-constexpr auto FP4FP6 = true;
-constexpr auto PE_M = (FP4FP6 ? 32 : 16);
-constexpr auto PE_N = (FP4FP6 ? 32 : 16);
-constexpr auto PE_K = (FP4FP6 ? 16 : 16);
-constexpr auto PE_TILES_I = TILE_M / PE_M;
-constexpr auto PE_TILES_J = TILE_N / PE_N;
-constexpr auto PE_TILES_K = TILE_K / PE_K;
-constexpr auto SCALE_FAC_DIM = TILE_M * TILE_K / 32; // TODO: TILE_N not differentiated
-constexpr auto USE_LUT = FP4FP6;
-constexpr auto VALUES_PER_BYTE = (FP4FP6 ? 2 : 1);
-constexpr auto QUANT_LUT_UPDATE_GRANULARITY = 1;
-static_assert(TILE_M == TILE_N, "currently only supports square SMEM tile dimensions");
+struct GemmConfig {
+    uint32_t GEMM_K = 256;
+    uint32_t TILE_M = 128;
+    uint32_t TILE_N = 128;
+    uint32_t TILE_K = 256;
+    bool FP4FP6 = false;
+
+    constexpr uint32_t PE_M() const { return (FP4FP6 ? 32 : 16); }
+    constexpr uint32_t PE_N() const { return (FP4FP6 ? 32 : 16); }
+    constexpr uint32_t PE_K() const { return (FP4FP6 ? 16 : 16); }
+    constexpr uint32_t PE_TILES_I() const { return TILE_M / PE_M(); }
+    constexpr uint32_t PE_TILES_J() const { return TILE_N / PE_N(); }
+    constexpr uint32_t PE_TILES_K() const { return TILE_K / PE_K(); }
+    // TODO: TILE_N not differentiated
+    constexpr uint32_t SCALE_FAC_DIM() const { return TILE_M * TILE_K / 32; }
+    constexpr uint32_t VALUES_PER_BYTE() const { return (FP4FP6 ? 2 : 1); }
+    constexpr bool USE_LUT() const { return FP4FP6; }
+};
 
 constexpr auto GEMMINI_FORMAT_FP8 = 0;
 constexpr auto GEMMINI_FORMAT_FP6 = 1;
 constexpr auto GEMMINI_FORMAT_FP4 = 2;
 constexpr auto GEMMINI_FORMAT_FULL = 3;
+constexpr auto QUANT_LUT_UPDATE_GRANULARITY = 1;
 
 // Performance benchmark options -----------------------------------------------
 constexpr bool GEMMINI_DMA = true;
@@ -44,7 +47,8 @@ constexpr bool DISABLE_SCALE_FACTOR_UPDATE = false;
 // TODO: cleanup
 typedef uint64_t out_t;   // UNUSED: C_scaled: fp8:e4m3 (1 byte per output)
 
-static uint32_t C_scale_factors[TILE_M * TILE_N / 32] __attribute__((aligned(32))) = {0};
+// TODO: hardcoded
+static uint32_t C_scale_factors[128 * 128 / 32] __attribute__((aligned(32))) = {0};
 
 static void __attribute__((noinline))
 load_scale_factors(volatile __shared uint32_t *sf_mem, const uint8_t *scale_factors,
@@ -78,12 +82,16 @@ static void load_lut_row(volatile __shared uint32_t *lut_mem, uint8_t *lut) {
                             (lut[13] << 14) | (lut[14] << 20) | (lut[15] << 26));
 }
 
+template <GemmConfig C>
 static inline void configure_mxgemmini() {
+    static_assert(C.TILE_M == C.TILE_N,
+                  "currently only supports square SMEM tile dimensions");
+
     gemmini_flush(0);
 
     // TODO: FP4
     constexpr auto GEMMINI_FORMAT =
-        FP4FP6 ? GEMMINI_FORMAT_FP6 : GEMMINI_FORMAT_FP8;
+        C.FP4FP6 ? GEMMINI_FORMAT_FP6 : GEMMINI_FORMAT_FP8;
 
     gemmini_extended3_config_ex(
         WEIGHT_STATIONARY, // dataflow
@@ -94,46 +102,29 @@ static inline void configure_mxgemmini() {
         GEMMINI_FORMAT, // A dtype
         GEMMINI_FORMAT, // B dtype
         GEMMINI_FORMAT_FULL, // C dtype
-        USE_LUT  // uselut
+        C.USE_LUT()  // uselut
     );
-    // ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC,
-    //   ((uint64_t)acc_scale_t_to_acc_scale_t_bits((acc_scale_t)ACC_SCALE_IDENTITY) << 32)
-    //   | ((uint64_t)(1) << 16) // A stride
-    //   // | (GEMMINI_FORMAT << 14) // C format
-    //   | (3 << 14) // C format
-    //   | (GEMMINI_FORMAT << 12) // B format
-    //   | (GEMMINI_FORMAT << 10) // A format
-    //   | (0 << 9) // B transpose
-    //   | (0 << 8) // A transpose
-    //   | ((false) << 7) // Set only strides
-    //   | ((USE_LUT) << 4)
-    //   | ((0) << 3) // Activation function
-    //   | ((WEIGHT_STATIONARY) << 2)
-    //   | CONFIG_EX,
-    //   ((uint64_t)(1) << 48) // C stride
-    //   | (0),
-    //   k_CONFIG);
 
     // Configure GMEM move-in strides for A and B
     gemmini_extended3_config_ld(
-        TILE_K * sizeof(uint8_t) / VALUES_PER_BYTE,
+        C.TILE_K * sizeof(uint8_t) / C.VALUES_PER_BYTE(),
         MVIN_SCALE_IDENTITY, false, 0
     );
     gemmini_extended3_config_ld(
-        TILE_N * sizeof(uint8_t) / VALUES_PER_BYTE,
+        C.TILE_N * sizeof(uint8_t) / C.VALUES_PER_BYTE(),
         MVIN_SCALE_IDENTITY, false, 1
     );
 
     // Configure GMEM move-out stride for C
     // gemmini_extended_config_st(DIM * sizeof(out_t), NO_ACTIVATION, 1); // nicolas's
     gemmini_config_st(
-        TILE_N * sizeof(uint16_t) // FIXME: need to change by GEMMINI_FORMAT_FULL
+        C.TILE_N * sizeof(uint16_t) // FIXME: need to change by GEMMINI_FORMAT_FULL
     );
 
     // Configure scalefac->PE read and scalefac->GMEM write addresses; inst: 0x3420b07b
     gemmini_mxquant_config_mvout(
         rad_device_to_host_address(reinterpret_cast<uint32_t>(&C_scale_factors[0])),
-        PE_TILES_I, PE_TILES_J, PE_TILES_K,
+        C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
         0, // A double-buffer toggle
         0, // B double-buffer toggle
         QUANT_LUT_UPDATE_GRANULARITY);
@@ -142,7 +133,7 @@ static inline void configure_mxgemmini() {
     // This only needs to be done once since the kernel does not change the
     // SMEM tile size
     gemmini_loop_ws_config_bounds(
-        PE_TILES_I, PE_TILES_J, PE_TILES_K,
+        C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
         0, 0, 0 // pad_I=0, pad_J=0, pad_K=0
     );
 
@@ -151,7 +142,7 @@ static inline void configure_mxgemmini() {
 
     // NOTE: we need to run this twice to configure the two FSMs
     gemmini_loop_ws_config_bounds(
-        PE_TILES_I, PE_TILES_J, PE_TILES_K,
+        C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
         0, 0, 0 // pad_I=0, pad_J=0, pad_K=0
     );
     // wait for configuration finish
@@ -195,6 +186,7 @@ static inline __shared uint32_t *calculate_scale_factor_addr(const uint32_t tile
     }
 }
 
+template <GemmConfig C>
 static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unused */,
                                            const uint32_t tile_j /* FIXME: unused */,
                                            const uint32_t tile_k) {
@@ -214,11 +206,7 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
         // inst: 0x1420b07b
         ROCC_INSTRUCTION_RS1_RS2(
             XCUSTOM_ACC,
-#if USE_LUT // FIXME: remove
-            rad_device_to_host_address(reinterpret_cast<uint32_t>(A_in_hw)),
-#else
             rad_device_to_host_address(reinterpret_cast<uint32_t>(A_in)),
-#endif
             rad_device_to_host_address(reinterpret_cast<uint32_t>(B_in)),
             k_LOOP_WS_CONFIG_ADDRS_AB)
 
@@ -228,8 +216,8 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
         // FIXME: However, moving this out of the loop breaks addresses?
         ROCC_INSTRUCTION_RS1_RS2(
             XCUSTOM_ACC,
-            (uint64_t)(TILE_K),
-            (uint64_t)(TILE_N),
+            (uint64_t)(C.TILE_K),
+            (uint64_t)(C.TILE_N),
             k_LOOP_WS_CONFIG_STRIDES_AB /* 0x1820b07b */)
 
         // gemmini_loop_ws_spad issues three instructions:
@@ -245,7 +233,7 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
         constexpr auto DONTCARE = 0;
 
         gemmini_loop_ws_spad(
-            PE_TILES_I, PE_TILES_J, PE_TILES_K, // loop bounds for I, J, K (single 16×16 PE tile)
+            C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(), // loop bounds for I, J, K (single 16×16 PE tile)
             0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
             a_spad_addr_start,    // A scratchpad address in rows (grows upward)
             b_spad_addr_end,      // B scratchpad address in rows (grows downward)
@@ -261,16 +249,16 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
     } else { // GEMMINI_DMA
 
         gemmini_config_ld(
-            TILE_K * sizeof(uint8_t) / VALUES_PER_BYTE
+            C.TILE_K * sizeof(uint8_t) / C.VALUES_PER_BYTE()
         );
 
         // A layout: for each i row, store all k tiles contiguously
         // A tile (i,k) -> a_base + (i * tiles_K + k) * DIM
-        for (int i = 0; i < PE_TILES_I; i++) {
-            for (int k = 0; k < PE_TILES_K; k++) {
+        for (int i = 0; i < C.PE_TILES_I(); i++) {
+            for (int k = 0; k < C.PE_TILES_K(); k++) {
                 // FIXME: TILE_K may have to be GEMM_K
-                const uint8_t *dram_ptr = ((uint8_t*)A_in) + i * DIM * TILE_K + k * DIM;
-                const uint32_t sp_addr = a_spad_addr_start + (i * PE_TILES_K + k) * DIM;
+                const uint8_t *dram_ptr = ((uint8_t*)A_in) + i * DIM * C.TILE_K + k * DIM;
+                const uint32_t sp_addr = a_spad_addr_start + (i * C.PE_TILES_K() + k) * DIM;
                 // Note gemmini needs CPU-global addresses for mvin
                 gemmini_extended_mvin(rad_device_to_host_address(
                     reinterpret_cast<uint32_t>(dram_ptr)),
@@ -279,16 +267,16 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
         }
 
         gemmini_config_ld(
-            TILE_N * sizeof(uint8_t) / VALUES_PER_BYTE
+            C.TILE_N * sizeof(uint8_t) / C.VALUES_PER_BYTE()
         );
 
         // B layout: for each k row, store all j tiles contiguously
         // B tile (k,j) -> b_base + (k * tiles_J + j) * DIM
-        for (int k = 0; k < PE_TILES_K; k++) {
-            for (int j = 0; j < PE_TILES_J; j++) {
-                const uint8_t *dram_ptr = ((uint8_t*)B_in) + k * DIM * TILE_N + j * DIM;
-                const uint32_t b_spad_addr_start = b_spad_addr_end - PE_TILES_K * PE_TILES_J * DIM;
-                const uint32_t sp_addr = b_spad_addr_start + (k * PE_TILES_J + j) * DIM;
+        for (int k = 0; k < C.PE_TILES_K(); k++) {
+            for (int j = 0; j < C.PE_TILES_J(); j++) {
+                const uint8_t *dram_ptr = ((uint8_t*)B_in) + k * DIM * C.TILE_N + j * DIM;
+                const uint32_t b_spad_addr_start = b_spad_addr_end - C.PE_TILES_K() * C.PE_TILES_J() * DIM;
+                const uint32_t sp_addr = b_spad_addr_start + (k * C.PE_TILES_J() + j) * DIM;
                 gemmini_extended_mvin(rad_device_to_host_address(
                     reinterpret_cast<uint32_t>(dram_ptr)),
                                       sp_addr, DIM, DIM);
@@ -301,6 +289,7 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
 
 /** Asynchronously kick off loop FSM matmul compute operation in MxGemmini.
  *  Move out accumulator data to SMEM if `acc_move_out` is true. */
+template <GemmConfig C>
 static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_out) {
     asm volatile ("matmul_tile_async_start_%=:" :: );
 
@@ -315,7 +304,7 @@ static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_
     const uint32_t b_spad_addr_end = calculate_spad_addr<true>(tile_k);
 
     gemmini_loop_ws_spad(
-        PE_TILES_I, PE_TILES_J, PE_TILES_K, // loop bounds for I, J, K (single 16×16 PE tile)
+        C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(), // loop bounds for I, J, K (single 16×16 PE tile)
         0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
         a_spad_addr_start,    // A scratchpad address in rows (grows upward)
         b_spad_addr_end,      // B scratchpad address in rows (grows downward)
@@ -330,4 +319,3 @@ static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_
 
     asm volatile ("matmul_tile_async_end_%=:" :: );
 }
-
