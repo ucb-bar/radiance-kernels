@@ -26,6 +26,8 @@ struct GemmConfig {
     constexpr bool USE_LUT() const { return FP4FP6; }
 };
 
+// Gemmini constants -----------------------------------------------------------
+
 constexpr auto GEMMINI_FORMAT_FP8 = 0;
 constexpr auto GEMMINI_FORMAT_FP6 = 1;
 constexpr auto GEMMINI_FORMAT_FP4 = 2;
@@ -33,16 +35,14 @@ constexpr auto GEMMINI_FORMAT_FULL = 3;
 constexpr auto QUANT_LUT_UPDATE_GRANULARITY = 1;
 
 // Performance benchmark options -----------------------------------------------
+
 constexpr bool GEMMINI_DMA = true;
 // disable GMEM->SMEM DMA copy and have MxGemmini work on stale data in SMEM
 constexpr bool DISABLE_DMA_MOVE_IN = false;
 // disable scale-factor write & fence from the GPU
 constexpr bool DISABLE_SCALE_FACTOR_UPDATE = false;
 
-// TODO: cleanup
-typedef uint64_t out_t;   // UNUSED: C_scaled: fp8:e4m3 (1 byte per output)
-
-// TODO: hardcoded
+// TODO: max size hardcoded
 static uint32_t C_scale_factors[128 * 128 / 32] __attribute__((aligned(32))) = {0};
 
 static void __attribute__((noinline))
@@ -111,6 +111,7 @@ static inline void configure_mxgemmini() {
     );
 
     // Configure GMEM move-out stride for C
+    // typedef uint64_t out_t;   // UNUSED: C_scaled: fp8:e4m3 (1 byte per output)
     // gemmini_extended_config_st(DIM * sizeof(out_t), NO_ACTIVATION, 1); // nicolas's
     gemmini_config_st(
         C.TILE_N * sizeof(uint16_t) // FIXME: need to change by GEMMINI_FORMAT_FULL
@@ -198,6 +199,7 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
 
     if constexpr (GEMMINI_DMA) {
         // Configure GMEM address for A and B
+        // TODO: stride by tile_k
         // inst: 0x1420b07b
         ROCC_INSTRUCTION_RS1_RS2(
             XCUSTOM_ACC,
@@ -215,18 +217,17 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
             (uint64_t)(C.TILE_N),
             k_LOOP_WS_CONFIG_STRIDES_AB /* 0x1820b07b */)
 
+        // Kick off DMA move-in via the loop FSM
+        //
         // gemmini_loop_ws_spad issues three instructions:
-        //
-        // 1. configure loop bounds (inst: 0x1220b07b, funct: k_LOOP_WS_CONFIG_BOUNDS)
-        // 2. configure spad addresses (inst: 0x3020b07b, funct: k_LOOP_WS_CONFIG_SPAD_AB)
-        // 3. compute loop ws with skips (inst: 0x1020b07b, funct: k_LOOP_WS)
-        //
+        //   1. configure loop bounds (inst: 0x1220b07b, funct: k_LOOP_WS_CONFIG_BOUNDS)
+        //   2. configure spad addresses (inst: 0x3020b07b, funct: k_LOOP_WS_CONFIG_SPAD_AB)
+        //   3. compute loop ws with skips (inst: 0x1020b07b, funct: k_LOOP_WS)
         // TODO: skip re-configuring of loop bounds
         constexpr uint32_t skips_mvin =
             loop_matmul_skips(/*skip_lda=*/0, /*skip_ldb=*/0, /*skip_ldd=*/1,
                               /*skip_ex=*/1, /*skip_stc=*/1);
         constexpr auto DONTCARE = 0;
-
         gemmini_loop_ws_spad(
             C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(), // loop bounds for I, J, K (single 16×16 PE tile)
             0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
@@ -239,9 +240,9 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
             NO_ACTIVATION,        // activation
             0, 0,                 // a_spad_id, b_spad_id
             false,                // is_resadd
-            skips_mvin);        // skips
+            skips_mvin);          // skips
 
-    } else { // GEMMINI_DMA
+    } else { // !GEMMINI_DMA
 
         gemmini_config_ld(
             C.TILE_K * sizeof(uint8_t) / C.VALUES_PER_BYTE()
@@ -277,7 +278,7 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
                                       sp_addr, DIM, DIM);
             }
         }
-    }
+    } // end !GEMMINI_DMA
 
     asm volatile ("copy_gmem_to_smem_async_end_%=:" :: );
 }
@@ -298,19 +299,23 @@ static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_
     const uint32_t a_spad_addr_start = calculate_spad_addr<false>(tile_k);
     const uint32_t b_spad_addr_end = calculate_spad_addr<true>(tile_k);
 
+    const bool first_k = tile_k == 0;
+
+    // TODO(perf): !first_k creates a branch
     gemmini_loop_ws_spad(
         C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(), // loop bounds for I, J, K (single 16×16 PE tile)
-        0, 0, 0,              // pad_I=0, pad_J=0, pad_K=0
-        a_spad_addr_start,    // A scratchpad address in rows (grows upward)
-        b_spad_addr_end,      // B scratchpad address in rows (grows downward)
-        0,                    // D (bias) - none
-        SPAD_DEST,            // C scratchpad address in rows
-        false, false,         // A_transpose, B_transpose
-        false, false, false,  // full_C, low_D, ex_accumulate
-        NO_ACTIVATION,        // activation
-        0, 0,                 // a_spad_id, b_spad_id
-        false,                // is_resadd
-        skips_compute);       // skips
+        0, 0, 0,                // pad_I=0, pad_J=0, pad_K=0
+        a_spad_addr_start,      // A scratchpad address in rows (grows upward)
+        b_spad_addr_end,        // B scratchpad address in rows (grows downward)
+        0,                      // D (bias) - none
+        SPAD_DEST,              // C scratchpad address in rows
+        false, false,           // A_transpose, B_transpose
+        false, false, !first_k, // full_C, low_D, ex_accumulate
+                                // only start in-mem accumulation after first k
+        NO_ACTIVATION,          // activation
+        0, 0,                   // a_spad_id, b_spad_id
+        false,                  // is_resadd
+        skips_compute);         // skips
 
     asm volatile ("matmul_tile_async_end_%=:" :: );
 }
@@ -405,7 +410,8 @@ void mxgemm() {
 
             // configure scalefac->PE double-buffer read; inst: 0x3420b07b
             gemmini_mxquant_config_mvout(
-                rad_device_to_host_address(reinterpret_cast<uint32_t>(&C_scale_factors[0])), // TODO: change for multiple SMEM tiles
+                // TODO: dummy move-out space for the scale factor
+                rad_device_to_host_address(reinterpret_cast<uint32_t>(&C_scale_factors[0])),
                 C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
                 odd_k, // A double-buffer toggle
                 odd_k, // B double-buffer toggle
