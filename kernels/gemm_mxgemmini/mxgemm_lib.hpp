@@ -52,29 +52,6 @@ constexpr bool SIMT_GMEM_MOVEOUT = true;
 // TODO: max size hardcoded
 static uint32_t C_scale_factors[128 * 128 / 32] __attribute__((aligned(32))) = {0};
 
-static void __attribute__((noinline))
-load_scale_factors(volatile __shared uint32_t *sf_mem, const uint8_t *scale_factors,
-                   int n) {
-    // asm volatile ("load_scale_factors_start_%=:" :: );
-    auto word_scale_factors = reinterpret_cast<const uint32_t *>(scale_factors);
-
-    // unroll in registers to reduce back-to-back WAW/WAR
-    constexpr auto ILP = 8;
-    uint32_t unrolled[ILP];
-    #pragma unroll 4
-    for (size_t i = 0; i < n / 4; i += ILP) {
-        #pragma unroll
-        for (int j = 0; j < ILP; j++) {
-            // do full-word stores instead of 1-byte stores
-            unrolled[j] = word_scale_factors[i + j];
-        }
-        for (int j = 0; j < ILP; j++) {
-            sf_mem[i + j] = unrolled[j];
-        }
-    }
-    // asm volatile ("load_scale_factors_end_%=:" :: );
-}
-
 template <GemmConfig C>
 static inline void configure_mxgemmini() {
     static_assert(C.TILE_M == C.TILE_N,
@@ -179,6 +156,53 @@ static inline __shared uint32_t *calculate_scale_factor_addr(const uint32_t tile
     } else {
         return a_sf_addr;
     }
+}
+
+static void __attribute__((noinline))
+load_scale_factors(volatile __shared uint32_t *sf_mem, const uint8_t *scale_factors,
+                   int n) {
+    // asm volatile ("load_scale_factors_start_%=:" :: );
+    auto word_scale_factors = reinterpret_cast<const uint32_t *>(scale_factors);
+
+    // unroll in registers to reduce back-to-back WAW/WAR
+    constexpr auto ILP = 8;
+    uint32_t unrolled[ILP];
+    #pragma unroll 4
+    for (size_t i = 0; i < n / 4; i += ILP) {
+        #pragma unroll
+        for (int j = 0; j < ILP; j++) {
+            // do full-word stores instead of 1-byte stores
+            unrolled[j] = word_scale_factors[i + j];
+        }
+        for (int j = 0; j < ILP; j++) {
+            sf_mem[i + j] = unrolled[j];
+        }
+    }
+    // asm volatile ("load_scale_factors_end_%=:" :: );
+}
+
+template <GemmConfig C>
+static inline void load_lut() {
+    asm volatile ("load_lut_start_%=:" :: );
+
+    if constexpr (C.USE_LUT()) {
+        // TODO: fix to use GEMM_MNK
+        for (size_t i = 0; i < (C.TILE_N >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
+            auto *dst = reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT0_ADDR) + 3 * i;
+            dst[0] = B_lut[i][0]; dst[1] = B_lut[i][1]; dst[2] = B_lut[i][2];
+        }
+        for (size_t i = 0; i < (C.TILE_M >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
+            auto *dst = reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT1_ADDR) + 3 * i;
+            dst[0] = A_lut[i][0]; dst[1] = A_lut[i][1]; dst[2] = A_lut[i][2];
+        }
+        for (size_t i = 0; i < (C.TILE_M >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
+            auto *dst = reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT2_ADDR) + 3 * i;
+            dst[0] = C_lut[i][0]; dst[1] = C_lut[i][1]; dst[2] = C_lut[i][2];
+        }
+    }
+
+    asm volatile ("load_lut_end_%=:" :: );
+
 }
 
 template <GemmConfig C>
@@ -385,25 +409,7 @@ void mxgemm_smem() {
     load_scale_factors(calculate_scale_factor_addr<false>(tile_k), &A_scales_row[0][0], C.SCALE_FAC_DIM());
     load_scale_factors(calculate_scale_factor_addr<true> (tile_k), &B_scales_col[0][0], C.SCALE_FAC_DIM());
 
-    asm volatile ("load_lut_start_%=:" :: );
-
-    if constexpr (C.USE_LUT()) {
-        // TODO: fix to use GEMM_MNK
-        for (size_t i = 0; i < (C.TILE_N >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
-            auto *dst = reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT0_ADDR) + 3 * i;
-            dst[0] = B_lut[i][0]; dst[1] = B_lut[i][1]; dst[2] = B_lut[i][2];
-        }
-        for (size_t i = 0; i < (C.TILE_M >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
-            auto *dst = reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT1_ADDR) + 3 * i;
-            dst[0] = A_lut[i][0]; dst[1] = A_lut[i][1]; dst[2] = A_lut[i][2];
-        }
-        for (size_t i = 0; i < (C.TILE_M >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
-            auto *dst = reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT2_ADDR) + 3 * i;
-            dst[0] = C_lut[i][0]; dst[1] = C_lut[i][1]; dst[2] = C_lut[i][2];
-        }
-    }
-
-    asm volatile ("load_lut_end_%=:" :: );
+    load_lut<C>();
 
     // fence scale factor and LUT writes
     mu_fence_smem();
@@ -461,7 +467,6 @@ void mxgemm_smem() {
                 QUANT_LUT_UPDATE_GRANULARITY);
         }
 
-        // TODO: add LUT loading
         gemmini_fence();
     }
 
