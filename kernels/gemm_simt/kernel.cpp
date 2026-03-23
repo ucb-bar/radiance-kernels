@@ -14,13 +14,13 @@
 #define TN 4
 #define TB_X 16
 #define TB_Y 8
-#define BLOCK_X TB_X * TM
-#define BLOCK_Y TB_Y * TN
-#define BLOCK_SIZE BLOCK_X * BLOCK_Y
+#define BLOCK_X (TB_X * TM)
+#define BLOCK_Y (TB_Y * TN)
+#define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
 
 #define THREADBLOCK_SIZE MU_BLOCK_SIZE(NUM_WARPS)
-#define NUM_A_CHUNKS BLOCK_X * BK / THREADBLOCK_SIZE // ENSURE BLOCK_X * BK >= THREADBLOCK_SIZE and is a multiple of THREADBLOCK_SIZE
-#define NUM_B_CHUNKS BK * BLOCK_Y / THREADBLOCK_SIZE // same as above
+#define NUM_A_CHUNKS (BLOCK_X * BK / 2) / THREADBLOCK_SIZE // ENSURE BLOCK_X * BK / 2 >= THREADBLOCK_SIZE and is a multiple of THREADBLOCK_SIZE
+#define NUM_B_CHUNKS (BK * BLOCK_Y / 2) / THREADBLOCK_SIZE // same as above
 
 extern "C" uint32_t __mu_num_warps = NUM_WARPS;
 
@@ -72,20 +72,20 @@ static inline void gemm(
     for (uint32_t i = 0; i < TM*TN; i++) acc[i] = 0;
 
     //stream across K
-    for (uint32_t k = 0; k < args->K; k += BK) {
+    for (uint32_t k = 0; k < K; k += BK) {
       //load A block to smem
       for (uint32_t a_block = 0; a_block < NUM_A_CHUNKS; a_block++) {
         uint32_t elem_idx = tid_in_threadblock + a_block * THREADBLOCK_SIZE;
-        uint32_t A_x = block_x_idx + (elem_idx / (BK / 2)); // BK bf16 elements = BK/2 uint32_t elements
-        uint32_t A_y = k + (elem_idx % (BK / 2));
-        As[elem_idx] = A[A_x * K + A_y];
+        uint32_t A_x = block_x_idx * BLOCK_X + (elem_idx / (BK / 2)); // BK bf16 elements = BK/2 uint32_t elements
+        uint32_t A_y = k / 2 + (elem_idx % (BK / 2));
+        As[elem_idx] = A[A_x * (K / 2) + A_y];
       }
       //load B block to smem
       for (uint32_t b_block = 0; b_block < NUM_B_CHUNKS; b_block++) {
         uint32_t elem_idx = tid_in_threadblock + b_block * THREADBLOCK_SIZE;
-        uint32_t B_y = block_y_idx + (elem_idx % (BLOCK_Y / 2)); // BLOCK_Y bf16 elements
-        uint32_t B_x = k + (elem_idx % (BLOCK_Y / 2));
-        Bs[elem_idx] = B[B_x * N + B_y];
+        uint32_t B_y = block_y_idx * BLOCK_Y / 2 + (elem_idx % (BLOCK_Y / 2)); // BLOCK_Y bf16 elements
+        uint32_t B_x = k + (elem_idx / (BLOCK_Y / 2));
+        Bs[elem_idx] = B[B_x * (N / 2) + B_y];
       }
     }
 
