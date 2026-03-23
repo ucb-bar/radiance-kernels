@@ -18,6 +18,10 @@
 #define BLOCK_Y TB_Y * TN
 #define BLOCK_SIZE BLOCK_X * BLOCK_Y
 
+#define THREADBLOCK_SIZE MU_BLOCK_SIZE(NUM_WARPS)
+#define NUM_A_CHUNKS BLOCK_X * BK / THREADBLOCK_SIZE // ENSURE BLOCK_X * BK >= THREADBLOCK_SIZE and is a multiple of THREADBLOCK_SIZE
+#define NUM_B_CHUNKS BK * BLOCK_Y / THREADBLOCK_SIZE // same as above
+
 extern "C" uint32_t __mu_num_warps = NUM_WARPS;
 
 struct GEMMArgs {
@@ -46,11 +50,16 @@ static inline void gemm(
   uint32_t blocks_per_cluster = total_blocks / MU_NUM_CLUSTERS;
   uint32_t block_N = args->N / BLOCK_Y;
 
+  uint32_t M = args->M;
+  uint32_t N = args->N;
+  uint32_t K = args->K;
+  __global uint32_t *A = args->A;
+  __global uint32_t *B = args->B;
   __shared uint32_t *As = sdata;
   __shared uint32_t *Bs = sdata + BLOCK_X * BK / 2;
 
-  for (uint32_t block = 0; block < blocks_per_cluster; block++) {
-    uint32_t block_idx = threadblock_id * blocks_per_cluster + block;
+  for (uint32_t c_block = 0; c_block < blocks_per_cluster; c_block++) {
+    uint32_t block_idx = threadblock_id * blocks_per_cluster + c_block;
     uint32_t block_x_idx = block_idx / block_N;
     uint32_t block_y_idx = block_idx % block_N;
 
@@ -63,9 +72,21 @@ static inline void gemm(
     for (uint32_t i = 0; i < TM*TN; i++) acc[i] = 0;
 
     //stream across K
-    for (uint32_t k = 0; k < BK; k++) {
+    for (uint32_t k = 0; k < args->K; k += BK) {
       //load A block to smem
-
+      for (uint32_t a_block = 0; a_block < NUM_A_CHUNKS; a_block++) {
+        uint32_t elem_idx = tid_in_threadblock + a_block * THREADBLOCK_SIZE;
+        uint32_t A_x = block_x_idx + (elem_idx / (BK / 2)); // BK bf16 elements = BK/2 uint32_t elements
+        uint32_t A_y = k + (elem_idx % (BK / 2));
+        As[elem_idx] = A[A_x * K + A_y];
+      }
+      //load B block to smem
+      for (uint32_t b_block = 0; b_block < NUM_B_CHUNKS; b_block++) {
+        uint32_t elem_idx = tid_in_threadblock + b_block * THREADBLOCK_SIZE;
+        uint32_t B_y = block_y_idx + (elem_idx % (BLOCK_Y / 2)); // BLOCK_Y bf16 elements
+        uint32_t B_x = k + (elem_idx % (BLOCK_Y / 2));
+        Bs[elem_idx] = B[B_x * N + B_y];
+      }
     }
 
   }
