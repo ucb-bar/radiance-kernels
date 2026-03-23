@@ -105,6 +105,8 @@ MU_BIN_OBJS ?=
 
 ifneq ($(strip $(HOST_SRCS)),)
 HOST_OBJS := $(addsuffix .host.o,$(basename $(HOST_SRCS)))
+# don't delete HOST_OBJS and cause rebuilds of *.soc.elf
+.SECONDARY: $(HOST_OBJS)
 endif
 
 %.host.o: %.c
