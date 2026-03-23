@@ -3,6 +3,8 @@
 #include <mu_intrinsics.h>
 
 #include "include/matmul_fp8_64x64.h"
+static const uint8_t A_lut[64][16] = {0};
+static const uint8_t B_lut[64][16] = {0};
 #include "mxgemm_lib.hpp"
 
 constexpr GemmConfig C{

@@ -6,7 +6,7 @@ MU_SRCS = mxgemm.cpp mxgemm_singletile.cpp \
 	  mxgemm.fp6.singletile.tm128tn128tk512.fullout.cpp
 HOST_SRCS = host.cpp
 
-mxgemm.mu.o: mxgemm_lib.hpp
-# %.mu.o: mxgemm_lib.hpp
+MXGEMM_MU_OBJS := $(addsuffix .mu.o,$(basename $(MU_SRCS)))
+$(MXGEMM_MU_OBJS): mxgemm_lib.hpp
 
 include ../common.mk
