@@ -43,6 +43,11 @@ constexpr bool GEMMINI_DMA = true;
 constexpr bool DISABLE_DMA_MOVE_IN = false;
 // disable scale-factor write & fence from the GPU
 constexpr bool DISABLE_SCALE_FACTOR_UPDATE = false;
+// disable C result tensor move-out from SMEM to GMEM
+constexpr bool DISABLE_GMEM_MOVEOUT = false;
+// use SIMT load/stores instead of DMA for C DMA move-out
+// TODO: enabled to avoid current mvout bug in DMA
+constexpr bool SIMT_GMEM_MOVEOUT = false;
 
 // TODO: max size hardcoded
 static uint32_t C_scale_factors[128 * 128 / 32] __attribute__((aligned(32))) = {0};
@@ -285,7 +290,7 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
     asm volatile ("copy_gmem_to_smem_async_end_%=:" :: );
 }
 
-/** Move tensor data from GMEM->SMEM using SIMT threads.
+/** Move tensor data from SMEM->GMEM using SIMT threads.
  *  Assumes row-major layout for both src and dest.
  *  TODO: De-dup with FlashAttention */
 template <uint32_t dim_row, uint32_t dim_col>
@@ -312,19 +317,20 @@ inline void copy_output_smem_to_gmem_simt(const __shared _Float16 *src_smem,
     asm volatile ("copy_output_smem_to_gmem_simt_end_%=:" :: );
 }
 
+/** Move tensor data from SMEM->GMEM using Gemmini DMA.
+ *  `src_spad_addr` is in scratchpad row address. */
 template <GemmConfig C>
-static inline void copy_output_smem_to_gmem_async(const uint32_t tile_i /* FIXME: unused */,
-                                                  const uint32_t tile_j /* FIXME: unused */) {
+static inline void copy_output_smem_to_gmem_async(const uint32_t src_spad_addr,
+                                                  _Float16 *dest_gmem) {
     asm volatile ("copy_output_smem_to_gmem_async_start_%=:" :: );
 
-    const auto C_out = reinterpret_cast<const uint16_t *>(0x40000000);
     for (int i = 0; i < C.PE_TILES_I(); i++) {
         for (int j = 0; j < C.PE_TILES_J(); j++) {
-            const uint32_t acc_tile_addr = SPAD_DEST + (i * C.PE_TILES_J() + j) * DIM;
+            const uint32_t tile_spad_addr = src_spad_addr + (i * C.PE_TILES_J() + j) * DIM;
             // row-major layout
             // FIXME: hardcoded output dtype
-            const auto *dram_ptr = C_out + (i * DIM * C.GEMM_K + j * DIM) * sizeof(uint16_t);
-            gemmini_mvout((void *) dram_ptr, acc_tile_addr);
+            auto *dram_ptr = dest_gmem + (i * DIM * C.GEMM_K + j * DIM) * sizeof(uint16_t);
+            gemmini_mvout((void *) dram_ptr, tile_spad_addr);
         }
     }
 
@@ -419,6 +425,7 @@ void mxgemm_smem() {
     //
     asm volatile ("main_matmul_k_loop_start_%=:" :: );
 
+    // Potential software-pipelining loop structures:
     //                 ┌───┐   ┌───┐
     //             ┌───────────┐
     //         ┌───────┐
@@ -426,9 +433,6 @@ void mxgemm_smem() {
     //         ┌───┐   ┌───┐   ┌───┐
     // Loop 2: M0->C0->M1->C1->M0->C0->...
     //
-    // FIXME: below is not possible in current fence_ready():
-    // Operations of the same type are serialized (e.g. M0->M1->M2); therefore
-    // no need to fence against previous same-double-buffer op.
     for (; (tile_k * C.TILE_K) < dim_k; tile_k++) {
         const auto last_k = ((tile_k + 1) * C.TILE_K) >= dim_k;
         const auto odd_k = (tile_k & 1);
@@ -471,13 +475,6 @@ void mxgemm_smem() {
 
     gemmini_fence();
 
-#if 0
-    // Move-out C from SMEM to GMEM
-    copy_output_smem_to_gmem_async<C>(0, 0 /*FIXME*/);
-
-    gemmini_fence();
-#endif
-
     asm volatile ("main_matmul_k_loop_end_%=:" :: );
 }
 
@@ -493,7 +490,15 @@ static inline void mxgemm(_Float16 *C_gmem,
     const auto warps_per_threadblock = threads_per_threadblock / MU_NUM_THREADS;
     mu_barrier(0, warps_per_threadblock);
 
-    auto C_smem = reinterpret_cast<const __shared _Float16 *>(SPAD_DEST * DIM);
-    copy_output_smem_to_gmem_simt<C.TILE_M, C.TILE_N>(
-        C_smem, C_gmem, tid_in_threadblock, threads_per_threadblock);
+    // Move-out C from SMEM to GMEM
+    if constexpr (!DISABLE_GMEM_MOVEOUT) {
+        auto C_smem = reinterpret_cast<const __shared _Float16 *>(SPAD_DEST * DIM);
+        if constexpr (SIMT_GMEM_MOVEOUT) {
+            copy_output_smem_to_gmem_simt<C.TILE_M, C.TILE_N>(
+                C_smem, C_gmem, tid_in_threadblock, threads_per_threadblock);
+        } else {
+            copy_output_smem_to_gmem_async<C>(SPAD_DEST, C_gmem);
+            gemmini_fence();
+        }
+    }
 }
