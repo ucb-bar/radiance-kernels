@@ -7,17 +7,26 @@
 #include <stdint.h>
 
 #define NUM_WARPS 4
+#define BLOCK_SIZE MU_BLOCK_SIZE(NUM_WARPS)
+
+#define BM 16
+#define BK 32
+#define BN 16
+#define TM 2
+#define TN 2
 
 extern "C" uint32_t __mu_num_warps = NUM_WARPS;
 
 struct GEMMArgs {
-  __global uint16_t* A;
-  __global uint16_t* B;
-  __global uint16_t* C;
+  __global uint32_t* A;
+  __global uint32_t* B;
+  __global uint32_t* C;
   uint32_t M;
   uint32_t K;
   uint32_t N;
 };
+
+__shared uint32_t* const sdata = reinterpret_cast<__shared uint32_t*>(0x0);
 
 // C = A * B where A is MxK, B is KxN, C is MxN (all bf16)
 static inline void gemm(
@@ -30,6 +39,12 @@ static inline void gemm(
   uint32_t lane_id = tid_in_threadblock % 16;
   uint32_t warp_id = tid_in_threadblock / 16;
   uint32_t tid = tid_in_threadblock;
+  uint32_t total_blocks = args->M * args->N / BLOCK_SIZE;
+  uint32_t blocks_per_cluster = total_blocks / MU_NUM_CLUSTERS;
+
+  for (uint32_t block = 0; block < blocks_per_cluster; block++) {
+  
+  }
 }
 
 GEMMArgs gemm_args = {
@@ -44,9 +59,9 @@ GEMMArgs gemm_args = {
 #include "data"
 
 int main() {
-  gemm_args.A = reinterpret_cast<__global uint16_t*>(A_raw);
-  gemm_args.B = reinterpret_cast<__global uint16_t*>(B_raw);
-  gemm_args.C = reinterpret_cast<__global uint16_t*>(C_raw);
+  gemm_args.A = reinterpret_cast<__global uint32_t*>(A_raw);
+  gemm_args.B = reinterpret_cast<__global uint32_t*>(B_raw);
+  gemm_args.C = reinterpret_cast<__global uint32_t*>(C_raw);
   gemm_args.M = M_val;
   gemm_args.K = K_val;
   gemm_args.N = N_val;
