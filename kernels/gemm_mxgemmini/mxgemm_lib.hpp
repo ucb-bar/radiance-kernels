@@ -121,7 +121,7 @@ static inline void configure_mxgemmini() {
     // typedef uint64_t out_t;   // UNUSED: C_scaled: fp8:e4m3 (1 byte per output)
     // gemmini_extended_config_st(DIM * sizeof(out_t), NO_ACTIVATION, 1); // nicolas's
     gemmini_config_st(
-        C.GEMM_K * sizeof(uint16_t) // FIXME: need to change by GEMMINI_FORMAT_FULL
+        C.TILE_N * sizeof(uint16_t) // FIXME: need to change by GEMMINI_FORMAT_FULL
     );
 
     // Configure scalefac->PE read and scalefac->GMEM write addresses; inst: 0x3420b07b
