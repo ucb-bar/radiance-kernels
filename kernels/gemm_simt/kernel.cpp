@@ -8,11 +8,10 @@
 
 #define NUM_WARPS 4
 
-#define BM 16
+// all numbers below in number of BF16 elements
 #define BK 32
-#define BN 16
 #define TM 2
-#define TN 2
+#define TN 4
 #define TB_X 16
 #define TB_Y 8
 #define BLOCK_X TB_X * TM
@@ -45,19 +44,29 @@ static inline void gemm(
   uint32_t tid = tid_in_threadblock;
   uint32_t total_blocks = args->M * args->N / BLOCK_SIZE;
   uint32_t blocks_per_cluster = total_blocks / MU_NUM_CLUSTERS;
-  uint32_t block_M = args->M / BLOCK_X;
   uint32_t block_N = args->N / BLOCK_Y;
+
+  __shared uint32_t *As = sdata;
+  __shared uint32_t *Bs = sdata + BLOCK_X * BK / 2;
 
   for (uint32_t block = 0; block < blocks_per_cluster; block++) {
     uint32_t block_idx = threadblock_id * blocks_per_cluster + block;
     uint32_t block_x_idx = block_idx / block_N;
     uint32_t block_y_idx = block_idx % block_N;
 
-    // grab x and y for each thread's TB_X x TB_Y C subblock 
+    //grab x and y for each thread's TB_X x TB_Y C subblock 
     uint32_t thread_x = tid_in_threadblock / TB_Y;
     uint32_t thread_y = tid_in_threadblock % TB_Y;
 
-    
+    //accum
+    _Float16 acc[TM * TN];
+    for (uint32_t i = 0; i < TM*TN; i++) acc[i] = 0;
+
+    //stream across K
+    for (uint32_t k = 0; k < BK; k++) {
+      //load A block to smem
+
+    }
 
   }
 }
