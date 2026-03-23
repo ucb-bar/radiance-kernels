@@ -7,13 +7,15 @@
 #include <stdint.h>
 
 #define NUM_WARPS 4
-#define BLOCK_SIZE MU_BLOCK_SIZE(NUM_WARPS)
 
 #define BM 16
 #define BK 32
 #define BN 16
 #define TM 2
 #define TN 2
+#define BLOCK_X 16 * TM
+#define BLOCK_Y 8 * TN
+#define BLOCK_SIZE BLOCK_X * BLOCK_Y
 
 extern "C" uint32_t __mu_num_warps = NUM_WARPS;
 
@@ -41,9 +43,14 @@ static inline void gemm(
   uint32_t tid = tid_in_threadblock;
   uint32_t total_blocks = args->M * args->N / BLOCK_SIZE;
   uint32_t blocks_per_cluster = total_blocks / MU_NUM_CLUSTERS;
+  uint32_t block_M = args->M / BLOCK_X;
+  uint32_t block_N = args->N / BLOCK_Y;
 
   for (uint32_t block = 0; block < blocks_per_cluster; block++) {
-  
+    uint32_t block_idx = threadblock_id * blocks_per_cluster + block;
+    uint32_t block_x_idx = block_idx / block_M;
+    uint32_t block_y_idx = block_idx % block_N;
+    uint32_t* C = args->C + (block_x_idx * BLOCK_SIZE * block_N) + (block_y_idx * BLOCK_Y); 
   }
 }
 
