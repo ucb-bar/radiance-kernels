@@ -13,6 +13,8 @@ struct GemmConfig {
     uint32_t TILE_N = 128;
     uint32_t TILE_K = 256;
     bool FP4FP6 = false;
+    // quantize output to fp4/fp6/fp8
+    bool QUANT_OUTPUT = true;
 
     constexpr uint32_t PE_M() const { return (FP4FP6 ? 32 : 16); }
     constexpr uint32_t PE_N() const { return (FP4FP6 ? 32 : 16); }
@@ -23,6 +25,11 @@ struct GemmConfig {
     // TODO: TILE_N not differentiated
     constexpr uint32_t SCALE_FAC_DIM() const { return TILE_M * TILE_K / 32; }
     constexpr uint32_t VALUES_PER_BYTE() const { return (FP4FP6 ? 2 : 1); }
+    // sizeof(C element)
+    constexpr uint32_t OUT_ELEM_SIZE() const {
+        // C FP4/FP6 elem-packing is along the M dimension, not N
+        return (QUANT_OUTPUT ? sizeof(uint8_t) : sizeof(uint16_t));
+    }
     constexpr bool USE_LUT() const { return FP4FP6; }
 };
 
@@ -87,11 +94,7 @@ static inline void configure_mxgemmini() {
     );
 
     // Configure GMEM move-out stride for C
-    // typedef uint64_t out_t;   // UNUSED: C_scaled: fp8:e4m3 (1 byte per output)
-    // gemmini_extended_config_st(DIM * sizeof(out_t), NO_ACTIVATION, 1); // nicolas's
-    gemmini_config_st(
-        C.TILE_N * sizeof(uint16_t) // FIXME: need to change by GEMMINI_FORMAT_FULL
-    );
+    gemmini_config_st(C.TILE_N * C.OUT_ELEM_SIZE());
 
     // Configure scalefac->PE read and scalefac->GMEM write addresses; inst: 0x3420b07b
     gemmini_mxquant_config_mvout(
@@ -309,24 +312,26 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
 /** Move tensor data from SMEM->GMEM using SIMT threads.
  *  Assumes row-major layout for both src and dest.
  *  TODO: De-dup with FlashAttention */
-template <uint32_t dim_row, uint32_t dim_col>
-inline void copy_output_smem_to_gmem_simt(const __shared _Float16 *src_smem,
-                                          _Float16 *dest_gmem,
+template <GemmConfig C>
+inline void copy_output_smem_to_gmem_simt(const __shared uint8_t *src_smem,
+                                          uint8_t *dest_gmem,
                                           const uint32_t tid_in_threadblock,
                                           const uint32_t threads_per_threadblock) {
     asm volatile ("copy_output_smem_to_gmem_simt_start_%=:" :: );
 
     // Thread mapping: All warps in a threadblock cooperatively copies a
     // contiguous chunk of the same size as the threadblock per every "wave".
-    // The number of waves are determined with:
-    const auto iter = (dim_row * dim_col) / threads_per_threadblock;
+    // TODO: use GEMM_ instead of TILE_ here
+    const auto iter = (C.TILE_M * C.TILE_N) / threads_per_threadblock;
 
-#pragma unroll 16
+#pragma unroll 32
     for (int i = 0; i < iter; i++) {
+        // simple uniform-strided access
         const auto index = (threads_per_threadblock) * i + tid_in_threadblock;
-        const auto data = src_smem[index];
-        auto gmem_address = &dest_gmem[index];
-        *gmem_address = data;
+        const auto smem_addr = src_smem + index * C.OUT_ELEM_SIZE();
+        auto gmem_addr = dest_gmem + index * C.OUT_ELEM_SIZE();
+        // TODO: do packed 32-bit transfers instead of uint8_t
+        *gmem_addr = *smem_addr;
         // asm volatile("sh.shared %1, 0(%0)" :: "r"(smem_address), "r"(data) : "memory");
     }
 
@@ -337,15 +342,16 @@ inline void copy_output_smem_to_gmem_simt(const __shared _Float16 *src_smem,
  *  `src_spad_addr` is in scratchpad row address. */
 template <GemmConfig C>
 static inline void copy_output_smem_to_gmem_async(const uint32_t src_spad_addr,
-                                                  _Float16 *dest_gmem) {
+                                                  uint8_t *dest_gmem) {
     asm volatile ("copy_output_smem_to_gmem_async_start_%=:" :: );
 
     for (int i = 0; i < C.PE_TILES_I(); i++) {
         for (int j = 0; j < C.PE_TILES_J(); j++) {
+            // TODO: stride is wrong for re-quantized output
             const uint32_t tile_spad_addr = src_spad_addr + (i * C.PE_TILES_J() + j) * DIM;
             // row-major layout
             // FIXME: hardcoded output dtype
-            auto *dram_ptr = dest_gmem + i * DIM * C.GEMM_K + j * DIM;
+            auto *dram_ptr = dest_gmem + (i * DIM * C.GEMM_K + j * DIM) * C.OUT_ELEM_SIZE();
             gemmini_mvout((void *) dram_ptr, tile_spad_addr);
         }
     }
@@ -476,7 +482,7 @@ void mxgemm_smem() {
 }
 
 template <GemmConfig C>
-static inline void mxgemm(_Float16 *C_gmem,
+static inline void mxgemm(uint8_t *C_gmem,
                           uint32_t tid_in_threadblock,
                           uint32_t threads_per_threadblock,
                           uint32_t threadblock_id) {
@@ -489,9 +495,9 @@ static inline void mxgemm(_Float16 *C_gmem,
 
     // Move-out C from SMEM to GMEM
     if constexpr (!DISABLE_GMEM_MOVEOUT) {
-        auto C_smem = reinterpret_cast<const __shared _Float16 *>(SPAD_DEST * DIM);
+        auto C_smem = reinterpret_cast<const __shared uint8_t *>(SPAD_DEST * DIM);
         if constexpr (SIMT_GMEM_MOVEOUT) {
-            copy_output_smem_to_gmem_simt<C.TILE_M, C.TILE_N>(
+            copy_output_smem_to_gmem_simt<C>(
                 C_smem, C_gmem, tid_in_threadblock, threads_per_threadblock);
         } else {
             copy_output_smem_to_gmem_async<C>(SPAD_DEST, C_gmem);
