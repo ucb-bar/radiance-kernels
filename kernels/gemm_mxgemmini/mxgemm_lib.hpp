@@ -42,6 +42,9 @@ constexpr bool DISABLE_DMA_MOVE_IN = false;
 // disable scale-factor write & fence from the GPU
 constexpr bool DISABLE_SCALE_FACTOR_UPDATE = false;
 
+// TODO: hardcoded
+constexpr uint32_t SPAD_DEST = 256;
+
 // TODO: max size hardcoded
 static uint32_t C_scale_factors[128 * 128 / 32] __attribute__((aligned(32))) = {0};
 
@@ -114,7 +117,7 @@ static inline void configure_mxgemmini() {
     // typedef uint64_t out_t;   // UNUSED: C_scaled: fp8:e4m3 (1 byte per output)
     // gemmini_extended_config_st(DIM * sizeof(out_t), NO_ACTIVATION, 1); // nicolas's
     gemmini_config_st(
-        C.TILE_N * sizeof(uint16_t) // FIXME: need to change by GEMMINI_FORMAT_FULL
+        C.GEMM_K * sizeof(uint16_t) // FIXME: need to change by GEMMINI_FORMAT_FULL
     );
 
     // Configure scalefac->PE read and scalefac->GMEM write addresses; inst: 0x3420b07b
@@ -283,6 +286,52 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
     asm volatile ("copy_gmem_to_smem_async_end_%=:" :: );
 }
 
+/** Move tensor data from GMEM->SMEM using SIMT threads.
+ *  Assumes row-major layout for both src and dest.
+ *  TODO: De-dup with FlashAttention */
+template <uint32_t dim_row, uint32_t dim_col>
+inline void copy_output_smem_to_gmem_simt(const __shared _Float16 *src_smem,
+                                          _Float16 *dest_gmem,
+                                          const uint32_t tid_in_threadblock,
+                                          const uint32_t threads_per_threadblock) {
+    asm volatile ("copy_output_smem_to_gmem_simt_start_%=:" :: );
+
+    // Thread mapping: All warps in a threadblock cooperatively copies a
+    // contiguous chunk of the same size as the threadblock per every "wave".
+    // The number of waves are determined with:
+    const auto iter = (dim_row * dim_col) / threads_per_threadblock;
+
+#pragma unroll 16
+    for (int i = 0; i < iter; i++) {
+        const auto index = (threads_per_threadblock) * i + tid_in_threadblock;
+        const auto data = src_smem[index];
+        auto gmem_address = &dest_gmem[index];
+        *gmem_address = data;
+        // asm volatile("sh.shared %1, 0(%0)" :: "r"(smem_address), "r"(data) : "memory");
+    }
+
+    asm volatile ("copy_output_smem_to_gmem_simt_end_%=:" :: );
+}
+
+template <GemmConfig C>
+static inline void copy_output_smem_to_gmem_async(const uint32_t tile_i /* FIXME: unused */,
+                                                  const uint32_t tile_j /* FIXME: unused */) {
+    asm volatile ("copy_output_smem_to_gmem_async_start_%=:" :: );
+
+    const auto C_out = reinterpret_cast<const uint16_t *>(0x40000000);
+    for (int i = 0; i < C.PE_TILES_I(); i++) {
+        for (int j = 0; j < C.PE_TILES_J(); j++) {
+            const uint32_t acc_tile_addr = SPAD_DEST + (i * C.PE_TILES_J() + j) * DIM;
+            // row-major layout
+            // FIXME: hardcoded output dtype
+            const auto *dram_ptr = C_out + (i * DIM * C.GEMM_K + j * DIM) * sizeof(uint16_t);
+            gemmini_mvout((void *) dram_ptr, acc_tile_addr);
+        }
+    }
+
+    asm volatile ("copy_output_smem_to_gmem_async_end_%=:" :: );
+}
+
 /** Asynchronously kick off loop FSM matmul compute operation in MxGemmini.
  *  Move out accumulator data to SMEM if `acc_move_out` is true. */
 template <GemmConfig C>
@@ -294,7 +343,6 @@ static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_
       loop_matmul_skips(/*skip_lda=*/1, /*skip_ldb=*/1, /*skip_ldd=*/1,
                         /*skip_ex=*/0, /*skip_stc=*/skip_stc);
     // uint32_t acc_addr = (1u << (ADDR_LEN - 1));
-    const uint32_t SPAD_DEST = 256;
 
     const uint32_t a_spad_addr_start = calculate_spad_addr<false>(tile_k);
     const uint32_t b_spad_addr_end = calculate_spad_addr<true>(tile_k);
@@ -342,21 +390,21 @@ void mxgemm() {
 
     asm volatile ("load_lut_start_%=:" :: );
 
-    // if constexpr (C.USE_LUT()) {
-    //     // A_lut[M>>G][LUT_SIZE] and B_lut[N>>G][LUT_SIZE]: one unique LUT per slot
-    //     for (size_t i = 0; i < (C.TILE_N >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
-    //         load_lut_row(reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT0_ADDR) + 3 * i,
-    //                  (uint8_t *)B_lut[i]);
-    //     }
-    //     for (size_t i = 0; i < (C.TILE_M >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
-    //         load_lut_row(reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT1_ADDR) + 3 * i,
-    //                  (uint8_t *)A_lut[i]);
-    //     }
-    //     for (size_t i = 0; i < (C.TILE_M >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
-    //         load_lut_row(reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT2_ADDR) + 3 * i,
-    //                  (uint8_t *)A_lut[i]);
-    //     }
-    // }
+    if constexpr (C.USE_LUT()) {
+        // A_lut[M>>G][LUT_SIZE] and B_lut[N>>G][LUT_SIZE]: one unique LUT per slot
+        for (size_t i = 0; i < (C.TILE_N >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
+            load_lut_row(reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT0_ADDR) + 3 * i,
+                     (uint8_t *)B_lut[i]);
+        }
+        for (size_t i = 0; i < (C.TILE_M >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
+            load_lut_row(reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT1_ADDR) + 3 * i,
+                     (uint8_t *)A_lut[i]);
+        }
+        for (size_t i = 0; i < (C.TILE_M >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
+            load_lut_row(reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT2_ADDR) + 3 * i,
+                     (uint8_t *)A_lut[i]);
+        }
+    }
 
     asm volatile ("load_lut_end_%=:" :: );
 
@@ -424,16 +472,12 @@ void mxgemm() {
 
     gemmini_fence();
 
-    asm volatile ("main_matmul_k_loop_end_%=:" :: );
-
 #if 0
-    // read back C_out_got from DMEM to generate some traces
-    volatile uint64_t sum = 0;
-    for (int i = 0; i < DIM; i++) {
-        for (int j = 0; j < DIM; j++) {
-            uint64_t got = C_out_got[i][j];
-            sum += got;
-        }
-    }
+    // Move-out C from SMEM to GMEM
+    copy_output_smem_to_gmem_async<C>(0, 0 /*FIXME*/);
+
+    gemmini_fence();
 #endif
+
+    asm volatile ("main_matmul_k_loop_end_%=:" :: );
 }
