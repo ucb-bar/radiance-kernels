@@ -5,6 +5,7 @@
 #include "include/matmul_fp8_128x128x256.h"
 static const uint8_t A_lut[64][16] = {0};
 static const uint8_t B_lut[64][16] = {0};
+static const uint8_t C_lut[64][16] = {0};
 #include "mxgemm_lib.hpp"
 
 constexpr GemmConfig C{

@@ -47,7 +47,7 @@ constexpr bool DISABLE_SCALE_FACTOR_UPDATE = false;
 constexpr bool DISABLE_GMEM_MOVEOUT = false;
 // use SIMT load/stores instead of DMA for C DMA move-out
 // TODO: enabled to avoid current mvout bug in DMA
-constexpr bool SIMT_GMEM_MOVEOUT = false;
+constexpr bool SIMT_GMEM_MOVEOUT = true;
 
 // TODO: max size hardcoded
 static uint32_t C_scale_factors[128 * 128 / 32] __attribute__((aligned(32))) = {0};
@@ -75,15 +75,6 @@ load_scale_factors(volatile __shared uint32_t *sf_mem, const uint8_t *scale_fact
     // asm volatile ("load_scale_factors_end_%=:" :: );
 }
 
-static void load_lut_row(volatile __shared uint32_t *lut_mem, uint8_t *lut) {
-    lut_mem[0] = (uint32_t)(lut[0] | (lut[1] << 6) | (lut[2] << 12) |
-                            (lut[3] << 18) | (lut[4] << 24) | (lut[5] << 30));
-    lut_mem[1] = (uint32_t)((lut[5] >> 2) | (lut[6] << 4) | (lut[7] << 10) |
-                            (lut[8] << 16) | (lut[9] << 22) | (lut[10] << 28));
-    lut_mem[2] = (uint32_t)((lut[10] >> 4) | (lut[11] << 2) | (lut[12] << 8) |
-                            (lut[13] << 14) | (lut[14] << 20) | (lut[15] << 26));
-}
-
 template <GemmConfig C>
 static inline void configure_mxgemmini() {
     static_assert(C.TILE_M == C.TILE_N,
@@ -103,13 +94,14 @@ static inline void configure_mxgemmini() {
         false, // set_only:strides
         GEMMINI_FORMAT, // A dtype
         GEMMINI_FORMAT, // B dtype
-        GEMMINI_FORMAT_FULL, // C dtype
+        GEMMINI_FORMAT, // C dtype
         C.USE_LUT()  // uselut
     );
 
     // Configure GMEM move-in strides for A and B
+    // NOTE: FP4/FP6 packs elements by M and N dimensions
     gemmini_extended3_config_ld(
-        C.TILE_K * sizeof(uint8_t) / C.VALUES_PER_BYTE(),
+        C.TILE_K * sizeof(uint8_t),
         MVIN_SCALE_IDENTITY, false, 0
     );
     gemmini_extended3_config_ld(
@@ -220,8 +212,8 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
         // FIXME: However, moving this out of the loop breaks addresses?
         ROCC_INSTRUCTION_RS1_RS2(
             XCUSTOM_ACC,
-            (uint64_t)(C.TILE_K),
-            (uint64_t)(C.TILE_N),
+            (uint64_t)(C.TILE_K * sizeof(uint8_t)),
+            (uint64_t)(C.TILE_N * sizeof(uint8_t) / C.VALUES_PER_BYTE()),
             k_LOOP_WS_CONFIG_STRIDES_AB /* 0x1820b07b */)
 
         // Kick off DMA move-in via the loop FSM
@@ -396,18 +388,18 @@ void mxgemm_smem() {
     asm volatile ("load_lut_start_%=:" :: );
 
     if constexpr (C.USE_LUT()) {
-        // A_lut[M>>G][LUT_SIZE] and B_lut[N>>G][LUT_SIZE]: one unique LUT per slot
+        // TODO: fix to use GEMM_MNK
         for (size_t i = 0; i < (C.TILE_N >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
-            load_lut_row(reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT0_ADDR) + 3 * i,
-                     (uint8_t *)B_lut[i]);
+            auto *dst = reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT0_ADDR) + 3 * i;
+            dst[0] = B_lut[i][0]; dst[1] = B_lut[i][1]; dst[2] = B_lut[i][2];
         }
         for (size_t i = 0; i < (C.TILE_M >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
-            load_lut_row(reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT1_ADDR) + 3 * i,
-                     (uint8_t *)A_lut[i]);
+            auto *dst = reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT1_ADDR) + 3 * i;
+            dst[0] = A_lut[i][0]; dst[1] = A_lut[i][1]; dst[2] = A_lut[i][2];
         }
         for (size_t i = 0; i < (C.TILE_M >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
-            load_lut_row(reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT2_ADDR) + 3 * i,
-                     (uint8_t *)A_lut[i]);
+            auto *dst = reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT2_ADDR) + 3 * i;
+            dst[0] = C_lut[i][0]; dst[1] = C_lut[i][1]; dst[2] = C_lut[i][2];
         }
     }
 
