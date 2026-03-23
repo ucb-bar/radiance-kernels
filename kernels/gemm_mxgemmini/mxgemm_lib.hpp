@@ -33,6 +33,8 @@ constexpr auto GEMMINI_FORMAT_FP6 = 1;
 constexpr auto GEMMINI_FORMAT_FP4 = 2;
 constexpr auto GEMMINI_FORMAT_FULL = 3;
 constexpr auto QUANT_LUT_UPDATE_GRANULARITY = 1;
+constexpr auto GEMMINI_ACC_ADDR = (1u << (ADDR_LEN - 1));
+constexpr auto SPAD_DEST = 256; // TODO: arbitrary
 
 // Performance benchmark options -----------------------------------------------
 
@@ -41,9 +43,6 @@ constexpr bool GEMMINI_DMA = true;
 constexpr bool DISABLE_DMA_MOVE_IN = false;
 // disable scale-factor write & fence from the GPU
 constexpr bool DISABLE_SCALE_FACTOR_UPDATE = false;
-
-// TODO: hardcoded
-constexpr uint32_t SPAD_DEST = 256;
 
 // TODO: max size hardcoded
 static uint32_t C_scale_factors[128 * 128 / 32] __attribute__((aligned(32))) = {0};
@@ -342,13 +341,13 @@ static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_
     const uint32_t skips_compute =
       loop_matmul_skips(/*skip_lda=*/1, /*skip_ldb=*/1, /*skip_ldd=*/1,
                         /*skip_ex=*/0, /*skip_stc=*/skip_stc);
-    // uint32_t acc_addr = (1u << (ADDR_LEN - 1));
 
     const uint32_t a_spad_addr_start = calculate_spad_addr<false>(tile_k);
     const uint32_t b_spad_addr_end = calculate_spad_addr<true>(tile_k);
 
     const bool first_k = tile_k == 0;
 
+    // TODO: support skipping move-out to SMEM
     // TODO(perf): !first_k creates a branch
     gemmini_loop_ws_spad(
         C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(), // loop bounds for I, J, K (single 16×16 PE tile)
@@ -369,7 +368,7 @@ static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_
 }
 
 template <GemmConfig C>
-void mxgemm() {
+void mxgemm_smem() {
     // TODO: dim_m / dim_n
     const uint32_t dim_k = C.GEMM_K;
 
@@ -480,4 +479,21 @@ void mxgemm() {
 #endif
 
     asm volatile ("main_matmul_k_loop_end_%=:" :: );
+}
+
+template <GemmConfig C>
+static inline void mxgemm(_Float16 *C_gmem,
+                          uint32_t tid_in_threadblock,
+                          uint32_t threads_per_threadblock,
+                          uint32_t threadblock_id) {
+    if (tid_in_threadblock == 0) {
+        mxgemm_smem<C>();
+    }
+
+    const auto warps_per_threadblock = threads_per_threadblock / MU_NUM_THREADS;
+    mu_barrier(0, warps_per_threadblock);
+
+    auto C_smem = reinterpret_cast<const __shared _Float16 *>(SPAD_DEST * DIM);
+    copy_output_smem_to_gmem_simt<C.TILE_M, C.TILE_N>(
+        C_smem, C_gmem, tid_in_threadblock, threads_per_threadblock);
 }
