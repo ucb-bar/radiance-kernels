@@ -18,6 +18,7 @@
 #define BLOCK_Y (TB_Y * TN)
 #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
 
+#define BLOCK_NUM_WARPS MU_BLOCK_NUM_WARPS(NUM_WARPS)
 #define THREADBLOCK_SIZE MU_BLOCK_SIZE(NUM_WARPS)
 #define NUM_A_CHUNKS (BLOCK_X * BK / 2) / THREADBLOCK_SIZE // ENSURE BLOCK_X * BK / 2 >= THREADBLOCK_SIZE and is a multiple of THREADBLOCK_SIZE
 #define NUM_B_CHUNKS (BK * BLOCK_Y / 2) / THREADBLOCK_SIZE // same as above
@@ -87,6 +88,10 @@ static inline void gemm(
         uint32_t B_x = k + (elem_idx / (BLOCK_Y / 2));
         Bs[elem_idx] = B[B_x * (N / 2) + B_y];
       }
+
+      //hold up
+      mu_fence_smem();
+      mu_barrier(0, BLOCK_NUM_WARPS);
     }
 
   }
