@@ -329,7 +329,7 @@ static inline void copy_output_smem_to_gmem_async(const uint32_t src_spad_addr,
             const uint32_t tile_spad_addr = src_spad_addr + (i * C.PE_TILES_J() + j) * DIM;
             // row-major layout
             // FIXME: hardcoded output dtype
-            auto *dram_ptr = dest_gmem + (i * DIM * C.GEMM_K + j * DIM) * sizeof(uint16_t);
+            auto *dram_ptr = dest_gmem + i * DIM * C.GEMM_K + j * DIM;
             gemmini_mvout((void *) dram_ptr, tile_spad_addr);
         }
     }
