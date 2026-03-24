@@ -319,7 +319,7 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
 }
 
 /** Move tensor data from SMEM->GMEM using SIMT threads.
- *  Assumes row-major layout for both src and dest.
+ *  Assumes row-major, packed layout (row stride == dim_col) for both src and dest.
  *  TODO: De-dup with FlashAttention */
 template <uint32_t dim_row, uint32_t dim_col, uint32_t elem_size>
 inline void copy_output_smem_to_gmem_simt(const __shared uint8_t *src_smem,
@@ -331,15 +331,20 @@ inline void copy_output_smem_to_gmem_simt(const __shared uint8_t *src_smem,
     // Thread mapping: All warps in a threadblock cooperatively copies a
     // contiguous chunk of the same size as the threadblock per every "wave".
     // TODO: use GEMM_ instead of TILE_ here
-    const auto iter = dim_row * dim_col * elem_size / sizeof(*src_smem) /
+
+    // Vectorize to 32-bit words for better throughput.
+    auto *src_smem_vec = reinterpret_cast<const __shared uint32_t *>(src_smem);
+    auto *dest_gmem_vec = reinterpret_cast<uint32_t *>(dest_gmem);
+    static_assert((dim_row * dim_col * elem_size) % sizeof(uint32_t) == 0);
+    const auto iter = dim_row * dim_col * elem_size / sizeof(uint32_t) /
                       threads_per_threadblock;
 
 #pragma unroll 32
     for (int i = 0; i < iter; i++) {
         // simple uniform-strided access
         const auto index = (threads_per_threadblock) * i + tid_in_threadblock;
-        const auto smem_addr = src_smem + index * elem_size;
-        auto gmem_addr = dest_gmem + index * elem_size;
+        const auto smem_addr = src_smem_vec + index;
+        auto gmem_addr = dest_gmem_vec + index;
         // TODO: do packed 32-bit transfers instead of uint8_t
         *gmem_addr = *smem_addr;
         // asm volatile("sh.shared %1, 0(%0)" :: "r"(smem_address), "r"(data) : "memory");
