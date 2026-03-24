@@ -6,13 +6,13 @@
 #include <math.h>
 #include <stdint.h>
 
-#define NUM_WARPS 4
+#define NUM_WARPS 2
 
 // all numbers below in number of BF16 elements
 #define BK 32
 #define TM 2
-#define TN 4
-#define TB_X 16
+#define TN 2
+#define TB_X 8
 #define TB_Y 8
 #define BLOCK_X (TB_X * TM)
 #define BLOCK_Y (TB_Y * TN)
@@ -76,6 +76,7 @@ static inline void gemm(
     //stream across K
     for (uint32_t k_block = 0; k_block < K; k_block += BK) {
       //load A block to smem
+      #pragma unroll
       for (uint32_t a_block = 0; a_block < NUM_A_CHUNKS; a_block++) {
         uint32_t elem_idx = tid_in_threadblock + a_block * THREADBLOCK_SIZE;
         uint32_t A_x = block_x_idx * BLOCK_X + (elem_idx / (BK / 2)); // BK bf16 elements = BK/2 uint32_t elements
@@ -83,6 +84,7 @@ static inline void gemm(
         As[elem_idx] = A[A_x * (K / 2) + A_y];
       }
       //load B block to smem
+      #pragma unroll
       for (uint32_t b_block = 0; b_block < NUM_B_CHUNKS; b_block++) {
         uint32_t elem_idx = tid_in_threadblock + b_block * THREADBLOCK_SIZE;
         uint32_t B_y = block_y_idx * BLOCK_Y / 2 + (elem_idx % (BLOCK_Y / 2)); // BLOCK_Y bf16 elements
@@ -116,6 +118,7 @@ static inline void gemm(
     //store C
     uint32_t c_row = block_x_idx * BLOCK_X + thread_x * TM;
     uint32_t c_col = block_y_idx * BLOCK_Y / 2 + thread_y * TN / 2;
+    #pragma unroll
     for (uint32_t i = 0; i < TM; i++) {
       uint32_t c_x = c_row + i;
       for (uint32_t j = 0; j < TN / 2; j++) {
