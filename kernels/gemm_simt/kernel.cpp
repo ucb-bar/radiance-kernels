@@ -73,24 +73,42 @@ static inline void gemm(
     for (uint32_t i = 0; i < TM*TN; i++) acc[i] = 0;
 
     //stream across K
-    for (uint32_t k = 0; k < K; k += BK) {
+    for (uint32_t k_block = 0; k_block < K; k_block += BK) {
       //load A block to smem
       for (uint32_t a_block = 0; a_block < NUM_A_CHUNKS; a_block++) {
         uint32_t elem_idx = tid_in_threadblock + a_block * THREADBLOCK_SIZE;
         uint32_t A_x = block_x_idx * BLOCK_X + (elem_idx / (BK / 2)); // BK bf16 elements = BK/2 uint32_t elements
-        uint32_t A_y = k / 2 + (elem_idx % (BK / 2));
+        uint32_t A_y = k_block / 2 + (elem_idx % (BK / 2));
         As[elem_idx] = A[A_x * (K / 2) + A_y];
       }
       //load B block to smem
       for (uint32_t b_block = 0; b_block < NUM_B_CHUNKS; b_block++) {
         uint32_t elem_idx = tid_in_threadblock + b_block * THREADBLOCK_SIZE;
         uint32_t B_y = block_y_idx * BLOCK_Y / 2 + (elem_idx % (BLOCK_Y / 2)); // BLOCK_Y bf16 elements
-        uint32_t B_x = k + (elem_idx / (BLOCK_Y / 2));
+        uint32_t B_x = k_block + (elem_idx / (BLOCK_Y / 2));
         Bs[elem_idx] = B[B_x * (N / 2) + B_y];
       }
 
       //hold up
       mu_fence_smem();
+      mu_barrier(0, BLOCK_NUM_WARPS);
+
+      //compute
+      //j and k can vector load 2 BF16
+      for (uint32_t k = 0; k < BK / 2; k++) {
+        for (uint32_t i = 0; i < TM; i++) {
+          uint32_t a_idx = thread_x * TM + i;
+          auto [a0, a1] = unpack_bf16x2(As[a_idx * BK / 2 + k]);
+          for (uint32_t j = 0; j < TN / 2; j++) {
+            uint32_t b_idx = thread_y * TN / 2 + j;
+            auto [b00, b10] = unpack_bf16x2(Bs[2*k * (BLOCK_Y / 2) + b_idx]);
+            auto [b01, b11] = unpack_bf16x2(Bs[(2*k + 1) * (BLOCK_Y / 2) + b_idx]);
+            acc[i * TN + 2 * j] += a0 * b00 + a1 * b01;
+            acc[i * TN + 2 * j + 1] += a0 * b10 + a1 * b11;
+          }
+        }
+      }
+
       mu_barrier(0, BLOCK_NUM_WARPS);
     }
 
