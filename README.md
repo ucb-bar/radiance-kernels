@@ -1,6 +1,6 @@
 # Radiance Kernels
 
-This WIP repo is based off of [virgo-kernels](https://github.com/ucb-bar/virgo-kernels).
+Kernels written for the [Radiance GPU](https://github.com/ucb-bar/radiance).
 
 ## Setup
 
@@ -58,8 +58,20 @@ compiled cyclotron binary.
 
 ## Run Kernels
 
-Similar to the ISA tests, go to `kernels/<kernel_name>` and run `make`. The
-output `kernel.radiance.elf` is what you want.
+Similar to the ISA tests, go to `kernels/<kernel_name>` and run `make`.
+Use `*.elf` binaries for the `BINARY=` argument of the [Chipyard RTL
+simulations](https://chipyard.readthedocs.io/en/latest/Simulation/Software-RTL-Simulation.html).
+
+`*.soc.elf` binaries fuse both the host CPU and device GPU programs
+into one, and they should be run on the SoC `CONFIG`s such as
+`RadianceTapeoutConfig` and `RadianceSingleClusterConfig`.
+
+`*.radiance.elf` binaries are GPU-only kernels that should be run on
+host-less `CONFIG`s such as `MuonCoreTestConfig`.
+
+See
+[RadianceConfigs.scala](https://github.com/ucb-bar/radiance/blob/main/chipyard/RadianceConfigs.scala)
+for the full list of configs.
 
 
 ## Kernel Writing Pitfalls
