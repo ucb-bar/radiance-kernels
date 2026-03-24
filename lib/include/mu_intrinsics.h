@@ -65,8 +65,41 @@ __attribute__((convergent))
 inline void mu_fence_smem() {
     asm volatile ("fence.s" ::: "memory");
 }
+
+/** NOTE about barriers: Placing barriers around thread-divergent branches
+ *  may cause bugs.  The compiler might decide to duplicate mu_barrier() into
+ *  both paths of a warp-divergent branch, which will cause the barrier to
+ *  execute twice via SIMT serialization, and cause potential deadlocks.
+ *  mu_barrier() doesn't check for participating tmasks.
+ *
+ *  We wrap mu_barrier() with convergent/noduplicate/noinline, but that doesn't
+ *  seem to be sufficient.
+ *
+ *  This seems to happen the most around single-thread-guarded code, e.g.:
+ *
+ *    if (tid == 0) {
+ *        // do something
+ *    }
+ *    mu_barrier(...);
+ *
+ *  A workaround that _may_ work is to put an explicit else clause with a
+ *  nop in it:
+ *
+ *    if (tid == 0) {
+ *        // do something
+ *    } else {
+ *        asm volatile("nop");
+ *    }
+ *    mu_barrier(...);
+ *
+ *  Another workaround is to use -Os for the optimization, which keeps
+ *  the compiler from branch-duplicating to save code size.
+ *
+ *  None of these workarounds are fundamental, and we need proper compiler
+ *  support to reason about warp-convergence.  TODO.
+ */
 __attribute__((convergent))
-inline void mu_barrier(unsigned barried_id, unsigned num_warps) {
+static void mu_barrier(unsigned barried_id, unsigned num_warps) {
     asm volatile ("vx_bar %0, %1" :: "r"(barried_id), "r"(num_warps) : "memory");
 }
 

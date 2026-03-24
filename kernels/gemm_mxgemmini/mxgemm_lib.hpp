@@ -321,7 +321,7 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
  *  Assumes row-major, packed layout (row stride == dim_col) for both src and dest.
  *  TODO: De-dup with FlashAttention */
 template <uint32_t dim_row, uint32_t dim_col, uint32_t elem_size>
-inline void copy_output_smem_to_gmem_simt(const __shared uint8_t *src_smem,
+static void copy_output_smem_to_gmem_simt(const __shared uint8_t *src_smem,
                                           uint8_t *dest_gmem,
                                           const uint32_t tid_in_threadblock,
                                           const uint32_t threads_per_threadblock) {
@@ -353,7 +353,7 @@ inline void copy_output_smem_to_gmem_simt(const __shared uint8_t *src_smem,
 /** Move tensor data from SMEM->GMEM using Gemmini DMA.
  *  `src_spad_addr` is in scratchpad row address. */
 template <GemmConfig C>
-static inline void copy_output_smem_to_gmem_async(const uint32_t src_spad_addr,
+static void copy_output_smem_to_gmem_async(const uint32_t src_spad_addr,
                                                   uint8_t *dest_gmem,
                                                   const uint32_t dim_n) {
     asm volatile ("copy_output_smem_to_gmem_async_start_%=:" :: );
@@ -411,6 +411,8 @@ static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_
 /** Do matmul on a single TILE_M * TILE_N output tile, accumulating over the
  *  full GEMM_K. */
 template <GemmConfig C> void mxgemm_single_output_tile(const uint32_t dim_k) {
+    asm volatile ("mxgemm_single_output_tile_start_%=:" :: );
+
     configure_mxgemmini<C>();
 
     // -----------------
@@ -491,16 +493,22 @@ template <GemmConfig C> void mxgemm_single_output_tile(const uint32_t dim_k) {
     gemmini_fence();
 
     asm volatile ("main_matmul_k_loop_end_%=:" :: );
+
+    asm volatile ("mxgemm_single_output_tile_end_%=:" :: );
 }
 
 /** Do a full GEMM and store the result C tensor at `C_gmem` GMEM address. */
 template <GemmConfig C>
-static inline void
+static void
 mxgemm(const uint32_t dim_m, const uint32_t dim_n, const uint32_t dim_k,
        uint8_t *C_gmem, const uint32_t tid_in_threadblock,
        const uint32_t threads_per_threadblock, const uint32_t threadblock_id) {
     if (tid_in_threadblock == 0) {
         mxgemm_single_output_tile<C>(dim_k);
+    } else {
+        // NOTE: This exists to prevent branch duplication of mu_barrier and a
+        // subsequent deadlock.  See comment in mu_intrinsics.h.
+        asm volatile("nop");
     }
 
     const auto warps_per_threadblock = threads_per_threadblock / MU_NUM_THREADS;
