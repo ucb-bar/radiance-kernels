@@ -56,6 +56,7 @@ static inline void gemm(
   uint32_t K = args->K;
   __global uint32_t *A = args->A;
   __global uint32_t *B = args->B;
+  __global uint32_t *C = args->C;
   __shared uint32_t *As = sdata;
   __shared uint32_t *Bs = sdata + BLOCK_X * BK / 2;
 
@@ -112,6 +113,16 @@ static inline void gemm(
       mu_barrier(0, BLOCK_NUM_WARPS);
     }
 
+    //store C
+    uint32_t c_row = block_x_idx * BLOCK_X + thread_x * TM;
+    uint32_t c_col = block_y_idx * BLOCK_Y / 2 + thread_y * TN / 2;
+    for (uint32_t i = 0; i < TM; i++) {
+      uint32_t c_x = c_row + i;
+      for (uint32_t j = 0; j < TN / 2; j++) {
+        uint32_t c_y = c_col + j;
+        C[c_x * (N / 2) + c_y] = pack_bf16x2(acc[i * TN + 2*j], acc[i * TN + 2*j + 1]);
+      } 
+    }
   }
 }
 
