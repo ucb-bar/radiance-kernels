@@ -57,10 +57,10 @@ constexpr bool DISABLE_DMA_MOVE_IN = false;
 // disable scale-factor write & fence from the GPU
 constexpr bool DISABLE_SCALE_FACTOR_UPDATE = false;
 // disable C result tensor move-out from SMEM to GMEM
-constexpr bool DISABLE_GMEM_MOVEOUT = false;
+constexpr bool DISABLE_GMEM_MOVE_OUT = false;
 // use SIMT load/stores instead of DMA for C DMA move-out
 // TODO: enabled to avoid current mvout bug in DMA
-constexpr bool SIMT_GMEM_MOVEOUT = false;
+constexpr bool DISABLE_DMA_GMEM_MOVE_OUT = true;
 
 // TODO: max size hardcoded
 static uint32_t C_scale_factors[128 * 128 / 32] __attribute__((aligned(32))) = {0};
@@ -321,11 +321,11 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
  *  Assumes row-major, packed layout (row stride == dim_col) for both src and dest.
  *  TODO: De-dup with FlashAttention */
 template <uint32_t dim_row, uint32_t dim_col, uint32_t elem_size>
-static void copy_output_smem_to_gmem_simt(const __shared uint8_t *src_smem,
+static void copy_smem_to_gmem_simt(const __shared uint8_t *src_smem,
                                           uint8_t *dest_gmem,
                                           const uint32_t tid_in_threadblock,
                                           const uint32_t threads_per_threadblock) {
-    asm volatile ("copy_output_smem_to_gmem_simt_start_%=:" :: );
+    asm volatile ("copy_smem_to_gmem_simt_start_%=:" :: );
 
     // Thread mapping: All warps in a threadblock cooperatively copies a
     // contiguous chunk of the same size as the threadblock per every "wave".
@@ -347,29 +347,100 @@ static void copy_output_smem_to_gmem_simt(const __shared uint8_t *src_smem,
         *gmem_addr = *smem_addr;
     }
 
-    asm volatile ("copy_output_smem_to_gmem_simt_end_%=:" :: );
+    asm volatile ("copy_smem_to_gmem_simt_end_%=:" :: );
+}
+
+/** Copy tensor data from GMEM->GMEM using SIMT threads.
+ *  Used for generating memory traces to verify. */
+template <uint32_t dim_row, uint32_t dim_col, uint32_t elem_size>
+static void copy_gmem_to_gmem_simt(const uint8_t *src_gmem, uint8_t *dest_gmem,
+                                   const uint32_t tid_in_threadblock,
+                                   const uint32_t threads_per_threadblock) {
+    asm volatile ("copy_gmem_to_gmem_simt_start_%=:" :: );
+
+    // TODO: dedup with copy_smem_to_gmem_simt
+
+    // Vectorize to 32-bit words for better throughput.
+    auto *src_gmem_vec = reinterpret_cast<const uint32_t *>(src_gmem);
+    auto *dest_gmem_vec = reinterpret_cast<uint32_t *>(dest_gmem);
+    static_assert((dim_row * dim_col * elem_size) % sizeof(uint32_t) == 0);
+    const auto iter = dim_row * dim_col * elem_size / sizeof(uint32_t) /
+                      threads_per_threadblock;
+
+#pragma unroll 32
+    for (int i = 0; i < iter; i++) {
+        // simple uniform-strided access
+        const auto index = (threads_per_threadblock) * i + tid_in_threadblock;
+        const auto src_addr = src_gmem_vec + index;
+        auto dst_addr = dest_gmem_vec + index;
+        *dst_addr = *src_addr;
+    }
+
+    asm volatile ("copy_gmem_to_gmem_simt_end_%=:" :: );
 }
 
 /** Move tensor data from SMEM->GMEM using Gemmini DMA.
- *  `src_spad_addr` is in scratchpad row address. */
+ *  `src_spad_addr` is in scratchpad row address.
+ *  This call blocks and synchronizes with the completion of the DMA. */
 template <GemmConfig C>
-static void copy_output_smem_to_gmem_async(const uint32_t src_spad_addr,
-                                                  uint8_t *dest_gmem,
-                                                  const uint32_t dim_n) {
-    asm volatile ("copy_output_smem_to_gmem_async_start_%=:" :: );
+static void copy_smem_to_gmem_dma_sync(const uint32_t src_spad_addr,
+                                       uint8_t *dest_gmem, const uint32_t dim_n,
+                                       const uint32_t tid_in_threadblock) {
+    asm volatile("copy_smem_to_gmem_dma_sync_start_%=:" ::);
 
-    for (int i = 0; i < C.PE_TILES_I(); i++) {
-        for (int j = 0; j < C.PE_TILES_J(); j++) {
-            // TODO: stride is wrong for re-quantized output
-            const uint32_t tile_spad_addr = src_spad_addr + (i * C.PE_TILES_J() + j) * DIM;
-            // row-major layout
-            // FIXME: hardcoded output dtype
-            auto *dram_ptr = dest_gmem + (i * DIM * dim_n + j * DIM) * C.OUT_ELEM_SIZE();
-            gemmini_mvout((void *) dram_ptr, tile_spad_addr);
+    if (tid_in_threadblock == 0) {
+        for (int i = 0; i < C.PE_TILES_I(); i++) {
+#pragma unroll 32
+            for (int j = 0; j < C.PE_TILES_J(); j++) {
+                const uint32_t tile_spad_addr =
+                    src_spad_addr + (i * C.PE_TILES_J() + j) * DIM;
+                // row-major layout
+                // TODO: DRAM stride is wrong for re-quantized output
+                uint8_t *dram_ptr =
+                    dest_gmem +
+                    (i * DIM * dim_n + j * DIM) * C.OUT_ELEM_SIZE();
+                gemmini_mvout(rad_device_to_host_address(
+                                  reinterpret_cast<uint32_t>(dram_ptr)),
+                              tile_spad_addr);
+            }
         }
+
+        gemmini_fence();
     }
 
-    asm volatile ("copy_output_smem_to_gmem_async_end_%=:" :: );
+    asm volatile("copy_smem_to_gmem_dma_sync_end_%=:" ::);
+}
+
+/** Move tensor data from AccMEM->GMEM using Gemmini DMA.
+ *  This call blocks and synchronizes with the completion of the DMA. */
+template <GemmConfig C>
+static void copy_accmem_to_gmem_dma_sync(uint8_t *dest_gmem,
+                                         const uint32_t dim_n,
+                                         const uint32_t tid_in_threadblock) {
+    asm volatile("copy_accmem_to_gmem_dma_sync_start_%=:" ::);
+
+    if (tid_in_threadblock == 0) {
+        for (int i = 0; i < C.PE_TILES_I(); i++) {
+#pragma unroll 32
+            // need 4 because 4 fit in accmem row
+            for (int j = 0; j < C.PE_TILES_J() / 4; j++) {
+                const uint32_t tile_acc_addr =
+                    GEMMINI_ACC_ADDR + (i * C.PE_TILES_J() / 4 + j) * DIM;
+                // row-major layout
+                // TODO: DRAM stride is wrong for re-quantized output
+                uint8_t *dram_ptr =
+                    dest_gmem +
+                    (i * DIM * dim_n + j * DIM * 2) * C.OUT_ELEM_SIZE();
+                gemmini_mvout(rad_device_to_host_address(
+                                  reinterpret_cast<uint32_t>(dram_ptr)),
+                              tile_acc_addr);
+            }
+        }
+
+        gemmini_fence();
+    }
+
+    asm volatile("copy_accmem_to_gmem_dma_sync_end_%=:" ::);
 }
 
 /** Asynchronously kick off loop FSM matmul compute operation in MxGemmini.
@@ -410,8 +481,14 @@ static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_
 
 /** Do matmul on a single TILE_M * TILE_N output tile, accumulating over the
  *  full GEMM_K. */
-template <GemmConfig C> void mxgemm_single_output_tile(const uint32_t dim_k) {
+template <GemmConfig C>
+void mxgemm_single_output_tile(const uint32_t dim_k,
+                               const uint32_t tid_in_threadblock) {
     asm volatile ("mxgemm_single_output_tile_start_%=:" :: );
+
+    if (tid_in_threadblock != 0) {
+        return;
+    }
 
     configure_mxgemmini<C>();
 
@@ -503,30 +580,30 @@ static void
 mxgemm(const uint32_t dim_m, const uint32_t dim_n, const uint32_t dim_k,
        uint8_t *C_gmem, const uint32_t tid_in_threadblock,
        const uint32_t threads_per_threadblock, const uint32_t threadblock_id) {
-    if (tid_in_threadblock == 0) {
-        mxgemm_single_output_tile<C>(dim_k);
-    } else {
-        // NOTE: This exists to prevent branch duplication of mu_barrier and a
-        // subsequent deadlock.  See comment in mu_intrinsics.h.
-        asm volatile("nop");
-    }
+    mxgemm_single_output_tile<C>(dim_k, tid_in_threadblock);
 
     const auto warps_per_threadblock = threads_per_threadblock / MU_NUM_THREADS;
-    mu_barrier(0, warps_per_threadblock);
+    mu_barrier(1, warps_per_threadblock);
 
     // Move-out C from SMEM to GMEM
-    if constexpr (!DISABLE_GMEM_MOVEOUT) {
+    if constexpr (!DISABLE_GMEM_MOVE_OUT) {
         auto C_smem =
             reinterpret_cast<const __shared uint8_t *>(SPAD_DEST * DIM);
-        if constexpr (SIMT_GMEM_MOVEOUT) {
-            copy_output_smem_to_gmem_simt<C.TILE_M_QUANT(), C.TILE_N_QUANT(),
-                                          C.OUT_ELEM_SIZE()>(
+        if constexpr (DISABLE_DMA_GMEM_MOVE_OUT) {
+            copy_smem_to_gmem_simt<C.TILE_M_QUANT(), C.TILE_N_QUANT(),
+                                   C.OUT_ELEM_SIZE()>(
                 C_smem, C_gmem, tid_in_threadblock, threads_per_threadblock);
         } else {
-            if (tid_in_threadblock == 0) {
-                copy_output_smem_to_gmem_async<C>(SPAD_DEST, C_gmem, dim_n);
-                gemmini_fence();
-            }
+            copy_accmem_to_gmem_dma_sync<C>(C_gmem, dim_n, tid_in_threadblock);
+
+            mu_barrier(2, warps_per_threadblock);
+
+            // do bogus GMEM->GMEM copy for trace generation
+            auto trace_gmem = reinterpret_cast<uint8_t *>(0x60000000);
+            copy_gmem_to_gmem_simt<C.TILE_M_QUANT(), C.TILE_N_QUANT(),
+                                   C.OUT_ELEM_SIZE()>(C_gmem, trace_gmem,
+                                                      tid_in_threadblock,
+                                                      threads_per_threadblock);
         }
     }
 }
