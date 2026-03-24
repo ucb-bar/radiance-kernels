@@ -10,8 +10,8 @@
 
 // all numbers below in number of BF16 elements
 #define BK 32
-#define TM 2
-#define TN 2
+#define TM 4
+#define TN 4
 #define TB_X 8
 #define TB_Y 8
 #define BLOCK_X (TB_X * TM)
@@ -22,6 +22,7 @@
 #define THREADBLOCK_SIZE MU_BLOCK_SIZE(NUM_WARPS)
 #define NUM_A_CHUNKS (BLOCK_X * BK / 2) / THREADBLOCK_SIZE // ENSURE BLOCK_X * BK / 2 >= THREADBLOCK_SIZE and is a multiple of THREADBLOCK_SIZE
 #define NUM_B_CHUNKS (BK * BLOCK_Y / 2) / THREADBLOCK_SIZE // same as above
+//ENSURE NUM_A_CHUNKS = NUM_B_CHUNKS
 
 extern "C" uint32_t __mu_num_warps = NUM_WARPS;
 
@@ -75,21 +76,30 @@ static inline void gemm(
 
     //stream across K
     for (uint32_t k_block = 0; k_block < K; k_block += BK) {
-      //load A block to smem
+
+      __global uint32_t *A_ptr[NUM_A_CHUNKS], *B_ptr[NUM_A_CHUNKS];
+      uint32_t Agm[NUM_A_CHUNKS], Bgm[NUM_A_CHUNKS];
+      //load A & B block to smem
       #pragma unroll
-      for (uint32_t a_block = 0; a_block < NUM_A_CHUNKS; a_block++) {
-        uint32_t elem_idx = tid_in_threadblock + a_block * THREADBLOCK_SIZE;
+      for (uint32_t block = 0; block < NUM_A_CHUNKS; block++) {
+        uint32_t elem_idx = tid_in_threadblock + block * THREADBLOCK_SIZE;
         uint32_t A_x = block_x_idx * BLOCK_X + (elem_idx / (BK / 2)); // BK bf16 elements = BK/2 uint32_t elements
         uint32_t A_y = k_block / 2 + (elem_idx % (BK / 2));
-        As[elem_idx] = A[A_x * (K / 2) + A_y];
-      }
-      //load B block to smem
-      #pragma unroll
-      for (uint32_t b_block = 0; b_block < NUM_B_CHUNKS; b_block++) {
-        uint32_t elem_idx = tid_in_threadblock + b_block * THREADBLOCK_SIZE;
         uint32_t B_y = block_y_idx * BLOCK_Y / 2 + (elem_idx % (BLOCK_Y / 2)); // BLOCK_Y bf16 elements
         uint32_t B_x = k_block + (elem_idx / (BLOCK_Y / 2));
-        Bs[elem_idx] = B[B_x * (N / 2) + B_y];
+        A_ptr[block] = &A[A_x * (K / 2) + A_y];
+        B_ptr[block] = &B[B_x * (N / 2) + B_y];
+      }
+      #pragma unroll
+      for (uint32_t block = 0; block < NUM_A_CHUNKS; block++) {
+        Agm[block] = *A_ptr[block];
+        Bgm[block] = *B_ptr[block];
+      }
+      #pragma unroll
+      for (uint32_t block = 0; block < NUM_A_CHUNKS; block++) {
+        uint32_t elem_idx = tid_in_threadblock + block * THREADBLOCK_SIZE;
+        As[elem_idx] = Agm[block];
+        Bs[elem_idx] = Bgm[block];
       }
 
       //hold up
