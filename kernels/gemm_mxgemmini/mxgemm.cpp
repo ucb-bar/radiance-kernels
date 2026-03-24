@@ -19,6 +19,7 @@ constexpr GemmConfig C{
     .TILE_N = 128,
     .TILE_K = 128,
     .FP4FP6 = true,
+    .QUANT_OUTPUT = false,
 };
 
 void mxgemm_entry(void *arg, uint32_t tid_in_threadblock,

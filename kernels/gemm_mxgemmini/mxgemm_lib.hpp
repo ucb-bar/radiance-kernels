@@ -14,7 +14,7 @@ struct GemmConfig {
     uint32_t TILE_K = 256;
     bool FP4FP6 = false;
     // quantize output to fp4/fp6/fp8
-    bool QUANT_OUTPUT = true;
+    bool QUANT_OUTPUT = false;
 
     constexpr uint32_t PE_M() const { return (FP4FP6 ? 32 : 16); }
     constexpr uint32_t PE_N() const { return (FP4FP6 ? 32 : 16); }
@@ -25,10 +25,17 @@ struct GemmConfig {
     // TODO: TILE_N not differentiated
     constexpr uint32_t SCALE_FAC_DIM() const { return TILE_M * TILE_K / 32; }
     constexpr uint32_t VALUES_PER_BYTE() const { return (FP4FP6 ? 2 : 1); }
-    // sizeof(C element)
+    // Size of each C element *after column-packing*.
     constexpr uint32_t OUT_ELEM_SIZE() const {
         // C FP4/FP6 elem-packing is along the M dimension, not N
         return (QUANT_OUTPUT ? sizeof(uint8_t) : sizeof(uint16_t));
+    }
+    constexpr uint32_t TILE_M_QUANT() const {
+        return (QUANT_OUTPUT ? TILE_M / VALUES_PER_BYTE() : TILE_M);
+    }
+    constexpr uint32_t TILE_N_QUANT() const {
+        // packing of N-dimension is already reflected in OUT_ELEM_SIZE()
+        return TILE_N;
     }
     constexpr bool USE_LUT() const { return FP4FP6; }
 };
@@ -69,6 +76,8 @@ static inline void configure_mxgemmini() {
     // TODO: FP4
     constexpr auto GEMMINI_FORMAT =
         C.FP4FP6 ? GEMMINI_FORMAT_FP6 : GEMMINI_FORMAT_FP8;
+    constexpr auto GEMMINI_FORMAT_OUT =
+        C.QUANT_OUTPUT ? GEMMINI_FORMAT : GEMMINI_FORMAT_FULL;
 
     gemmini_extended3_config_ex(
         WEIGHT_STATIONARY, // dataflow
@@ -78,7 +87,7 @@ static inline void configure_mxgemmini() {
         false, // set_only:strides
         GEMMINI_FORMAT, // A dtype
         GEMMINI_FORMAT, // B dtype
-        GEMMINI_FORMAT, // C dtype
+        GEMMINI_FORMAT_OUT, // C dtype
         C.USE_LUT()  // uselut
     );
 
@@ -312,7 +321,7 @@ static inline void copy_gmem_to_smem_async(const uint32_t tile_i /* FIXME: unuse
 /** Move tensor data from SMEM->GMEM using SIMT threads.
  *  Assumes row-major layout for both src and dest.
  *  TODO: De-dup with FlashAttention */
-template <GemmConfig C>
+template <uint32_t dim_row, uint32_t dim_col, uint32_t elem_size>
 inline void copy_output_smem_to_gmem_simt(const __shared uint8_t *src_smem,
                                           uint8_t *dest_gmem,
                                           const uint32_t tid_in_threadblock,
@@ -322,14 +331,15 @@ inline void copy_output_smem_to_gmem_simt(const __shared uint8_t *src_smem,
     // Thread mapping: All warps in a threadblock cooperatively copies a
     // contiguous chunk of the same size as the threadblock per every "wave".
     // TODO: use GEMM_ instead of TILE_ here
-    const auto iter = (C.TILE_M * C.TILE_N) / threads_per_threadblock;
+    const auto iter = dim_row * dim_col * elem_size / sizeof(*src_smem) /
+                      threads_per_threadblock;
 
 #pragma unroll 32
     for (int i = 0; i < iter; i++) {
         // simple uniform-strided access
         const auto index = (threads_per_threadblock) * i + tid_in_threadblock;
-        const auto smem_addr = src_smem + index * C.OUT_ELEM_SIZE();
-        auto gmem_addr = dest_gmem + index * C.OUT_ELEM_SIZE();
+        const auto smem_addr = src_smem + index * elem_size;
+        auto gmem_addr = dest_gmem + index * elem_size;
         // TODO: do packed 32-bit transfers instead of uint8_t
         *gmem_addr = *smem_addr;
         // asm volatile("sh.shared %1, 0(%0)" :: "r"(smem_address), "r"(data) : "memory");
@@ -497,7 +507,8 @@ static inline void mxgemm(uint8_t *C_gmem,
     if constexpr (!DISABLE_GMEM_MOVEOUT) {
         auto C_smem = reinterpret_cast<const __shared uint8_t *>(SPAD_DEST * DIM);
         if constexpr (SIMT_GMEM_MOVEOUT) {
-            copy_output_smem_to_gmem_simt<C>(
+            copy_output_smem_to_gmem_simt
+                <C.TILE_M_QUANT(), C.TILE_N_QUANT(), C.OUT_ELEM_SIZE()>(
                 C_smem, C_gmem, tid_in_threadblock, threads_per_threadblock);
         } else {
             copy_output_smem_to_gmem_async<C>(SPAD_DEST, C_gmem);
