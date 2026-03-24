@@ -60,3 +60,61 @@ compiled cyclotron binary.
 
 Similar to the ISA tests, go to `kernels/<kernel_name>` and run `make`. The
 output `kernel.radiance.elf` is what you want.
+
+
+## Kernel Writing Pitfalls
+
+### Deadlock due to branch duplication of `mu_barrier`
+
+When putting threadblock barriers around thread-divergent branches
+(`mu_barrier` in [mu_intrinsic.h](lib/include/mu_intrinsics.h)), be careful
+about the compiler potentially duplicating the barrier to both branch paths and
+resulting in a deadlock.  For example:
+
+```
+if (tid_in_threadblock == 0) {
+    // do something
+}
+mu_barrier(0, NUM_WARPS);
+```
+
+may be transformed to:
+
+```
+if (tid_in_threadblock == 0) {
+    // do something
+    mu_barrier(0, NUM_WARPS);
+} else {
+    mu_barrier(0, NUM_WARPS);
+}
+```
+
+This may result in a deadlock, since the thread-divergent warp 0 executes
+`mu_barrier` twice due to SIMT branch serialization.  Because the other warps
+are convergent, they execute the barrier once, and warp 0 deadlocks due to no
+participation from other warps.
+
+#### Workarounds
+
+This problem requires a compiler fix, and otherwise can only be worked around
+with various levels of friction.
+
+Putting a nop explicitly at the else-clause sometimes helps:
+
+```
+if (tid_in_threadblock == 0) {
+    // do something
+} else {
+    asm volatile ("nop");
+}
+mu_barrier(...);
+```
+
+Placing the barrier further away from divergent branches also helps, e.g. by
+wrapping the branch inside a function.
+
+Using the `-Os` compiler flag also seems to keep the compiler from doing aggressive
+branch-duplication, albeit with a performance impact.
+
+We put `__attribute__((convergent, noinline))` directive to `mu_barrier`, but
+that doens't seem to fix this.
