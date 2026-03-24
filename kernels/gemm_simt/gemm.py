@@ -6,7 +6,7 @@ from string import Template
 import torch
 
 
-M = 8
+M = 64
 K = 128
 N = 128
 SEED = 0
