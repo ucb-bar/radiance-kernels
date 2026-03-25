@@ -13,15 +13,17 @@
 
 extern "C" {
 
-struct Context {
+struct __attribute__((aligned(CACHE_LINE_BYTES))) Context {
     mu_schedule_callback callback;
     void *arg;
     uint32_t occupancy;
+    uint8_t _pad[CACHE_LINE_BYTES - 3 * sizeof(uint32_t)];
 };
 
 /* Since vx_wspawn can only enter a function with no arguments, we need a
- * persistent state to restore contexts such as kernel arguments. */
-static Context schedule_context;
+ * persistent state to restore contexts such as kernel arguments.
+ * Must occupy its own cache line (64B) to avoid flush races with adjacent data. */
+static volatile Context schedule_context;
 
 static void __attribute__ ((noinline)) mu_schedule_standalone() {
     uint32_t cluster_id = 0;

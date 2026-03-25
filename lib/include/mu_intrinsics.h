@@ -14,6 +14,9 @@
 // 128 KiB SMEM
 #define MU_SMEM_SIZE_BYTES (128 << 10)
 
+// 64 KB cache line
+#define CACHE_LINE_BYTES 64
+
 #define MU_CSR_CLUSTER_ID 0xCD0
 
 inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {
