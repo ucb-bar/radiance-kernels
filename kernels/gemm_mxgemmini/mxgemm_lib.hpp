@@ -62,7 +62,7 @@ constexpr bool DISABLE_SCALE_FACTOR_UPDATE = false;
 constexpr bool DISABLE_GMEM_MOVE_OUT = false;
 // use SIMT load/stores instead of DMA for C DMA move-out
 // TODO: enabled to avoid current mvout bug in DMA
-constexpr bool DISABLE_DMA_GMEM_MOVE_OUT = true;
+constexpr bool SIMT_GMEM_MOVE_OUT = true;
 
 // TODO: max size hardcoded
 static uint32_t C_scale_factors[128 * 128 / 32] __attribute__((aligned(32))) = {0};
@@ -141,6 +141,7 @@ static inline uint32_t calculate_spad_addr(const uint32_t tile_k) {
     constexpr auto A_SPAD_ADDR_EVEN = 0;
     constexpr auto A_SPAD_ADDR_ODD = SMEM_QUARTER_ROWS;
     // B spad address is counted from the end (SMEM_SIZE_ROWS)
+    // TODO: might want to swap even and odd (do bank 0-2, 1-3 instead of 0-3, 1-2)
     constexpr auto B_SPAD_ADDR_EVEN = SMEM_SIZE_ROWS;
     constexpr auto B_SPAD_ADDR_ODD = SMEM_SIZE_ROWS - SMEM_QUARTER_ROWS;
 
@@ -330,10 +331,10 @@ static inline void copy_gmem_to_smem_async(
  *  TODO: De-dup with FlashAttention */
 template <uint32_t dim_row, uint32_t dim_col, uint32_t elem_size>
 static void copy_smem_to_gmem_simt(const __shared uint8_t *src_smem,
-                                          uint8_t *dest_gmem,
-                                          const uint32_t tid_in_threadblock,
-                                          const uint32_t threads_per_threadblock) {
-    asm volatile ("copy_smem_to_gmem_simt_start_%=:" :: );
+                                   uint8_t *dest_gmem,
+                                   const uint32_t tid_in_threadblock,
+                                   const uint32_t threads_per_threadblock) {
+    asm volatile("copy_smem_to_gmem_simt_start_%=:" ::);
 
     // Thread mapping: All warps in a threadblock cooperatively copies a
     // contiguous chunk of the same size as the threadblock per every "wave".
@@ -629,7 +630,7 @@ mxgemm(const uint32_t dim_m, const uint32_t dim_n, const uint32_t dim_k,
     if constexpr (!DISABLE_GMEM_MOVE_OUT) {
         auto C_smem =
             reinterpret_cast<const __shared uint8_t *>(SPAD_DEST * DIM);
-        if constexpr (DISABLE_DMA_GMEM_MOVE_OUT) {
+        if constexpr (SIMT_GMEM_MOVE_OUT) {
             copy_smem_to_gmem_simt<C.TILE_M_QUANT(), C.TILE_N_QUANT(),
                                    C.OUT_ELEM_SIZE()>(
                 C_smem, C_gmem, tid_in_threadblock, threads_per_threadblock);
