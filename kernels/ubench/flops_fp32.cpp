@@ -1,4 +1,4 @@
-#include "lib.h"
+#include <mu_lib.h>
 
 int main() {
   vx_tmc((1u << vx_num_threads()) - 1);
