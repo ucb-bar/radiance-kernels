@@ -6,6 +6,7 @@
 #include <math.h>
 #include <stdint.h>
 
+#define ILP 8
 #define NUM_WARPS 4
 #define BLOCK_NUM_WARPS MU_BLOCK_NUM_WARPS(NUM_WARPS)
 #define THREADBLOCK_SIZE MU_BLOCK_SIZE(NUM_WARPS)
@@ -118,6 +119,7 @@ static inline void gemm(
 
       //compute
       //j and k can vector load 2 BF16
+      #pragma unroll ILP
       for (uint32_t k = 0; k < BK / 2; k++) {
         for (uint32_t i = 0; i < TM; i++) {
           uint32_t a_idx = thread_x * TM + i;
