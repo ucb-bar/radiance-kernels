@@ -10,10 +10,10 @@
 
 // all numbers below in number of BF16 elements
 #define BK 32
-#define TM 2
+#define TM 4
 #define TN 2
 #define TB_X 8
-#define TB_Y 8
+#define TB_Y 16
 #define BLOCK_X (TB_X * TM)
 #define BLOCK_Y (TB_Y * TN)
 #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
