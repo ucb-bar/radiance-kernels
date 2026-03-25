@@ -23,6 +23,7 @@
 
 #define NUM_A_CHUNKS (BLOCK_X * BK / 2) / THREADBLOCK_SIZE // ENSURE BLOCK_X * BK / 2 >= THREADBLOCK_SIZE and is a multiple of THREADBLOCK_SIZE
 #define NUM_B_CHUNKS (BK * BLOCK_Y / 2) / THREADBLOCK_SIZE // same as above
+#define MAX_CHUNKS (NUM_A_CHUNKS > NUM_B_CHUNKS ? NUM_A_CHUNKS : NUM_B_CHUNKS)
 
 extern "C" uint32_t __mu_num_warps = NUM_WARPS;
 
@@ -61,6 +62,12 @@ static inline void gemm(
   __shared uint32_t *As = sdata;
   __shared uint32_t *Bs = sdata + BLOCK_X * BK / 2;
 
+  uint32_t elem_idxs[MAX_CHUNKS];
+  #pragma unroll
+  for (uint32_t block = 0; block < MAX_CHUNKS; block++) {
+    elem_idxs[block] = tid_in_threadblock + block * THREADBLOCK_SIZE;
+  }
+
   for (uint32_t c_block = 0; c_block < blocks_per_cluster; c_block++) {
     uint32_t block_idx = threadblock_id * blocks_per_cluster + c_block;
     uint32_t block_x_idx = block_idx / block_N;
@@ -82,16 +89,14 @@ static inline void gemm(
       //load A & B block to smem
       #pragma unroll
       for (uint32_t block = 0; block < NUM_A_CHUNKS; block++) {
-        uint32_t elem_idx = tid_in_threadblock + block * THREADBLOCK_SIZE;
-        uint32_t A_x = block_x_idx * BLOCK_X + (elem_idx / (BK / 2)); // BK bf16 elements = BK/2 uint32_t elements
-        uint32_t A_y = k_block / 2 + (elem_idx % (BK / 2));
+        uint32_t A_x = block_x_idx * BLOCK_X + (elem_idxs[block] / (BK / 2)); // BK bf16 elements = BK/2 uint32_t elements
+        uint32_t A_y = k_block / 2 + (elem_idxs[block] % (BK / 2));
         A_ptr[block] = &A[A_x * (K / 2) + A_y];
       }
       #pragma unroll
       for (uint32_t block = 0; block < NUM_B_CHUNKS; block++) {
-        uint32_t elem_idx = tid_in_threadblock + block * THREADBLOCK_SIZE;
-        uint32_t B_y = block_y_idx * BLOCK_Y / 2 + (elem_idx % (BLOCK_Y / 2)); // BLOCK_Y bf16 elements
-        uint32_t B_x = k_block + (elem_idx / (BLOCK_Y / 2));
+        uint32_t B_y = block_y_idx * BLOCK_Y / 2 + (elem_idxs[block] % (BLOCK_Y / 2)); // BLOCK_Y bf16 elements
+        uint32_t B_x = k_block + (elem_idxs[block] / (BLOCK_Y / 2));
         B_ptr[block] = &B[B_x * (N / 2) + B_y];
       }
       #pragma unroll
