@@ -1,3 +1,7 @@
+/*
+ * mu_lib.h: Utility functions for Muon SIMT kernels.
+ */
+
 #include <stdint.h>
 #include <type_traits>
 #include <mu_intrinsics.h>

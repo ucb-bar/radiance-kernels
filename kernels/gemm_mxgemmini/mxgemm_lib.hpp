@@ -341,13 +341,42 @@ static void copy_smem_to_gmem_simt(const __shared uint8_t *src_smem,
 #pragma unroll 32
     for (int i = 0; i < iter; i++) {
         // simple uniform-strided access
-        const auto index = (threads_per_threadblock) * i + tid_in_threadblock;
+        const auto index = (threads_per_threadblock)*i + tid_in_threadblock;
         const auto smem_addr = src_smem_vec + index;
         auto gmem_addr = dest_gmem_vec + index;
         *gmem_addr = *smem_addr;
     }
 
     asm volatile ("copy_smem_to_gmem_simt_end_%=:" :: );
+}
+
+/** Copy tensor data from GMEM->SMEM using SIMT threads.
+ *  Does 16-bit writes in order to comply with requantizer memory interface. */
+template <uint32_t dim_row, uint32_t dim_col, uint32_t elem_size>
+static void copy_gmem_to_smem_simt_bf16(
+    const uint8_t *src_gmem, __shared uint8_t *dest_smem,
+    const uint32_t tid_in_threadblock, const uint32_t threads_per_threadblock) {
+    asm volatile("copy_gmem_to_smem_simt_bf16_start_%=:" ::);
+
+    // TODO: dedup with copy_smem_to_gmem_simt
+
+    // Vectorize to 16-bit words
+    auto *src_gmem_vec = reinterpret_cast<const uint16_t *>(src_gmem);
+    auto *dest_smem_vec = reinterpret_cast<__shared uint16_t *>(dest_smem);
+    static_assert((dim_row * dim_col * elem_size) % sizeof(uint16_t) == 0);
+    const auto iter = dim_row * dim_col * elem_size / sizeof(uint16_t) /
+                      threads_per_threadblock;
+
+#pragma unroll 32
+    for (int i = 0; i < iter; i++) {
+        // simple uniform-strided access
+        const auto index = (threads_per_threadblock)*i + tid_in_threadblock;
+        const auto src_addr = src_gmem_vec + index;
+        auto dst_addr = dest_smem_vec + index;
+        *dst_addr = *src_addr;
+    }
+
+    asm volatile("copy_gmem_to_smem_simt_bf16_end_%=:" ::);
 }
 
 /** Copy tensor data from GMEM->GMEM using SIMT threads.
