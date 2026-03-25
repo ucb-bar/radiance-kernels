@@ -23,7 +23,8 @@ void requant_entry(void *arg, uint32_t tid_in_threadblock,
                    uint32_t threads_per_threadblock, uint32_t threadblock_id) {
     // do a dummy single-tile gemm to clear out uninitialized queues/X's in
     // Gemmini
-    mxgemm_single_output_tile<C>(C.TILE_K, tid_in_threadblock);
+    mxgemm_single_output_tile<C>(C.TILE_M, C.TILE_N, C.TILE_K,
+                                 tid_in_threadblock);
 
     auto C_gmem = reinterpret_cast<uint8_t *>(0x40000000);
 
