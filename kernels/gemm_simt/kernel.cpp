@@ -6,20 +6,20 @@
 #include <math.h>
 #include <stdint.h>
 
-#define NUM_WARPS 2
+#define NUM_WARPS 4
+#define BLOCK_NUM_WARPS MU_BLOCK_NUM_WARPS(NUM_WARPS)
+#define THREADBLOCK_SIZE MU_BLOCK_SIZE(NUM_WARPS)
 
 // all numbers below in number of BF16 elements
 #define BK 32
-#define TM 4
+#define TM 2
 #define TN 2
-#define TB_X 4
-#define TB_Y 16
+#define TB_Y MU_NUM_THREADS
+#define TB_X (THREADBLOCK_SIZE / TB_Y)
 #define BLOCK_X (TB_X * TM)
 #define BLOCK_Y (TB_Y * TN)
 #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
 
-#define BLOCK_NUM_WARPS MU_BLOCK_NUM_WARPS(NUM_WARPS)
-#define THREADBLOCK_SIZE MU_BLOCK_SIZE(NUM_WARPS)
 #define NUM_A_CHUNKS (BLOCK_X * BK / 2) / THREADBLOCK_SIZE // ENSURE BLOCK_X * BK / 2 >= THREADBLOCK_SIZE and is a multiple of THREADBLOCK_SIZE
 #define NUM_B_CHUNKS (BK * BLOCK_Y / 2) / THREADBLOCK_SIZE // same as above
 
