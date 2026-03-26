@@ -103,6 +103,7 @@ static inline void softmax(
       max = fmaxf(max, max_acc[i]);
 
     buf_sdata[tid] = (uint32_t)__builtin_bit_cast(uint16_t, max);
+    mu_fence_smem();
 
     // warp reduce max
     reduce_max<MU_NUM_THREADS>(buf_sdata, tid, lane_id);
@@ -149,6 +150,7 @@ static inline void softmax(
       denom += denom_acc[i];
 
     buf_sdata[tid] = (uint32_t)__builtin_bit_cast(uint16_t, denom);
+    mu_fence_smem();
 
     // warp reduce denom
     reduce_sum<MU_NUM_THREADS>(buf_sdata, tid, lane_id);
