@@ -3,6 +3,8 @@
 #include <mu_intrinsics.h>
 
 #include "include/matmul_data_mx_lut_hw.h"
+// unify naming for A_in
+static const uint8_t *A_in = &A_in_hw[0][0];
 #include "mxgemm_lib.hpp"
 
 constexpr GemmConfig C{
