@@ -416,13 +416,14 @@ static void copy_gmem_to_gmem_simt(const uint8_t *src_gmem, uint8_t *dest_gmem,
     asm volatile ("copy_gmem_to_gmem_simt_end_%=:" :: );
 }
 
-/** Move tensor data from SMEM->GMEM using Gemmini DMA.
+/** Move C result tensor from SMEM->GMEM using Gemmini DMA.
  *  `src_spad_addr` is in scratchpad row address.
  *  This call blocks and synchronizes with the completion of the DMA. */
 template <GemmConfig C>
-static void copy_smem_to_gmem_dma_sync(const uint32_t src_spad_addr,
-                                       uint8_t *dest_gmem, const uint32_t dim_n,
-                                       const uint32_t tid_in_threadblock) {
+static void copy_C_smem_to_gmem_dma_sync(const uint32_t src_spad_addr,
+                                         uint8_t *dest_gmem,
+                                         const uint32_t dim_n,
+                                         const uint32_t tid_in_threadblock) {
     asm volatile("copy_smem_to_gmem_dma_sync_start_%=:" ::);
 
     if (tid_in_threadblock == 0) {
@@ -434,8 +435,7 @@ static void copy_smem_to_gmem_dma_sync(const uint32_t src_spad_addr,
                 // row-major layout
                 // TODO: DRAM stride is wrong for re-quantized output
                 uint8_t *dram_ptr =
-                    dest_gmem +
-                    (i * DIM * dim_n + j * DIM) * C.OUT_ELEM_SIZE();
+                    dest_gmem + (i * DIM * dim_n + j * DIM) * C.OUT_ELEM_SIZE();
                 gemmini_mvout(rad_device_to_host_address(
                                   reinterpret_cast<uint32_t>(dram_ptr)),
                               tile_spad_addr);
@@ -467,7 +467,8 @@ static void copy_accmem_to_gmem_dma_sync(uint8_t *dest_gmem,
                 // TODO: DRAM stride is wrong for re-quantized output
                 uint8_t *dram_ptr =
                     dest_gmem +
-                    (i * DIM * dim_n + j * DIM * 2) * C.OUT_ELEM_SIZE();
+                    (i * DIM * dim_n + j * DIM * 2 /*is this right?*/) *
+                        C.OUT_ELEM_SIZE();
                 gemmini_mvout(rad_device_to_host_address(
                                   reinterpret_cast<uint32_t>(dram_ptr)),
                               tile_acc_addr);
@@ -635,11 +636,14 @@ mxgemm(const uint32_t dim_m, const uint32_t dim_n, const uint32_t dim_k,
                                    C.OUT_ELEM_SIZE()>(
                 C_smem, C_gmem, tid_in_threadblock, threads_per_threadblock);
         } else {
-            copy_accmem_to_gmem_dma_sync<C>(C_gmem, dim_n, tid_in_threadblock);
+            // copy_accmem_to_gmem_dma_sync<C>(C_gmem, dim_n, tid_in_threadblock);
+            copy_C_smem_to_gmem_dma_sync<C>(SPAD_DEST, C_gmem, dim_n,
+                                            tid_in_threadblock);
 
             mu_barrier(2, warps_per_threadblock);
 
-            // do bogus GMEM->GMEM copy for trace generation
+            // we do not trace DMA move; do an additional bogus SIMT copy to
+            // generate verifiable trace
             auto trace_gmem = reinterpret_cast<uint8_t *>(0x60000000);
             copy_gmem_to_gmem_simt<C.TILE_M_QUANT(), C.TILE_N_QUANT(),
                                    C.OUT_ELEM_SIZE()>(C_gmem, trace_gmem,
