@@ -25,22 +25,24 @@ void mxgemm_entry(void *arg, uint32_t tid_in_threadblock,
     mxgemm<C>(C.TILE_M, C.TILE_N, C.TILE_K, C_gmem, tid_in_threadblock,
               threads_per_threadblock, threadblock_id);
 
-    const auto warps_per_threadblock = threads_per_threadblock / MU_NUM_THREADS;
-    mu_barrier(4, warps_per_threadblock);
+    // Read out A/B from SMEM for verification
+    //
+    // const auto warps_per_threadblock = threads_per_threadblock / MU_NUM_THREADS;
+    // mu_barrier(4, warps_per_threadblock);
 
-    auto a_spad_addr_tile0 = calculate_spad_addr<false>(0);
-    auto b_spad_addr_tile0 =
-        calculate_spad_addr<true>(0) - C.PE_TILES_K() * C.PE_TILES_J() * DIM;
-    auto a_smem_tile0 =
-        reinterpret_cast<const __shared uint8_t *>(a_spad_addr_tile0 * DIM);
-    auto b_smem_tile0 =
-        reinterpret_cast<const __shared uint8_t *>(b_spad_addr_tile0 * DIM);
-    copy_smem_to_gmem_simt<C.TILE_M, C.TILE_K, sizeof(A_in[0][0])>(
-        a_smem_tile0, A_readout_gmem, tid_in_threadblock,
-        threads_per_threadblock);
-    copy_smem_to_gmem_simt<C.TILE_K, C.TILE_N, sizeof(B_in[0][0])>(
-        b_smem_tile0, B_readout_gmem, tid_in_threadblock,
-        threads_per_threadblock);
+    // auto a_spad_addr_tile0 = calculate_spad_addr<false>(0);
+    // auto b_spad_addr_tile0 =
+    //     calculate_spad_addr<true>(0) - C.PE_TILES_K() * C.PE_TILES_J() * DIM;
+    // auto a_smem_tile0 =
+    //     reinterpret_cast<const __shared uint8_t *>(a_spad_addr_tile0 * DIM);
+    // auto b_smem_tile0 =
+    //     reinterpret_cast<const __shared uint8_t *>(b_spad_addr_tile0 * DIM);
+    // copy_smem_to_gmem_simt<C.TILE_M, C.TILE_K, sizeof(A_in[0][0])>(
+    //     a_smem_tile0, A_readout_gmem, tid_in_threadblock,
+    //     threads_per_threadblock);
+    // copy_smem_to_gmem_simt<C.TILE_K, C.TILE_N, sizeof(B_in[0][0])>(
+    //     b_smem_tile0, B_readout_gmem, tid_in_threadblock,
+    //     threads_per_threadblock);
 }
 
 int main() {
