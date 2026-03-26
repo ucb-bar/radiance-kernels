@@ -19,9 +19,9 @@ constexpr GemmConfig C{
 void mxgemm_entry(void *arg, uint32_t tid_in_threadblock,
                   uint32_t threads_per_threadblock,
                   uint32_t threadblock_id) {
-    auto A_readout_gmem = reinterpret_cast<uint8_t *>(0x40000000);
-    auto B_readout_gmem = reinterpret_cast<uint8_t *>(0x50000000);
-    auto C_gmem = reinterpret_cast<uint8_t *>(0x60000000);
+    auto A_readout_gmem = reinterpret_cast<uint8_t *>(0x50000000);
+    auto B_readout_gmem = reinterpret_cast<uint8_t *>(0x60000000);
+    auto C_gmem = reinterpret_cast<uint8_t *>(0x40000000);
     mxgemm<C>(C.TILE_M, C.TILE_N, C.TILE_K, C_gmem, tid_in_threadblock,
               threads_per_threadblock, threadblock_id);
 
