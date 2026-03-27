@@ -21,6 +21,12 @@
 #define RAD_HOST_GPU_ALL_FINISHED 0x41000008ull
 #define RAD_HOST_GPU_CORES 0x41000010ull
 
+#define GPU_ADDR_OR_MMIO   ((volatile uint64_t *)0x40081000ull)
+#define SPAD_BASE          0x180000000ull
+#define DEVICE_KERNEL_BASE 0x10000000ull
+#define POST_OR_BASE       (SPAD_BASE | DEVICE_KERNEL_BASE)
+#define DRAM_KERNEL_BASE   0x110000000ull
+
 /** Convert GPU-local GMEM address to CPU-addressable global address */
 inline uint64_t rad_device_to_host_address(uint32_t addr) {
     return (static_cast<uint64_t>(addr) | RAD_HOST_GPU_DRAM_BASE);
