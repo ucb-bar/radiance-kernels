@@ -1,12 +1,5 @@
 #include <radiance.h>
 
-/* --- address map -------------------------------------------------------- */
-#define GPU_ADDR_OR_MMIO   ((volatile uint64_t *)0x40081000ull)
-#define SPAD_BASE          0x180000000ull
-#define DEVICE_KERNEL_BASE 0x10000000ull
-#define POST_OR_BASE       (SPAD_BASE | DEVICE_KERNEL_BASE)
-#define DRAM_KERNEL_BASE   0x110000000ull
-
 /* Data-region offsets (device address - DEVICE_KERNEL_BASE) */
 #define A_ELF_OFF    0x1000u   /* A in ELF / DRAM                       */
 #define B_ELF_OFF    0x3000u   /* B in ELF / DRAM                       */
