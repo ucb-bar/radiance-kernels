@@ -2,7 +2,7 @@
 #include <mu_schedule.h>
 #include <mu_intrinsics.h>
 
-#include "include/matmul_data_mx_lut_hw.h"
+#include "mxgemm.data.fp6.m128n128k128.h"
 // unify naming for A_in
 static const uint8_t *A_in = &A_in_hw[0][0];
 #include "mxgemm_lib.hpp"

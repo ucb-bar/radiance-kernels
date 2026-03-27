@@ -2,17 +2,16 @@
 #include <mu_schedule.h>
 #include <mu_intrinsics.h>
 
-#include "mxgemm.data.fp8.m128n128k256.h"
-static const uint8_t A_lut[64][16] = {0};
-static const uint8_t B_lut[64][16] = {0};
-static const uint8_t C_lut[64][16] = {0};
+#include "mxgemm.data.fp6.m128n128k128.h"
+// unify naming for A_in
+static const uint8_t *A_in = &A_in_hw[0][0];
 #include "mxgemm_lib.hpp"
 
 constexpr GemmConfig C{
     .TILE_M = 128,
     .TILE_N = 128,
-    .TILE_K = 256,
-    .FP4FP6 = false,
+    .TILE_K = 128,
+    .FP4FP6 = true,
     .QUANT_OUTPUT = false,
 };
 
