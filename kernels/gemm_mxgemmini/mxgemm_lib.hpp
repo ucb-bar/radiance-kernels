@@ -429,13 +429,13 @@ static void copy_C_smem_to_gmem_dma_sync(const uint32_t src_spad_addr,
     if (tid_in_threadblock == 0) {
         for (int i = 0; i < C.PE_TILES_I(); i++) {
 #pragma unroll 32
-            for (int j = 0; j < C.PE_TILES_J(); j++) {
+            for (int j = 0; j < 2 * C.PE_TILES_J(); j++) {
                 const uint32_t tile_spad_addr =
-                    src_spad_addr + (i * C.PE_TILES_J() + j) * DIM;
+                    src_spad_addr + (i * 2 * C.PE_TILES_J() + j) * DIM;
                 // row-major layout
                 // TODO: DRAM stride is wrong for re-quantized output
                 uint8_t *dram_ptr =
-                    dest_gmem + (i * DIM * dim_n + j * DIM) * C.OUT_ELEM_SIZE();
+                    dest_gmem + (i * 2 * DIM * dim_n + j * DIM) * C.OUT_ELEM_SIZE();
                 gemmini_mvout(rad_device_to_host_address(
                                   reinterpret_cast<uint32_t>(dram_ptr)),
                               tile_spad_addr);
@@ -545,6 +545,8 @@ void mxgemm_single_output_tile(const uint32_t dim_m, const uint32_t dim_n,
     load_scale_factors(calculate_scale_factor_addr<false>(tile_k), &A_scales_row[0][0], C.SCALE_FAC_DIM());
     load_scale_factors(calculate_scale_factor_addr<true> (tile_k), &B_scales_col[0][0], C.SCALE_FAC_DIM());
 
+    // LUT is shared across the entire K, and thus loaded once per one SMEM
+    // output tile
     load_lut<C>();
 
     // fence scale factor and LUT writes
