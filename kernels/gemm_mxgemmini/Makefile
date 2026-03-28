@@ -8,7 +8,9 @@ MU_SRCS = mxgemm.cpp mxgemm_singletile.cpp \
 	  mxgemm.fp6.singletile.tm128tn128tk128.fullout.cpp \
 	  mxgemm.fp6.singletile.tm128tn128tk128.requant.cpp \
 	  mxgemm.fp6.singletile.tm128tn128tk512.fullout.cpp \
+	  mxgemm.fp6.m128n128k1024.tm128tn128tk512.fullout.cpp \
 	  mxgemm.fp6.singletile.tm128tn128tk512.requant.cpp \
+	  mxgemm.simt_contention.cpp \
 	  requant.cpp
 HOST_SRCS = host.cpp
 
