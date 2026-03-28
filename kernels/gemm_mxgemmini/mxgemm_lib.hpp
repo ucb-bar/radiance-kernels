@@ -22,7 +22,7 @@ struct GemmConfig {
     constexpr uint32_t PE_TILES_J() const { return TILE_N / PE_N(); }
     constexpr uint32_t PE_TILES_K() const { return TILE_K / PE_K(); }
     // TODO: TILE_N not differentiated
-    constexpr uint32_t SCALE_FAC_DIM() const { return TILE_M * TILE_K / 32; }
+    constexpr uint32_t SCALE_FACTORS_PER_TILE() const { return TILE_M * TILE_K / 32; }
     constexpr uint32_t VALUES_PER_BYTE() const { return (FP4FP6 ? 2 : 1); }
     // Size of each C element *after column-packing*.
     constexpr uint32_t OUT_ELEM_SIZE() const {
@@ -73,6 +73,8 @@ static inline void configure_mxgemmini(const uint32_t dim_m,
                                        const uint32_t dim_k) {
     static_assert(C.TILE_M == C.TILE_N,
                   "currently only supports square SMEM tile dimensions");
+    static_assert(C.TILE_K >= 32 && (C.TILE_K % 32) == 0,
+                  "tile K dimension is not a multiple of block size (32)");
 
     gemmini_flush(0);
 
@@ -157,11 +159,14 @@ static inline uint32_t calculate_spad_addr(const uint32_t tile_k) {
 }
 
 template <bool is_b>
-static inline __shared uint32_t *calculate_scale_factor_addr(const uint32_t tile_k) {
+static inline __shared uint32_t *
+calculate_scale_factor_smem_addr(const uint32_t tile_k) {
     const uint32_t odd_k = (tile_k & 1);
     const uint32_t dbuf_offset = odd_k ? GEMMINI_SF_MEM_BUFFER_SIZE : 0;
-    auto a_sf_addr = reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_A + dbuf_offset);
-    auto b_sf_addr = reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_B + dbuf_offset);
+    auto a_sf_addr =
+        reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_A + dbuf_offset);
+    auto b_sf_addr =
+        reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_B + dbuf_offset);
 
     if constexpr (is_b) {
         return b_sf_addr;
@@ -170,9 +175,20 @@ static inline __shared uint32_t *calculate_scale_factor_addr(const uint32_t tile
     }
 }
 
+template <GemmConfig C, bool is_b>
+static inline const uint8_t *
+calculate_scale_factor_gmem_addr(const uint8_t *scales_base_addr,
+                                 const uint32_t tile_k, const uint32_t dim_m,
+                                 const uint32_t dim_n) {
+    const auto dim_mn = is_b ? dim_n : dim_m;
+    const auto scales_addr =
+        scales_base_addr + (tile_k * C.TILE_K * dim_mn / 32) * sizeof(uint8_t);
+    return scales_addr;
+}
+
 static void __attribute__((noinline))
 load_scale_factors(volatile __shared uint32_t *sf_mem, const uint8_t *scale_factors,
-                   int n) {
+                   const int n) {
     // asm volatile ("load_scale_factors_start_%=:" :: );
     auto word_scale_factors = reinterpret_cast<const uint32_t *>(scale_factors);
 
@@ -542,8 +558,14 @@ void mxgemm_single_output_tile(const uint32_t dim_m, const uint32_t dim_n,
 
     // Load scaling factors from GMEM to the scale SRAM
     // load_scale_factors((const uint64_t *) C_scale, sizeof(C_scale));
-    load_scale_factors(calculate_scale_factor_addr<false>(tile_k), &A_scales_row[0][0], C.SCALE_FAC_DIM());
-    load_scale_factors(calculate_scale_factor_addr<true> (tile_k), &B_scales_col[0][0], C.SCALE_FAC_DIM());
+    load_scale_factors(calculate_scale_factor_smem_addr<false>(tile_k),
+                       calculate_scale_factor_gmem_addr<C, false>(
+                           &A_scales_row[0][0], tile_k, dim_m, dim_n),
+                       C.SCALE_FACTORS_PER_TILE());
+    load_scale_factors(calculate_scale_factor_smem_addr<true>(tile_k),
+                       calculate_scale_factor_gmem_addr<C, true>(
+                           &B_scales_col[0][0], tile_k, dim_m, dim_n),
+                       C.SCALE_FACTORS_PER_TILE());
 
     // LUT is shared across the entire K, and thus loaded once per one SMEM
     // output tile
@@ -588,11 +610,16 @@ void mxgemm_single_output_tile(const uint32_t dim_m, const uint32_t dim_n,
         // update scale factors for the next tile_k
         // make sure to place this between tile_async and fence to hide latency
         if constexpr (!DISABLE_SCALE_FACTOR_UPDATE) {
-            // TODO: offset by tile_k
-            load_scale_factors(calculate_scale_factor_addr<false>(tile_k + 1),
-                               &A_scales_row[0][0], C.SCALE_FAC_DIM());
-            load_scale_factors(calculate_scale_factor_addr<true>(tile_k + 1),
-                               &B_scales_col[0][0], C.SCALE_FAC_DIM());
+            load_scale_factors(
+                calculate_scale_factor_smem_addr<false>(tile_k + 1),
+                calculate_scale_factor_gmem_addr<C, false>(
+                    &A_scales_row[0][0], tile_k + 1, dim_m, dim_n),
+                C.SCALE_FACTORS_PER_TILE());
+            load_scale_factors(
+                calculate_scale_factor_smem_addr<true>(tile_k + 1),
+                calculate_scale_factor_gmem_addr<C, true>(
+                    &B_scales_col[0][0], tile_k + 1, dim_m, dim_n),
+                C.SCALE_FACTORS_PER_TILE());
 
             // fence scale factor and LUT writes before next Gemmini compute
             mu_fence_smem();
