@@ -38,11 +38,11 @@
 #define GEMMINI_LUT2_ADDR (GEMMINI_CTRL + GEMMINI_LUT2_OFFSET)
 
 // scale-factor memory
-#define GEMMINI_SF_MEM             0x00088000
-#define GEMMINI_SF_MEM_SIZE        0x2000
-#define GEMMINI_SF_MEM_BUFFER_SIZE (0x4000 / 4)
-#define GEMMINI_SF_MEM_A          (GEMMINI_SF_MEM + 0x2000)
-#define GEMMINI_SF_MEM_B          (GEMMINI_SF_MEM)
+#define GEMMINI_SF_MEM               0x00088000
+#define GEMMINI_SF_MEM_SIZE          0x2000
+#define GEMMINI_SF_MEM_BUFFER_OFFSET (GEMMINI_SF_MEM_SIZE / 4)
+#define GEMMINI_SF_MEM_A             (GEMMINI_SF_MEM + 0x2000)
+#define GEMMINI_SF_MEM_B             (GEMMINI_SF_MEM)
 
 // requantizer interface
 #define GEMMINI_REQUANT      0x00040000

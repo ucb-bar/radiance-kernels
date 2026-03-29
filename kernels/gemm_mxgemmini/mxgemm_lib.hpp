@@ -162,7 +162,7 @@ template <bool is_b>
 static inline __shared uint32_t *
 calculate_scale_factor_smem_addr(const uint32_t tile_k) {
     const uint32_t odd_k = (tile_k & 1);
-    const uint32_t dbuf_offset = odd_k ? GEMMINI_SF_MEM_BUFFER_SIZE : 0;
+    const uint32_t dbuf_offset = odd_k ? GEMMINI_SF_MEM_BUFFER_OFFSET : 0;
     auto a_sf_addr =
         reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_A + dbuf_offset);
     auto b_sf_addr =
