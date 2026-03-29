@@ -593,6 +593,7 @@ void mxgemm_single_output_tile(const uint32_t dim_m, const uint32_t dim_n,
     //
     for (; (tile_k * C.TILE_K) < dim_k; tile_k++) {
         const auto odd_k = (tile_k & 1);
+        const auto odd_next_k = !odd_k;
 
         // GMEM->SMEM DMA for the next tile_k
         // TODO: This results in an unnecessary move-in at the last K tile
@@ -630,8 +631,8 @@ void mxgemm_single_output_tile(const uint32_t dim_m, const uint32_t dim_n,
                 rad_device_to_host_address(
                     reinterpret_cast<uint32_t>(&C_scale_factors[0])),
                 C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
-                odd_k, // A double-buffer toggle
-                odd_k, // B double-buffer toggle
+                odd_next_k, // A double-buffer toggle
+                odd_next_k, // B double-buffer toggle
                 QUANT_LUT_UPDATE_GRANULARITY);
         }
 
