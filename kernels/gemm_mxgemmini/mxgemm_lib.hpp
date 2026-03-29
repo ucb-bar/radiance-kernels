@@ -603,6 +603,16 @@ void mxgemm_single_output_tile(const uint32_t dim_m, const uint32_t dim_n,
                                        0 /*FIXME*/, tile_k + 1);
         }
 
+        // configure scalefac->PE double-buffer read; inst: 0x3420b07b
+        gemmini_mxquant_config_mvout(
+            // TODO: dummy move-out space for the scale factor
+            rad_device_to_host_address(
+                reinterpret_cast<uint32_t>(&C_scale_factors[0])),
+            C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
+            odd_k, // A double-buffer toggle
+            odd_k, // B double-buffer toggle
+            QUANT_LUT_UPDATE_GRANULARITY);
+
         // asynchrously kick off matmul for this tile_k
         // gemmini_fence_ready();
         const auto last_k = ((tile_k + 1) * C.TILE_K) >= dim_k;
@@ -624,16 +634,6 @@ void mxgemm_single_output_tile(const uint32_t dim_m, const uint32_t dim_n,
 
             // fence scale factor and LUT writes before next Gemmini compute
             mu_fence_smem();
-
-            // configure scalefac->PE double-buffer read; inst: 0x3420b07b
-            gemmini_mxquant_config_mvout(
-                // TODO: dummy move-out space for the scale factor
-                rad_device_to_host_address(
-                    reinterpret_cast<uint32_t>(&C_scale_factors[0])),
-                C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
-                odd_next_k, // A double-buffer toggle
-                odd_next_k, // B double-buffer toggle
-                QUANT_LUT_UPDATE_GRANULARITY);
         }
 
         gemmini_fence();
