@@ -63,7 +63,6 @@ constexpr bool DISABLE_SCALE_FACTOR_UPDATE = false;
 // disable C result tensor move-out from SMEM to GMEM
 constexpr bool DISABLE_GMEM_MOVE_OUT = false;
 // use SIMT load/stores instead of DMA for C DMA move-out
-// TODO: enabled to avoid current mvout bug in DMA
 constexpr bool SIMT_GMEM_MOVE_OUT = true;
 
 // TODO: max size hardcoded
@@ -218,7 +217,7 @@ static inline void load_lut() {
     asm volatile ("load_lut_start_%=:" :: );
 
     if constexpr (C.USE_LUT()) {
-        // TODO: fix to use GEMM_MNK
+        // TODO: fix to use GEMM_MN
         for (size_t i = 0; i < (C.TILE_N >> QUANT_LUT_UPDATE_GRANULARITY); i++) {
             auto *dst = reinterpret_cast<volatile __shared uint32_t *>(GEMMINI_LUT0_ADDR) + 3 * i;
             dst[0] = B_lut[i][0]; dst[1] = B_lut[i][1]; dst[2] = B_lut[i][2];
@@ -599,15 +598,9 @@ void mxgemm_single_output_tile(const uint32_t dim_m, const uint32_t dim_n,
         const auto odd_k = (tile_k & 1);
         const auto odd_next_k = !odd_k;
 
-        // GMEM->SMEM DMA for the next tile_k
-        // TODO: This results in an unnecessary move-in at the last K tile
-        if constexpr (!DISABLE_MOVE_IN_AFTER_FIRST_K) {
-            // gemmini_fence_ready();
-            copy_gmem_to_smem_async<C>(dim_m, dim_n, dim_k, 0 /*FIXME*/,
-                                       0 /*FIXME*/, tile_k + 1);
-        }
-
         // configure scalefac->PE double-buffer read; inst: 0x3420b07b
+        // done for (tile_k) compute; we do this before (tile_k + 1) DMA,
+        // since this may get serialized with the DMA instruction
         gemmini_mxquant_config_mvout(
             // TODO: dummy move-out space for the scale factor
             rad_device_to_host_address(
@@ -616,6 +609,14 @@ void mxgemm_single_output_tile(const uint32_t dim_m, const uint32_t dim_n,
             odd_k, // A double-buffer toggle
             odd_k, // B double-buffer toggle
             QUANT_LUT_UPDATE_GRANULARITY);
+
+        // GMEM->SMEM DMA for the next tile_k
+        // TODO: This results in an unnecessary move-in at the last K tile
+        if constexpr (!DISABLE_MOVE_IN_AFTER_FIRST_K) {
+            // gemmini_fence_ready();
+            copy_gmem_to_smem_async<C>(dim_m, dim_n, dim_k, 0 /*FIXME*/,
+                                       0 /*FIXME*/, tile_k + 1);
+        }
 
         // asynchrously kick off matmul for this tile_k
         // gemmini_fence_ready();
