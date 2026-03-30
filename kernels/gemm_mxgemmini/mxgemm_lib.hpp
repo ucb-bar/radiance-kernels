@@ -53,6 +53,8 @@ constexpr auto SPAD_DEST = 256; // TODO: arbitrary
 
 // use MxGemmini DMA for GMEM->SMEM move-in
 constexpr bool GEMMINI_DMA = true;
+// always read from the first-k tile position to incur high cache hits
+constexpr bool ZERO_STRIDE_K = false;
 // disable GMEM->SMEM DMA copy after 0th tile and have MxGemmini work on stale
 // data in SMEM
 constexpr bool DISABLE_MOVE_IN_AFTER_FIRST_K = false;
@@ -182,7 +184,9 @@ calculate_scale_factor_gmem_addr(const uint8_t *scales_base_addr,
                                  const uint32_t dim_n) {
     const auto dim_mn = is_b ? dim_n : dim_m;
     const auto scales_addr =
-        scales_base_addr + (tile_k * C.TILE_K * dim_mn / 32) * sizeof(uint8_t);
+        scales_base_addr +
+        (!ZERO_STRIDE_K ? (tile_k * C.TILE_K * dim_mn / 32) * sizeof(uint8_t)
+                        : 0);
     return scales_addr;
 }
 
@@ -254,11 +258,12 @@ static inline void copy_gmem_to_smem_async(
         // TODO: stride by tile_i/j
         // TODO: possibly create functions for A/B row-stride
         // inst: 0x1420b07b
-        const uint32_t A_tile_start =
-            reinterpret_cast<uint32_t>(A_in) + C.TILE_K * tile_k;
+        const uint32_t A_tile_start = reinterpret_cast<uint32_t>(A_in) +
+                                      (!ZERO_STRIDE_K ? C.TILE_K * tile_k : 0);
         const uint32_t B_tile_start =
             reinterpret_cast<uint32_t>(B_in) +
-            dim_n * C.TILE_K * tile_k / C.VALUES_PER_BYTE();
+            (!ZERO_STRIDE_K ? dim_n * C.TILE_K * tile_k / C.VALUES_PER_BYTE()
+                            : 0);
         ROCC_INSTRUCTION_RS1_RS2(
             XCUSTOM_ACC,
             rad_device_to_host_address(A_tile_start),
@@ -553,8 +558,7 @@ void mxgemm_single_output_tile(const uint32_t dim_m, const uint32_t dim_n,
     //
     int tile_k = 0;
     // TODO: change 0's for multiple SMEM tiles
-    copy_gmem_to_smem_async<C>(dim_m, dim_n, dim_k, 0 /*FIXME*/, 0 /*FIXME*/,
-                               tile_k);
+    copy_gmem_to_smem_async<C>(dim_m, dim_n, dim_k, 0, 0, tile_k);
 
     // Load scaling factors from GMEM to the scale SRAM
     // load_scale_factors((const uint64_t *) C_scale, sizeof(C_scale));
