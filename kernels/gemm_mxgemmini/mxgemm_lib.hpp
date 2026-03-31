@@ -7,23 +7,30 @@
 
 // Tiling parameters -----------------------------------------------------------
 
+enum class GemmDatatype : uint8_t {
+    FP8,
+    FP6,
+    FP4,
+};
+
 struct GemmConfig {
     uint32_t TILE_M = 128;
     uint32_t TILE_N = 128;
     uint32_t TILE_K = 256;
-    bool FP4FP6 = false;
+    GemmDatatype DATATYPE = GemmDatatype::FP8;
     // quantize output to fp4/fp6/fp8
     bool QUANT_OUTPUT = false;
 
-    constexpr uint32_t PE_M() const { return (FP4FP6 ? 32 : 16); }
-    constexpr uint32_t PE_N() const { return (FP4FP6 ? 32 : 16); }
-    constexpr uint32_t PE_K() const { return (FP4FP6 ? 16 : 16); }
+    constexpr bool IS_FP8() const { return DATATYPE == GemmDatatype::FP8; }
+    constexpr uint32_t PE_M() const { return (IS_FP8() ? 16 : 32); }
+    constexpr uint32_t PE_N() const { return (IS_FP8() ? 16 : 32); }
+    constexpr uint32_t PE_K() const { return 16; }
     constexpr uint32_t PE_TILES_I() const { return TILE_M / PE_M(); }
     constexpr uint32_t PE_TILES_J() const { return TILE_N / PE_N(); }
     constexpr uint32_t PE_TILES_K() const { return TILE_K / PE_K(); }
     // TODO: TILE_N not differentiated
     constexpr uint32_t SCALE_FACTORS_PER_TILE() const { return TILE_M * TILE_K / 32; }
-    constexpr uint32_t VALUES_PER_BYTE() const { return (FP4FP6 ? 2 : 1); }
+    constexpr uint32_t VALUES_PER_BYTE() const { return (IS_FP8() ? 1 : 2); }
     // Size of each C element *after column-packing*.
     constexpr uint32_t OUT_ELEM_SIZE() const {
         // C FP4/FP6 elem-packing is along the M dimension, not N
@@ -36,7 +43,7 @@ struct GemmConfig {
         // packing of N-dimension is already reflected in OUT_ELEM_SIZE()
         return TILE_N;
     }
-    constexpr bool USE_LUT() const { return FP4FP6; }
+    constexpr bool USE_LUT() const { return DATATYPE == GemmDatatype::FP6; }
 };
 
 // Gemmini constants -----------------------------------------------------------
@@ -79,9 +86,10 @@ static inline void configure_mxgemmini(const uint32_t dim_m,
 
     gemmini_flush(0);
 
-    // TODO: FP4
     constexpr auto GEMMINI_FORMAT =
-        C.FP4FP6 ? GEMMINI_FORMAT_FP6 : GEMMINI_FORMAT_FP8;
+        C.DATATYPE == GemmDatatype::FP8 ? GEMMINI_FORMAT_FP8 :
+        C.DATATYPE == GemmDatatype::FP6 ? GEMMINI_FORMAT_FP6 :
+                                          GEMMINI_FORMAT_FP4;
     constexpr auto GEMMINI_FORMAT_OUT =
         C.QUANT_OUTPUT ? GEMMINI_FORMAT : GEMMINI_FORMAT_FULL;
 

@@ -12,7 +12,7 @@ constexpr GemmConfig C{
     .TILE_M = 64,
     .TILE_N = 64,
     .TILE_K = 64,
-    .FP4FP6 = false,
+    .DATATYPE = GemmDatatype::FP8,
     .QUANT_OUTPUT = true,
 };
 
