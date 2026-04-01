@@ -25,7 +25,7 @@ void requant_entry(void *arg, uint32_t tid_in_threadblock,
     // Gemmini
     // NOTE: this also configures the datatype for requantizer
     mxgemm_single_output_tile<C>(C.TILE_M, C.TILE_N, C.TILE_K,
-                                 tid_in_threadblock);
+                                 tid_in_threadblock, threads_per_threadblock);
 
     const auto tid_in_warp = tid_in_threadblock % MU_NUM_THREADS;
     const auto warp_id = tid_in_threadblock / MU_NUM_THREADS;

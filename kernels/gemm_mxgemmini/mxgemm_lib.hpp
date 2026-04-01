@@ -547,11 +547,15 @@ static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_
 
 /** Do matmul on a single TILE_M * TILE_N output tile, accumulating over the
  *  full GEMM_K. */
-template <GemmConfig C>
+template <GemmConfig C, bool barrier_tile = false>
 void mxgemm_single_output_tile(const uint32_t dim_m, const uint32_t dim_n,
                                const uint32_t dim_k,
-                               const uint32_t tid_in_threadblock) {
+                               const uint32_t tid_in_threadblock,
+                               const uint32_t threads_per_threadblock) {
     asm volatile ("mxgemm_single_output_tile_start_%=:" :: );
+
+    constexpr auto barrier_id = 2;
+    const auto warps_per_threadblock = threads_per_threadblock / MU_NUM_THREADS;
 
     if (tid_in_threadblock != 0) {
         return;
@@ -587,6 +591,10 @@ void mxgemm_single_output_tile(const uint32_t dim_m, const uint32_t dim_n,
 
     // wait for GMEM->SMEM copy
     gemmini_fence();
+
+    if constexpr (barrier_tile) {
+        mu_barrier(barrier_id, warps_per_threadblock);
+    }
 
     // ------------------------------
     // Main software-pipelined K-loop
@@ -650,6 +658,10 @@ void mxgemm_single_output_tile(const uint32_t dim_m, const uint32_t dim_n,
         }
 
         gemmini_fence();
+
+        if constexpr (barrier_tile) {
+            mu_barrier(barrier_id, warps_per_threadblock);
+        }
     }
 
     gemmini_fence();
@@ -665,7 +677,8 @@ static void
 mxgemm(const uint32_t dim_m, const uint32_t dim_n, const uint32_t dim_k,
        uint8_t *C_gmem, const uint32_t tid_in_threadblock,
        const uint32_t threads_per_threadblock, const uint32_t threadblock_id) {
-    mxgemm_single_output_tile<C>(dim_m, dim_n, dim_k, tid_in_threadblock);
+    mxgemm_single_output_tile<C>(dim_m, dim_n, dim_k, tid_in_threadblock,
+                                 threads_per_threadblock);
 
     const auto warps_per_threadblock = threads_per_threadblock / MU_NUM_THREADS;
     mu_barrier(1, warps_per_threadblock);
