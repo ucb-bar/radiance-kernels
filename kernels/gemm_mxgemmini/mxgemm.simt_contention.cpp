@@ -38,27 +38,27 @@ void mxgemm_simt_entry(void *arg, uint32_t tid_in_threadblock,
         const auto tid_in_warpgroup = tid_in_threadblock % MU_NUM_THREADS;
         mxgemm<C>(C.TILE_M, C.TILE_N, 256, C_gmem, tid_in_warpgroup,
                   threads_in_warpgroup, threadblock_id);
-    } else if (1 <= warp_id && warp_id < 1 + num_worker_warps) {
-        const auto threads_in_warpgroup = MU_NUM_THREADS * num_worker_warps;
-        const auto warp_id_in_warpgroup = warp_id - 1;
+    } else if (warp_id == 1) {
         const auto tid_in_warp = tid_in_threadblock % MU_NUM_THREADS;
 
         // read dummy data from SMEM->GMEM to introduce read contention
-        // warp N reads from bank N. maximize confusion across all banks for
-        // MxGemmini
+        // have warp 0 round-robin through bank 0~4
         constexpr auto SMEM_BANK_SIZE = MU_SMEM_SIZE_BYTES / 4;
-        auto dummy_smem = reinterpret_cast<const __shared uint8_t *>(
-            SMEM_BANK_SIZE * (warp_id_in_warpgroup % 4));
-        for (int i = 0; i < 4; i++) {
-            // force each warp read full C from its own bank
-            copy_smem_to_gmem_simt<C.TILE_M_QUANT(), C.TILE_N_QUANT(),
-                                   C.OUT_ELEM_SIZE()>(
-                dummy_smem, dummy_gmem, tid_in_warp, MU_NUM_THREADS);
+#pragma unroll 32
+        for (int i = 0; i < 1024 * 32 /*arbitrary*/; i++) {
+            auto dummy_smem_base =
+                reinterpret_cast<const volatile __shared uint8_t *>(
+                    SMEM_BANK_SIZE * (i % 4));
+            auto dummy_smem_addr =
+                reinterpret_cast<const volatile __shared uint32_t *>(
+                    dummy_smem_base) +
+                tid_in_warp;
+            auto dummy = *dummy_smem_addr;
         }
     }
 }
 
 int main() {
-    mu_schedule(mxgemm_simt_entry, nullptr, 3);
+    mu_schedule(mxgemm_simt_entry, nullptr, 1);
     return 0;
 }
