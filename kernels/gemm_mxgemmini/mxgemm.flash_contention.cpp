@@ -8,7 +8,7 @@ static const uint8_t B_lut[64][16] = {0};
 static const uint8_t C_lut[64][16] = {0};
 #include "mxgemm_lib.hpp"
 
-constexpr uint32_t CORE_WARP_OCCUPANCY = 3;
+constexpr uint32_t CORE_WARP_OCCUPANCY = 2;
 
 constexpr GemmConfig C{
     .TILE_M = 64,
@@ -24,8 +24,6 @@ void flash_contention_entry(void *arg, uint32_t tid_in_threadblock,
     const auto warps_per_threadblock = threads_per_threadblock / MU_NUM_THREADS;
     const auto warp_id = tid_in_threadblock / MU_NUM_THREADS;
     const auto tid_in_warp = tid_in_threadblock % MU_NUM_THREADS;
-    // constexpr uint32_t num_worker_warps = 4;
-    // static_assert(num_worker_warps <= (CORE_WARP_OCCUPANCY * MU_NUM_CORES - 1));
 
     auto C_gmem = reinterpret_cast<uint8_t *>(0x40000000);
     auto dummy_gmem = reinterpret_cast<uint8_t *>(0x60000000);
@@ -44,7 +42,7 @@ void flash_contention_entry(void *arg, uint32_t tid_in_threadblock,
                                C.OUT_ELEM_SIZE()>(
             C_smem, C_gmem, tid_in_warp,
             MU_NUM_THREADS /* single-warp moveout */);
-    } else if (warp_id == 1) {
+    } else {
         // barrier after first tile move-in
         // FIXME: unify barrier-id with mxgemm
         constexpr auto barrier_id = 2;
@@ -62,25 +60,27 @@ void flash_contention_entry(void *arg, uint32_t tid_in_threadblock,
             constexpr auto SMEM_BANK_SIZE = MU_SMEM_SIZE_BYTES / 4;
             // A: bank 1->0->1->0->...
             // B: bank 2->3->2->3->...
-            const auto A_smem_base =
-                reinterpret_cast<const volatile __shared uint8_t *>(
+            auto A_smem_base =
+                reinterpret_cast<volatile __shared uint8_t *>(
                     SMEM_BANK_SIZE * even_k);
-            const auto B_smem_base =
-                reinterpret_cast<const volatile __shared uint8_t *>(
+            auto B_smem_base =
+                reinterpret_cast<volatile __shared uint8_t *>(
                     MU_SMEM_SIZE_BYTES - SMEM_BANK_SIZE * (even_k + 1));
 
 #pragma unroll 32
-            for (int i = 0; i < 1024 /*arbitrary*/; i++) {
+            for (int i = 0; i < 128 /*arbitrary*/; i++) {
                 auto A_smem_addr =
-                    reinterpret_cast<const volatile __shared uint32_t *>(
+                    reinterpret_cast<volatile __shared uint32_t *>(
                         A_smem_base) +
                     tid_in_warp;
                 auto B_smem_addr =
-                    reinterpret_cast<const volatile __shared uint32_t *>(
+                    reinterpret_cast<volatile __shared uint32_t *>(
                         B_smem_base) +
                     tid_in_warp;
                 auto A_dummy = *A_smem_addr;
                 auto B_dummy = *B_smem_addr;
+                *A_smem_addr = A_dummy;
+                *B_smem_addr = B_dummy;
             }
 
             mu_barrier(barrier_id, warps_per_threadblock);
@@ -91,6 +91,6 @@ void flash_contention_entry(void *arg, uint32_t tid_in_threadblock,
 }
 
 int main() {
-    mu_schedule(flash_contention_entry, nullptr, 1);
+    mu_schedule(flash_contention_entry, nullptr, CORE_WARP_OCCUPANCY);
     return 0;
 }

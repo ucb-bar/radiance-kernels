@@ -8,8 +8,6 @@ static const uint8_t B_lut[64][16] = {0};
 static const uint8_t C_lut[64][16] = {0};
 #include "mxgemm_lib.hpp"
 
-constexpr uint32_t CORE_WARP_OCCUPANCY = 3;
-
 constexpr GemmConfig C{
     .TILE_M = 64,
     .TILE_N = 64,
@@ -31,8 +29,6 @@ void simt_contention_entry(void *arg, uint32_t tid_in_threadblock,
     // to introduce synthetic contention on SMEM banks across Gemmini<->SIMT.
 
     const auto warp_id = tid_in_threadblock / MU_NUM_THREADS;
-    constexpr uint32_t num_worker_warps = 4;
-    static_assert(num_worker_warps <= (CORE_WARP_OCCUPANCY * MU_NUM_CORES - 1));
 
     if (warp_id == 0) {
         const auto threads_in_warpgroup = MU_NUM_THREADS * 1;
