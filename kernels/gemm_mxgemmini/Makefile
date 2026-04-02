@@ -22,6 +22,7 @@ MU_SRCS = mxgemm.cpp mxgemm_singletile.cpp \
 	  mxgemm.fp4.singletile.tm128tn128tk512.fullout.cpp \
 	  mxgemm.fp4.m128n128k1024.tm128tn128tk512.fullout.cpp \
 	  mxgemm.fp4.singletile.tm128tn128tk512.requant.cpp \
+	  mxgemm.flash_contention.cpp \
 	  mxgemm.simt_contention.cpp \
 	  mxgemm_smol.cpp \
 	  requant.cpp
