@@ -26,7 +26,8 @@ void flash_contention_entry(void *arg, uint32_t tid_in_threadblock,
     const auto tid_in_warp = tid_in_threadblock % MU_NUM_THREADS;
 
     auto C_gmem = reinterpret_cast<uint8_t *>(0x40000000);
-    auto dummy_gmem = reinterpret_cast<uint8_t *>(0x60000000);
+    auto A_gmem = reinterpret_cast<uint8_t *>(0x60000000);
+    auto B_gmem = reinterpret_cast<uint8_t *>(0x61000000);
 
     const auto dim_m = C.TILE_M;
     const auto dim_n = C.TILE_N;
@@ -77,10 +78,14 @@ void flash_contention_entry(void *arg, uint32_t tid_in_threadblock,
                     reinterpret_cast<volatile __shared uint32_t *>(
                         B_smem_base) +
                     tid_in_warp;
+                auto A_gmem_addr =
+                    reinterpret_cast<volatile uint32_t *>(A_gmem) + tid_in_warp;
+                auto B_gmem_addr =
+                    reinterpret_cast<volatile uint32_t *>(B_gmem) + tid_in_warp;
                 auto A_dummy = *A_smem_addr;
                 auto B_dummy = *B_smem_addr;
-                *A_smem_addr = A_dummy;
-                *B_smem_addr = B_dummy;
+                // *A_gmem_addr = A_dummy;
+                // *B_gmem_addr = B_dummy;
             }
 
             mu_barrier(barrier_id, warps_per_threadblock);
