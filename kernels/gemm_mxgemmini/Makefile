@@ -1,6 +1,7 @@
 PROJECT = mxgemm
 
 MU_SRCS = mxgemm.cpp mxgemm_singletile.cpp \
+	  mxgemm.fp8.singletile.tm128tn128tk128.requant.cpp \
 	  mxgemm.fp8.singletile.tm128tn128tk256.fullout.cpp \
 	  mxgemm.fp8.singletile.tm128tn128tk256.requant.cpp \
 	  mxgemm.fp8.singletile.tm64tn64tk64.fullout.cpp \
