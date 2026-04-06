@@ -613,6 +613,7 @@ void mxgemm_single_output_tile(const uint32_t dim_m, const uint32_t dim_n,
     for (; (tile_k * C.TILE_K) < dim_k; tile_k++) {
         const auto odd_k = (tile_k & 1);
         const auto odd_next_k = !odd_k;
+        const auto last_k = ((tile_k + 1) * C.TILE_K) >= dim_k;
 
         // configure scalefac->PE double-buffer read; inst: 0x3420b07b
         // done for (tile_k) compute; we do this before (tile_k + 1) DMA,
@@ -629,14 +630,14 @@ void mxgemm_single_output_tile(const uint32_t dim_m, const uint32_t dim_n,
         // GMEM->SMEM DMA for the next tile_k
         // TODO: This results in an unnecessary move-in at the last K tile
         if constexpr (!DISABLE_MOVE_IN_AFTER_FIRST_K) {
-            // gemmini_fence_ready();
-            copy_gmem_to_smem_async<C>(dim_m, dim_n, dim_k, 0 /*FIXME*/,
-                                       0 /*FIXME*/, tile_k + 1);
+            if (!last_k) {
+                copy_gmem_to_smem_async<C>(dim_m, dim_n, dim_k, 0 /*FIXME*/,
+                                           0 /*FIXME*/, tile_k + 1);
+            }
         }
 
         // asynchrously kick off matmul for this tile_k
         // gemmini_fence_ready();
-        const auto last_k = ((tile_k + 1) * C.TILE_K) >= dim_k;
         matmul_tile_async<C>(tile_k, last_k);
 
         // update scale factors for the next tile_k
