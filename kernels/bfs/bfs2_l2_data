@@ -1,0 +1,34 @@
+__global uint32_t graph_starting_raw[] = {
+    0x00000000,0x00000002,0x00000004,0x00000006,0x00000006,0x00000006,0x00000006,
+};
+
+__global uint32_t graph_no_of_edges_raw[] = {
+    0x00000002,0x00000002,0x00000002,0x00000000,0x00000000,0x00000000,0x00000000,
+};
+
+__global uint32_t graph_edges_raw[] = {
+    0x00000001,0x00000002,0x00000003,0x00000004,0x00000005,0x00000006,
+};
+
+__global uint32_t graph_mask_raw[] = {
+    0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,
+};
+
+__global uint32_t updating_graph_mask_raw[] = {
+    0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,
+};
+
+__global uint32_t graph_visited_raw[] = {
+    0x00000001,0x00000001,0x00000001,0x00000001,0x00000001,0x00000001,0x00000001,
+};
+
+__global uint32_t cost_raw[] = {
+    0x00000000,0x00000001,0x00000001,0x00000002,0x00000002,0x00000002,0x00000002,
+};
+
+__global uint32_t over_raw[] = {
+    0x00000000,
+};
+
+const uint32_t no_of_nodes_val = 7;
+const uint32_t edge_list_size_val = 6;

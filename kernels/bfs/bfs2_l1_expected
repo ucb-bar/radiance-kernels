@@ -1,0 +1,15 @@
+const uint32_t expected_graph_mask_raw[] = {
+    0x00000000,0x00000000,0x00000000,0x00000001,0x00000001,0x00000001,0x00000001,
+};
+
+const uint32_t expected_updating_graph_mask_raw[] = {
+    0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,
+};
+
+const uint32_t expected_graph_visited_raw[] = {
+    0x00000001,0x00000001,0x00000001,0x00000001,0x00000001,0x00000001,0x00000001,
+};
+
+const uint32_t expected_over_raw[] = {
+    0x00000001,
+};

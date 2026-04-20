@@ -1,0 +1,11 @@
+const uint32_t expected_graph_mask_raw[] = {
+    0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,
+};
+
+const uint32_t expected_updating_graph_mask_raw[] = {
+    0x00000000,0x00000001,0x00000001,0x00000000,0x00000000,0x00000000,0x00000000,
+};
+
+const uint32_t expected_cost_raw[] = {
+    0x00000000,0x00000001,0x00000001,0xffffffff,0xffffffff,0xffffffff,0xffffffff,
+};
