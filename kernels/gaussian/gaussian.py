@@ -104,10 +104,11 @@ const uint32_t expected_b_raw[] = {{
     path.write_text(text)
 
 
-def emit_wrapper(path: Path, include_name: str, kernel_include: str) -> None:
+def emit_wrapper(path: Path, include_name: str, phase_macro: str) -> None:
     path.write_text(
         f'#define GAUSSIAN_DATA_HEADER "{include_name}"\n'
-        f'#include "{kernel_include}"\n'
+        f"#define {phase_macro}\n"
+        f'#include "kernel_impl.hpp"\n'
     )
 
 
@@ -156,7 +157,7 @@ def main() -> None:
     for t in range(SIZE - 1):
         fan1_stem = f"fan1_t{t}"
         emit_data(Path(f"{fan1_stem}_data"), a, b, m, t)
-        emit_wrapper(Path(f"{fan1_stem}.cpp"), f"{fan1_stem}_data", "fan1_kernel.inc")
+        emit_wrapper(Path(f"{fan1_stem}.cpp"), f"{fan1_stem}_data", "GAUSSIAN_FAN1")
 
         m_after_fan1 = copy_matrix(m)
         fan1_step(a, m_after_fan1, t)
@@ -165,7 +166,7 @@ def main() -> None:
 
         fan2_stem = f"fan2_t{t}"
         emit_data(Path(f"{fan2_stem}_data"), a, b, m, t)
-        emit_wrapper(Path(f"{fan2_stem}.cpp"), f"{fan2_stem}_data", "fan2_kernel.inc")
+        emit_wrapper(Path(f"{fan2_stem}.cpp"), f"{fan2_stem}_data", "GAUSSIAN_FAN2")
 
         a_after_fan2 = copy_matrix(a)
         b_after_fan2 = b[:]

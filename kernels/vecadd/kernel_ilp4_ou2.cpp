@@ -1,4 +1,4 @@
 #define VECADD_ILP 4
 #define VECADD_OUTER_UNROLL 2
 #define VECADD_NUM_WARPS 4
-#include "kernel_common.inc"
+#include "kernel_impl.hpp"

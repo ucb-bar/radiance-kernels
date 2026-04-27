@@ -78,10 +78,11 @@ def emit_expected(path: Path, arrays: dict[str, list[int]]) -> None:
     path.write_text("\n".join(lines))
 
 
-def emit_wrapper(path: Path, include_name: str, kernel_include: str) -> None:
+def emit_wrapper(path: Path, include_name: str, phase_macro: str) -> None:
     path.write_text(
         f'#define BFS_DATA_HEADER "{include_name}"\n'
-        f'#include "{kernel_include}"\n'
+        f"#define {phase_macro}\n"
+        f'#include "kernel_impl.hpp"\n'
     )
 
 
@@ -179,7 +180,7 @@ def main() -> None:
             cost,
             over,
         )
-        emit_wrapper(Path(f"{bfs1_stem}.cpp"), f"{bfs1_stem}_data", "bfs1_kernel.inc")
+        emit_wrapper(Path(f"{bfs1_stem}.cpp"), f"{bfs1_stem}_data", "BFS_KERNEL_BFS1")
 
         graph_mask_after_bfs1 = clone_state(graph_mask)
         updating_after_bfs1 = clone_state(updating_graph_mask)
@@ -221,7 +222,7 @@ def main() -> None:
             cost,
             over_before_bfs2,
         )
-        emit_wrapper(Path(f"{bfs2_stem}.cpp"), f"{bfs2_stem}_data", "bfs2_kernel.inc")
+        emit_wrapper(Path(f"{bfs2_stem}.cpp"), f"{bfs2_stem}_data", "BFS_KERNEL_BFS2")
 
         graph_mask_after_bfs2 = clone_state(graph_mask)
         updating_after_bfs2 = clone_state(updating_graph_mask)

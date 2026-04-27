@@ -11,9 +11,19 @@ MU_SRCS = \
 	kernel_ilp4_w8.cpp
 HOST_SRCS = host.cpp
 
+ifneq ($(strip $(OCCUPANCIES)),)
+define add_warp_variant
+MU_VARIANTS += kernel_w$(1)
+kernel_w$(1).mu.o: kernel.cpp data kernel_impl.hpp
+kernel_w$(1).mu.o: MU_CFLAGS += -DVECADD_NUM_WARPS=$(1)
+endef
+
+$(foreach w,$(OCCUPANCIES),$(eval $(call add_warp_variant,$(w))))
+endif
+
 include ../common.mk
 
-data: vecadd.py kernel_common.inc extract_rtl_metrics.py
+data: vecadd.py extract_rtl_metrics.py
 	python3 vecadd.py
 
-$(addsuffix .mu.o,$(basename $(MU_SRCS))): data
+$(addsuffix .mu.o,$(basename $(MU_SRCS))): data kernel_impl.hpp

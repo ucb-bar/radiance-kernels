@@ -6,7 +6,7 @@ import struct
 from pathlib import Path
 
 
-N = int(os.environ.get("VECADD_N", "65536"))
+N = int(os.environ.get("VECADD_N", "8192"))
 SEED = 0
 
 

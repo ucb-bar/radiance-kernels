@@ -1,2 +1,3 @@
 #define BFS_DATA_HEADER "bfs1_l2_data"
-#include "bfs1_kernel.inc"
+#define BFS_KERNEL_BFS1
+#include "kernel_impl.hpp"

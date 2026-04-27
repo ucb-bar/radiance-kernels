@@ -58,11 +58,13 @@ PROJECT ?= kernel
 # MU_SRCS are entrypoint sources that provide main()
 # MU_SRC_DEPS are optional shared/common sources linked into every radiance target
 ifneq ($(strip $(MU_SRCS)),)
-RADIANCE_TARGETS := $(addsuffix .radiance.elf,$(basename $(MU_SRCS)))
+BASE_RADIANCE_TARGETS := $(addsuffix .radiance.elf,$(basename $(MU_SRCS)))
 else
-RADIANCE_TARGETS := $(addsuffix .radiance.elf,$(PROJECT))
+BASE_RADIANCE_TARGETS := $(addsuffix .radiance.elf,$(PROJECT))
 endif
 
+VARIANT_RADIANCE_TARGETS := $(addsuffix .radiance.elf,$(MU_VARIANTS))
+RADIANCE_TARGETS := $(BASE_RADIANCE_TARGETS) $(VARIANT_RADIANCE_TARGETS)
 BINARIES := $(RADIANCE_TARGETS)
 OBJDUMPS := $(patsubst %.elf,%.dump,$(RADIANCE_TARGETS))
 MU_LIB_OBJS := $(sort $(addsuffix .mu.o,$(basename $(MU_SRC_DEPS))))
@@ -90,6 +92,13 @@ MU_BIN_OBJS ?=
 
 %.mu.o: %.cpp
 	$(MU_CXX) $(MU_CFLAGS) -c $< -o $@
+
+ifneq ($(strip $(MU_VARIANTS)),)
+VARIANT_MU_OBJS := $(addsuffix .mu.o,$(MU_VARIANTS))
+
+$(VARIANT_MU_OBJS):
+	$(MU_CXX) $(MU_CFLAGS) -c $(firstword $(filter %.cpp,$^)) -o $@
+endif
 
 %.ll: %.cpp
 	$(MU_CXX) $(MU_CFLAGS) -S -emit-llvm $< -o $@

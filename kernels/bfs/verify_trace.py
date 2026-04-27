@@ -112,8 +112,9 @@ def bits_to_i32(bits: int) -> int:
 def main() -> int:
     args = parse_args()
     stem = args.elf.name.replace(".radiance.elf", "")
-    data_path = args.data or Path(f"{stem}_data")
-    expected_path = args.expected or Path(f"{stem}_expected")
+    data_stem = re.sub(r"_w(?:1|2|4|8)$", "", stem)
+    data_path = args.data or Path(f"{data_stem}_data")
+    expected_path = args.expected or Path(f"{data_stem}_expected")
 
     if not args.trace_db.exists():
         raise SystemExit(f"trace db not found: {args.trace_db}")
