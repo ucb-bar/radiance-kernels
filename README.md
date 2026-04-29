@@ -73,6 +73,61 @@ See
 [RadianceConfigs.scala](https://github.com/ucb-bar/radiance/blob/main/chipyard/RadianceConfigs.scala)
 for the full list of configs.
 
+## Kernel Optimization Guide
+
+When optimizing Muon SIMT kernels, start by shaping the work so that each warp
+owns a naturally contiguous slice of the problem. A common pattern is
+warp-strided indexing: lane `l` in a warp handles element `base + l`, and
+subsequent unrolled iterations advance by `MU_NUM_THREADS` rather than by `1`.
+This keeps loads and stores contiguous across lanes and matches the memory
+access style used in kernels such as `softmax` and `gemm_mxgemmini`.
+
+For simple bandwidth-oriented kernels, avoid extra per-lane validity branches
+in the hot loop when the problem shape allows it. If the input size is chosen
+to be a clean multiple of the warp-owned chunk size, removing those branches
+usually gives cleaner code generation and avoids paying repeated SIMT control
+overhead.
+
+Use two levels of unrolling deliberately:
+
+* Inner-loop ILP unrolling increases the number of independent loads, ALU ops,
+  and stores in flight within one loop body.
+* Outer-loop unrolling amortizes loop branch overhead across multiple chunks,
+  at the cost of larger code size and more instruction-cache pressure.
+
+Simple unrolling is often not enough. If every unrolled iteration reuses the
+same registers, the core can stall heavily on WAR and WAW hazards. The better
+pattern is to give different unrolled lanes independent temporaries and arrange
+the loop body more like software pipelining: issue a chunk of `lw.global`
+operations back-to-back, then the arithmetic, then `sw.global` operations. In
+practice, this tends to expose more memory-level parallelism and reduce short
+dependency chains.
+
+Inspect the generated `*.radiance.dump` before going straight to RTL. For a
+kernel like `vecadd`, a good hot loop usually looks like:
+
+* a dense block of back-to-back `lw.global`
+* then the arithmetic block such as `fadd.s`
+* then the `sw.global` block
+* then one loop branch for the whole chunk
+
+If the dump still shows many extra branches, scalarized address updates, or
+interleaved use/def chains that defeat ILP, fix the source structure first.
+
+Once the assembly looks reasonable, move to RTL and use the VCS log counters to
+guide the next step. In particular:
+
+* high WAR/WAW stalls usually mean the unrolled body still has too much
+  register reuse or too little independence
+* high scoreboard stalls usually mean short dependency chains are dominating
+* high LSU stalls usually mean the kernel has become memory-bound and more ILP
+  alone may not help much
+* higher ILP can reduce total cycles even when reported IPC goes down, because
+  the unrolled kernel may retire fewer dynamic instructions for the same work
+
+Use a large enough problem size to amortize cold I-cache and startup effects
+before drawing conclusions from performance counters. Small kernels can look
+artificially bad because fixed overheads dominate the trace.
 
 ## Kernel Writing Pitfalls
 
