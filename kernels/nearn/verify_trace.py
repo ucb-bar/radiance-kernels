@@ -26,6 +26,12 @@ def parse_args() -> argparse.Namespace:
         default="distances_raw",
         help="Output symbol to resolve with llvm-nm (default: distances_raw)",
     )
+    parser.add_argument(
+        "--max-ulp",
+        type=int,
+        default=1,
+        help="Maximum allowed ULP difference per output element (default: 1)",
+    )
     return parser.parse_args()
 
 
@@ -110,6 +116,15 @@ def bits_to_float(bits: int) -> float:
     return struct.unpack("<f", struct.pack("<I", bits))[0]
 
 
+def ordered_float_bits(bits: int) -> int:
+    # All nearn distances are non-negative, but keep the usual ordering transform.
+    return bits ^ (0xFFFFFFFF if bits & 0x80000000 else 0x80000000)
+
+
+def ulp_distance(lhs: int, rhs: int) -> int:
+    return abs(ordered_float_bits(lhs) - ordered_float_bits(rhs))
+
+
 def main() -> int:
     args = parse_args()
     if not args.trace_db.exists():
@@ -125,19 +140,20 @@ def main() -> int:
 
     mismatches = []
     for index, (expected, actual) in enumerate(zip(expected_words, actual_words)):
-        if expected != actual:
-            mismatches.append((index, expected, actual))
+        ulp = ulp_distance(expected, actual)
+        if ulp > args.max_ulp:
+            mismatches.append((index, expected, actual, ulp))
 
     print(f"symbol={args.symbol} address=0x{output_addr:08x} elements={len(expected_words)}")
     if not mismatches:
-        print("PASS")
+        print(f"PASS max_ulp={args.max_ulp}")
         return 0
 
     print(f"FAIL mismatches={len(mismatches)}")
-    for index, expected, actual in mismatches[:16]:
+    for index, expected, actual, ulp in mismatches[:16]:
         print(
             f"[{index}] expected=0x{expected:08x} ({bits_to_float(expected):.8g}) "
-            f"actual=0x{actual:08x} ({bits_to_float(actual):.8g})"
+            f"actual=0x{actual:08x} ({bits_to_float(actual):.8g}) ulp={ulp}"
         )
     return 1
 

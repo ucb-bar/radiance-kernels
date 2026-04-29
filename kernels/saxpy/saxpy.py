@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 
+import os
 import random
 import struct
 from pathlib import Path
 from string import Template
 
 
-N = 256
+N = int(os.environ.get("SAXPY_N", "4096"))
 SEED = 0
 
 

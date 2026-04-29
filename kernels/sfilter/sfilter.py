@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 
+import os
 import random
 import struct
 from pathlib import Path
 from string import Template
 
 
-SIZE = 16
+SIZE = int(os.environ.get("SFILTER_SIZE", "48"))
 SEED = 0
 MASK = [1.0] * 9
 

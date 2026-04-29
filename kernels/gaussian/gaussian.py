@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 
 import ctypes
+import os
 import random
 import struct
 from pathlib import Path
 
 
-SIZE = 5
+SIZE = int(os.environ.get("GAUSSIAN_SIZE", "128"))
+TIMESTEPS = tuple(int(t) for t in os.environ.get("GAUSSIAN_TIMESTEPS", "0 1 2 3").split())
 SEED = 0
 
 
@@ -154,24 +156,32 @@ def main() -> None:
     b = [f32(rng.uniform(-2.0, 2.0)) for _ in range(SIZE)]
     m = [[f32(0.0) for _ in range(SIZE)] for _ in range(SIZE)]
 
-    for t in range(SIZE - 1):
+    max_timestep = max(TIMESTEPS, default=-1)
+    if max_timestep >= SIZE - 1:
+        raise ValueError("GAUSSIAN_TIMESTEPS must be less than GAUSSIAN_SIZE - 1")
+
+    for t in range(max_timestep + 1):
         fan1_stem = f"fan1_t{t}"
-        emit_data(Path(f"{fan1_stem}_data"), a, b, m, t)
-        emit_wrapper(Path(f"{fan1_stem}.cpp"), f"{fan1_stem}_data", "GAUSSIAN_FAN1")
+        if t in TIMESTEPS:
+            emit_data(Path(f"{fan1_stem}_data"), a, b, m, t)
+            emit_wrapper(Path(f"{fan1_stem}.cpp"), f"{fan1_stem}_data", "GAUSSIAN_FAN1")
 
         m_after_fan1 = copy_matrix(m)
         fan1_step(a, m_after_fan1, t)
-        emit_expected_fan1(Path(f"{fan1_stem}_expected"), m_after_fan1, t)
+        if t in TIMESTEPS:
+            emit_expected_fan1(Path(f"{fan1_stem}_expected"), m_after_fan1, t)
         m = m_after_fan1
 
         fan2_stem = f"fan2_t{t}"
-        emit_data(Path(f"{fan2_stem}_data"), a, b, m, t)
-        emit_wrapper(Path(f"{fan2_stem}.cpp"), f"{fan2_stem}_data", "GAUSSIAN_FAN2")
+        if t in TIMESTEPS:
+            emit_data(Path(f"{fan2_stem}_data"), a, b, m, t)
+            emit_wrapper(Path(f"{fan2_stem}.cpp"), f"{fan2_stem}_data", "GAUSSIAN_FAN2")
 
         a_after_fan2 = copy_matrix(a)
         b_after_fan2 = b[:]
         fan2_step(a_after_fan2, b_after_fan2, m, t)
-        emit_expected_fan2(Path(f"{fan2_stem}_expected"), a_after_fan2, b_after_fan2, t)
+        if t in TIMESTEPS:
+            emit_expected_fan2(Path(f"{fan2_stem}_expected"), a_after_fan2, b_after_fan2, t)
         a = a_after_fan2
         b = b_after_fan2
 

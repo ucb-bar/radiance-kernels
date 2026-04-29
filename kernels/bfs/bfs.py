@@ -1,18 +1,36 @@
 #!/usr/bin/env python3
 
+import os
 from pathlib import Path
 
 
-NO_OF_NODES = 7
-ADJACENCY = [
-    [1, 2],
-    [3, 4],
-    [5, 6],
-    [],
-    [],
-    [],
-    [],
-]
+BFS_BRANCHING = int(os.environ.get("BFS_BRANCHING", "10"))
+BFS_DEPTH = int(os.environ.get("BFS_DEPTH", "2"))
+
+
+def build_tree_adjacency(branching: int, depth: int) -> list[list[int]]:
+    if branching <= 0:
+        raise ValueError("BFS_BRANCHING must be positive")
+    if depth < 0:
+        raise ValueError("BFS_DEPTH must be non-negative")
+
+    adjacency: list[list[int]] = [[]]
+    level = [0]
+    for _ in range(depth):
+        next_level = []
+        for node in level:
+            children = []
+            for _ in range(branching):
+                children.append(len(adjacency))
+                adjacency.append([])
+            adjacency[node] = children
+            next_level.extend(children)
+        level = next_level
+    return adjacency
+
+
+ADJACENCY = build_tree_adjacency(BFS_BRANCHING, BFS_DEPTH)
+NO_OF_NODES = len(ADJACENCY)
 
 
 def to_u32(value: int) -> int:
@@ -160,9 +178,9 @@ def main() -> None:
     remove_old_generated()
 
     graph_starting, graph_no_of_edges, graph_edges = build_graph()
-    graph_mask = [1, 0, 0, 0, 0, 0, 0]
+    graph_mask = [1] + [0] * (NO_OF_NODES - 1)
     updating_graph_mask = [0] * NO_OF_NODES
-    graph_visited = [1, 0, 0, 0, 0, 0, 0]
+    graph_visited = [1] + [0] * (NO_OF_NODES - 1)
     cost = [0] + [0xFFFFFFFF] * (NO_OF_NODES - 1)
     over = [0]
 

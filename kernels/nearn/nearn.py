@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
 import ctypes
+import os
 import random
 import struct
 from pathlib import Path
 from string import Template
 
 
-NUM_RECORDS = 256
+NUM_RECORDS = int(os.environ.get("NEARN_NUM_RECORDS", "4096"))
 SEED = 0
 
 LIBM = ctypes.CDLL("libm.so.6")
