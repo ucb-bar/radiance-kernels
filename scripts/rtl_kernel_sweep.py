@@ -20,6 +20,7 @@ from typing import Iterable
 DEFAULT_CONFIG = "RadianceSingleClusterConfig"
 DEFAULT_KERNELS = ("vecadd", "saxpy", "sfilter", "nearn", "gaussian", "bfs")
 DEFAULT_OCCUPANCIES = (1, 2, 4, 8)
+DEFAULT_ILPS = (1, 2, 4, 8)
 TERMINAL_STATUSES = {"done", "failed"}
 
 REPORT_RE = re.compile(
@@ -54,10 +55,10 @@ CSV_FIELDS = (
     "core",
     "instructions",
     "cycles",
-    "decoded_cycles",
-    "dispatched_cycles",
-    "eligible_cycles",
-    "issued_cycles",
+    "decoded_cycle_pct",
+    "dispatched_cycle_pct",
+    "eligible_cycle_pct",
+    "issued_cycle_pct",
     "decoded_warp_occ",
     "dispatched_warp_occ",
     "eligible_warp_occ",
@@ -71,6 +72,9 @@ CSV_FIELDS = (
     "tag",
     "binary",
     "log",
+    "trace_db",
+    "verify_status",
+    "verify_stdout",
     "error",
 )
 
@@ -117,8 +121,13 @@ def strip_soc_elf(path: Path) -> str:
     return name[: -len(suffix)]
 
 
-def discover_targets(kernels: Iterable[str], occupancies: Iterable[int]) -> list[Target]:
+def discover_targets(
+    kernels: Iterable[str],
+    occupancies: Iterable[int],
+    ilps: Iterable[int] | None = None,
+) -> list[Target]:
     occs = tuple(int(occ) for occ in occupancies)
+    ilp_values = None if ilps is None else tuple(int(ilp) for ilp in ilps)
     targets: list[Target] = []
     for kernel in kernels:
         kdir = repo_root() / "kernels" / kernel
@@ -126,7 +135,11 @@ def discover_targets(kernels: Iterable[str], occupancies: Iterable[int]) -> list
             raise SystemExit(f"unknown kernel directory: {kdir}")
 
         for occ in occs:
-            if kernel in {"vecadd", "saxpy", "sfilter", "nearn"}:
+            if ilp_values is not None and kernel in {"saxpy", "nearn", "gemm_simt", "softmax"}:
+                paths = [kdir / f"kernel_ilp{ilp}_w{occ}.soc.elf" for ilp in ilp_values]
+            elif ilp_values is not None:
+                raise SystemExit(f"--ilps is only supported for saxpy/nearn/gemm_simt/softmax, not {kernel}")
+            elif kernel in {"vecadd", "saxpy", "sfilter", "nearn"}:
                 paths = [kdir / f"kernel_w{occ}.soc.elf"]
             elif kernel == "gaussian":
                 paths = sorted(kdir.glob(f"fan[12]_t*_w{occ}.soc.elf"))
@@ -271,6 +284,49 @@ def resolve_log(job: Job) -> Path:
     return matches[-1]
 
 
+def resolve_trace_db(job: Job) -> Path:
+    binary_stem = job.binary.name[: -len(".elf")]
+    pattern = f"{binary_stem}.{job.tag}.sqlite"
+    matches: list[Path] = []
+    for directory in output_dirs(job.config):
+        matches.extend(sorted(directory.rglob(pattern)))
+    if not matches:
+        raise FileNotFoundError(f"no SQLite trace matched {pattern}")
+    return matches[-1]
+
+
+def radiance_elf_for(job: Job) -> Path:
+    target = target_from_job(job)
+    return job.binary.with_name(f"{target.variant}.radiance.elf")
+
+
+def verify_trace(job: Job) -> tuple[str, str, str, str]:
+    target = target_from_job(job)
+    verifier = repo_root() / "kernels" / target.kernel / "verify_trace.py"
+    if not verifier.is_file():
+        raise FileNotFoundError(f"no verifier for kernel {target.kernel}: {verifier}")
+    trace_db = resolve_trace_db(job)
+    radiance_elf = radiance_elf_for(job)
+    expected = repo_root() / "kernels" / target.kernel / "expected"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(verifier),
+            str(trace_db),
+            str(radiance_elf),
+            "--expected",
+            str(expected),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    output = "\n".join(part for part in (proc.stdout.strip(), proc.stderr.strip()) if part)
+    status = "pass" if proc.returncode == 0 else "fail"
+    return status, str(trace_db), output, "" if proc.returncode == 0 else output
+
+
 def parse_reports(log: Path) -> list[dict[str, str]]:
     text = log.read_text(encoding="utf-8", errors="replace")
     matches = list(REPORT_RE.finditer(text))
@@ -280,11 +336,32 @@ def parse_reports(log: Path) -> list[dict[str, str]]:
     for core_id, match in enumerate(matches):
         row = {key: value for key, value in match.groupdict().items()}
         row["core"] = str(core_id)
+        cycles = int(row["cycles"])
+        for source, dest in (
+            ("decoded_cycles", "decoded_cycle_pct"),
+            ("dispatched_cycles", "dispatched_cycle_pct"),
+            ("eligible_cycles", "eligible_cycle_pct"),
+            ("issued_cycles", "issued_cycle_pct"),
+        ):
+            row[dest] = f"{100.0 * int(row[source]) / cycles:.2f}" if cycles else ""
+            del row[source]
         rows.append(row)
     return rows
 
 
-def collect_rows(jobs: Iterable[Job], *, run_id: str) -> list[dict[str, str]]:
+def log_failure_summary(log: Path) -> str:
+    text = log.read_text(encoding="utf-8", errors="replace")
+    for pattern in (
+        r"Assertion failed: (?P<message>[^\n]+)",
+        r"Fatal: (?P<message>[^\n]+)",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            return match.group("message").strip()
+    return ""
+
+
+def collect_rows(jobs: Iterable[Job], *, run_id: str, verify_traces: bool = False) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for job in jobs:
         target = target_from_job(job)
@@ -300,14 +377,20 @@ def collect_rows(jobs: Iterable[Job], *, run_id: str) -> list[dict[str, str]]:
             "tag": job.tag,
             "binary": str(job.binary),
             "log": "",
+            "trace_db": "",
+            "verify_status": "",
+            "verify_stdout": "",
         }
-        if job.status != "done":
-            row = {field: "" for field in CSV_FIELDS}
-            row.update(base)
-            row["core"] = "error"
-            row["error"] = f"rtlq status={job.status} returncode={job.returncode}"
-            rows.append(row)
-            continue
+        verify_error = ""
+        if verify_traces:
+            try:
+                verify_status, trace_db, verify_stdout, verify_error = verify_trace(job)
+                base["trace_db"] = trace_db
+                base["verify_status"] = verify_status
+                base["verify_stdout"] = verify_stdout
+            except (FileNotFoundError, ValueError, subprocess.SubprocessError) as exc:
+                verify_error = str(exc)
+                base["verify_status"] = "error"
 
         try:
             log = resolve_log(job)
@@ -318,6 +401,12 @@ def collect_rows(jobs: Iterable[Job], *, run_id: str) -> list[dict[str, str]]:
             row["core"] = "error"
             row["log"] = "" if isinstance(exc, FileNotFoundError) else str(log)
             row["error"] = str(exc)
+            if not isinstance(exc, FileNotFoundError):
+                failure = log_failure_summary(log)
+                if failure:
+                    row["error"] = f"{row['error']}; rtl: {failure}"
+            if verify_error:
+                row["error"] = f"{row['error']}; verify: {verify_error}"
             rows.append(row)
             continue
 
@@ -326,6 +415,10 @@ def collect_rows(jobs: Iterable[Job], *, run_id: str) -> list[dict[str, str]]:
             row.update(base)
             row.update(metrics)
             row["log"] = str(log)
+            if job.status != "done":
+                row["error"] = f"rtlq status={job.status} returncode={job.returncode}; collected from artifacts"
+            if verify_error:
+                row["error"] = "; ".join(part for part in (row["error"], f"verify: {verify_error}") if part)
             rows.append(row)
     return rows
 
@@ -346,6 +439,7 @@ def write_csv(rows: list[dict[str, str]], path: Path | None) -> None:
 def add_target_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--kernels", nargs="+", default=list(DEFAULT_KERNELS), help="Kernel names to run")
     parser.add_argument("--occupancies", nargs="+", type=int, default=list(DEFAULT_OCCUPANCIES))
+    parser.add_argument("--ilps", nargs="+", type=int, help="ILP values for saxpy/nearn kernel_ilp*_w* variants")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
 
 
@@ -369,6 +463,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect = subparsers.add_parser("collect", help="Collect metrics from a run id")
     collect.add_argument("--run-id", required=True)
     collect.add_argument("--csv", type=Path, help="Output CSV path; stdout if omitted")
+    collect.add_argument("--verify-traces", action="store_true", help="Run kernel verify_trace.py against RTL SQLite traces")
 
     run = subparsers.add_parser("run", help="Submit, wait, and collect in one command")
     add_target_args(run)
@@ -377,18 +472,19 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--poll-sec", type=float, default=15.0)
     run.add_argument("--timeout-sec", type=float)
     run.add_argument("--csv", type=Path, help="Output CSV path; stdout if omitted")
+    run.add_argument("--verify-traces", action="store_true", help="Run kernel verify_trace.py against RTL SQLite traces")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
     if args.command == "list-targets":
-        for target in discover_targets(args.kernels, args.occupancies):
+        for target in discover_targets(args.kernels, args.occupancies, args.ilps):
             print(f"{target.kernel},{target.variant},{target.occupancy},{target.binary}")
         return 0
 
     if args.command == "submit":
-        targets = discover_targets(args.kernels, args.occupancies)
+        targets = discover_targets(args.kernels, args.occupancies, args.ilps)
         submit_targets(targets, config=args.config, run_id=args.run_id, slots=args.slots)
         print(args.run_id)
         return 0
@@ -404,14 +500,14 @@ def main() -> int:
         jobs = read_jobs(run_id=args.run_id)
         if not jobs:
             raise SystemExit(f"no jobs found for run id: {args.run_id}")
-        write_csv(collect_rows(jobs, run_id=args.run_id), args.csv)
+        write_csv(collect_rows(jobs, run_id=args.run_id, verify_traces=args.verify_traces), args.csv)
         return 0
 
     if args.command == "run":
-        targets = discover_targets(args.kernels, args.occupancies)
+        targets = discover_targets(args.kernels, args.occupancies, args.ilps)
         job_ids = submit_targets(targets, config=args.config, run_id=args.run_id, slots=args.slots)
         jobs = wait_jobs(job_ids, poll_sec=args.poll_sec, timeout_sec=args.timeout_sec)
-        write_csv(collect_rows(jobs, run_id=args.run_id), args.csv)
+        write_csv(collect_rows(jobs, run_id=args.run_id, verify_traces=args.verify_traces), args.csv)
         return 0
 
     raise AssertionError(args.command)
