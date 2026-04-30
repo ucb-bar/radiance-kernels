@@ -9,6 +9,9 @@ static void copy_section(uint32_t offset, uint32_t size_bytes) {
 }
 
 int main() {
+// test kernel loading from scratchpad memory
+// #define SPAD_KERNEL
+#ifdef SPAD_KERNEL
   // Copy kernel LOAD segments from DRAM to post-OR addresses.
   // Sizes from: readelf -l kernel.radiance.elf (2 rows x 512 cols)
   copy_section(0x0000, 0x68);   // .init
@@ -31,5 +34,6 @@ int main() {
     finished = READ_MMIO_32(RAD_HOST_GPU_ALL_FINISHED);
   }
 
+#endif
   return 0;
 }
