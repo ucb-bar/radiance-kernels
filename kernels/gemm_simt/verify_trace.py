@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import math
 import re
 import sqlite3
 import struct
@@ -25,6 +26,23 @@ def parse_args() -> argparse.Namespace:
         "--symbol",
         default="C_raw",
         help="Output symbol to resolve with llvm-nm (default: C_raw)",
+    )
+    parser.add_argument(
+        "--atol",
+        type=float,
+        default=0.375,
+        help="Absolute tolerance for BF16 numeric comparison (default: 0.375)",
+    )
+    parser.add_argument(
+        "--rtol",
+        type=float,
+        default=0.0,
+        help="Relative tolerance for BF16 numeric comparison (default: 0.0)",
+    )
+    parser.add_argument(
+        "--exact",
+        action="store_true",
+        help="Require exact BF16 bit matches, ignoring --atol/--rtol",
     )
     return parser.parse_args()
 
@@ -126,11 +144,19 @@ def main() -> int:
     output_addr = resolve_symbol_address(args.elf, args.symbol)
     actual = reconstruct_actual_halfwords(args.trace_db, output_addr, len(expected))
 
-    mismatches = [
-        (index, expected_value, actual_value)
-        for index, (expected_value, actual_value) in enumerate(zip(expected, actual))
-        if expected_value != actual_value
-    ]
+    mismatches = []
+    for index, (expected_value, actual_value) in enumerate(zip(expected, actual)):
+        if args.exact:
+            matched = expected_value == actual_value
+        else:
+            matched = math.isclose(
+                bf16_to_float(expected_value),
+                bf16_to_float(actual_value),
+                abs_tol=args.atol,
+                rel_tol=args.rtol,
+            )
+        if not matched:
+            mismatches.append((index, expected_value, actual_value))
 
     print(f"symbol={args.symbol} address=0x{output_addr:08x} elements={len(expected)}")
     if not mismatches:
@@ -139,9 +165,12 @@ def main() -> int:
 
     print(f"FAIL mismatches={len(mismatches)}")
     for index, expected_value, actual_value in mismatches[:16]:
+        expected_float = bf16_to_float(expected_value)
+        actual_float = bf16_to_float(actual_value)
         print(
-            f"[{index}] expected=0x{expected_value:04x} ({bf16_to_float(expected_value):.8g}) "
-            f"actual=0x{actual_value:04x} ({bf16_to_float(actual_value):.8g})"
+            f"[{index}] expected=0x{expected_value:04x} ({expected_float:.8g}) "
+            f"actual=0x{actual_value:04x} ({actual_float:.8g}) "
+            f"abs_diff={abs(expected_float - actual_float):.8g}"
         )
     return 1
 
