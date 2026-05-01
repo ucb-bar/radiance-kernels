@@ -6,8 +6,8 @@
 #include <math.h>
 #include <stdint.h>
 
-#ifndef GEMM_SIMT_ILP
-#define GEMM_SIMT_ILP 8
+#ifndef ILP_MEM
+#define ILP_MEM 2
 #endif
 
 #ifndef GEMM_SIMT_NUM_WARPS
@@ -33,6 +33,8 @@
 #define A_ITERS (A_WORDS / THREADBLOCK_SIZE)
 #define B_ITERS (B_WORDS / THREADBLOCK_SIZE)
 #define C_ITERS (C_TILES / THREADBLOCK_SIZE)
+#define A_FULL_ITERS ((A_ITERS / ILP_MEM) * ILP_MEM)
+#define B_FULL_ITERS ((B_ITERS / ILP_MEM) * ILP_MEM)
 
 static_assert(A_WORDS % THREADBLOCK_SIZE == 0, "A tile load must evenly divide across the threadblock");
 static_assert(B_WORDS % THREADBLOCK_SIZE == 0, "B tile load must evenly divide across the threadblock");
@@ -78,7 +80,7 @@ static inline void gemm(
     uint32_t block_x_idx = block_idx / block_N;
     uint32_t block_y_idx = block_idx % block_N;
 
-    // accum
+    // clear out accum
     _Float16 acc[C_ITERS][TM * TN];
     #pragma unroll
     for (uint32_t c_iter = 0; c_iter < C_ITERS; c_iter++) {
@@ -90,19 +92,55 @@ static inline void gemm(
     for (uint32_t k_block = 0; k_block < K; k_block += BK) {
       //load A & B block to smem
       #pragma unroll
-      for (uint32_t block = 0; block < A_ITERS; block++) {
+      for (uint32_t base = 0; base < A_FULL_ITERS; base += ILP_MEM) {
+        uint32_t a_val[ILP_MEM];
+        #pragma unroll
+        for (uint32_t u = 0; u < ILP_MEM; u++) {
+          uint32_t elem_idx = tid + (base + u) * THREADBLOCK_SIZE;
+          uint32_t A_x = block_x_idx * BLOCK_X + (elem_idx / (BK / 2)); // BK bf16 elements = BK/2 uint32_t elements
+          uint32_t A_y = k_block / 2 + (elem_idx % (BK / 2));
+          a_val[u] = A[A_x * (K / 2) + A_y];
+        }
+        #pragma unroll
+        for (uint32_t u = 0; u < ILP_MEM; u++) {
+          uint32_t elem_idx = tid + (base + u) * THREADBLOCK_SIZE;
+          As[elem_idx] = a_val[u];
+        }
+      }
+      #if (A_ITERS % ILP_MEM) != 0
+      #pragma unroll
+      for (uint32_t block = A_FULL_ITERS; block < A_ITERS; block++) {
         uint32_t elem_idx = tid + block * THREADBLOCK_SIZE;
         uint32_t A_x = block_x_idx * BLOCK_X + (elem_idx / (BK / 2)); // BK bf16 elements = BK/2 uint32_t elements
         uint32_t A_y = k_block / 2 + (elem_idx % (BK / 2));
         As[elem_idx] = A[A_x * (K / 2) + A_y];
       }
+      #endif
       #pragma unroll
-      for (uint32_t block = 0; block < B_ITERS; block++) {
+      for (uint32_t base = 0; base < B_FULL_ITERS; base += ILP_MEM) {
+        uint32_t b_val[ILP_MEM];
+        #pragma unroll
+        for (uint32_t u = 0; u < ILP_MEM; u++) {
+          uint32_t elem_idx = tid + (base + u) * THREADBLOCK_SIZE;
+          uint32_t B_y = block_y_idx * BLOCK_Y / 2 + (elem_idx % (BLOCK_Y / 2)); // BLOCK_Y bf16 elements
+          uint32_t B_x = k_block + (elem_idx / (BLOCK_Y / 2));
+          b_val[u] = B[B_x * (N / 2) + B_y];
+        }
+        #pragma unroll
+        for (uint32_t u = 0; u < ILP_MEM; u++) {
+          uint32_t elem_idx = tid + (base + u) * THREADBLOCK_SIZE;
+          Bs[elem_idx] = b_val[u];
+        }
+      }
+      #if (B_ITERS % ILP_MEM) != 0
+      #pragma unroll
+      for (uint32_t block = B_FULL_ITERS; block < B_ITERS; block++) {
         uint32_t elem_idx = tid + block * THREADBLOCK_SIZE;
         uint32_t B_y = block_y_idx * BLOCK_Y / 2 + (elem_idx % (BLOCK_Y / 2)); // BLOCK_Y bf16 elements
         uint32_t B_x = k_block + (elem_idx / (BLOCK_Y / 2));
         Bs[elem_idx] = B[B_x * (N / 2) + B_y];
       }
+      #endif
 
       // hold up
       mu_fence_smem();
@@ -115,7 +153,6 @@ static inline void gemm(
         uint32_t c_tile = tid + c_iter * THREADBLOCK_SIZE;
         uint32_t thread_x = c_tile / TB_Y;
         uint32_t thread_y = c_tile % TB_Y;
-        #pragma unroll GEMM_SIMT_ILP
         for (uint32_t k = 0; k < BK / 2; k++) {
           for (uint32_t i = 0; i < TM; i++) {
             uint32_t a_idx = thread_x * TM + i;

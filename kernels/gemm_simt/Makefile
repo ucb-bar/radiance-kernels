@@ -3,8 +3,8 @@ PROJECT = gemm_simt
 MU_SRCS = kernel.cpp
 HOST_SRCS = host.cpp
 
-ifneq ($(strip $(GEMM_SIMT_ILP)),)
-MU_CFLAGS += -DGEMM_SIMT_ILP=$(GEMM_SIMT_ILP)
+ifneq ($(strip $(ILP_MEM)),)
+MU_CFLAGS += -DILP_MEM=$(ILP_MEM)
 endif
 
 ifneq ($(strip $(GEMM_SIMT_NUM_WARPS)),)
@@ -16,7 +16,7 @@ ifneq ($(strip $(ILPS)),)
 define add_ilp_warp_variant
 MU_VARIANTS += kernel_ilp$(1)_w$(2)
 kernel_ilp$(1)_w$(2).mu.o: kernel.cpp data kernel_impl.hpp
-kernel_ilp$(1)_w$(2).mu.o: MU_CFLAGS += -DGEMM_SIMT_ILP=$(1) -DGEMM_SIMT_NUM_WARPS=$(2)
+kernel_ilp$(1)_w$(2).mu.o: MU_CFLAGS += -DILP_MEM=$(1) -DGEMM_SIMT_NUM_WARPS=$(2)
 endef
 
 $(foreach i,$(ILPS),$(foreach w,$(OCCUPANCIES),$(eval $(call add_ilp_warp_variant,$(i),$(w)))))
