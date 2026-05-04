@@ -135,10 +135,10 @@ def discover_targets(
             raise SystemExit(f"unknown kernel directory: {kdir}")
 
         for occ in occs:
-            if ilp_values is not None and kernel in {"saxpy", "nearn", "gemm_simt", "softmax"}:
+            if ilp_values is not None and kernel in {"saxpy", "nearn", "gemm_simt", "softmax", "gemv"}:
                 paths = [kdir / f"kernel_ilp{ilp}_w{occ}.soc.elf" for ilp in ilp_values]
             elif ilp_values is not None:
-                raise SystemExit(f"--ilps is only supported for saxpy/nearn/gemm_simt/softmax, not {kernel}")
+                raise SystemExit(f"--ilps is only supported for saxpy/nearn/gemm_simt/softmax/gemv, not {kernel}")
             elif kernel in {"vecadd", "saxpy", "sfilter", "nearn"}:
                 paths = [kdir / f"kernel_w{occ}.soc.elf"]
             elif kernel == "gaussian":
