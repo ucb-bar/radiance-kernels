@@ -6,12 +6,6 @@
 #include <math.h>
 #include <stdint.h>
 
-#ifndef GEMM_SIMT_NUM_WARPS
-#define GEMM_SIMT_NUM_WARPS 4
-#endif
-
-#define BLOCK_NUM_WARPS MU_BLOCK_NUM_WARPS(GEMM_SIMT_NUM_WARPS)
-#define THREADBLOCK_SIZE MU_BLOCK_SIZE(GEMM_SIMT_NUM_WARPS)
 #define ILP_MEM 2
 
 // all numbers below in number of BF16 elements
@@ -31,19 +25,24 @@
 #define A_WORDS (BM * BK / 2)
 #define B_WORDS (BK * BN / 2)
 #define C_TILES (TBM * TBN)
+#define GEMM_SIMT_NUM_WARPS (C_TILES / (MU_NUM_CORES * MU_NUM_THREADS))
+#define BLOCK_NUM_WARPS MU_BLOCK_NUM_WARPS(GEMM_SIMT_NUM_WARPS)
+#define THREADBLOCK_SIZE MU_BLOCK_SIZE(GEMM_SIMT_NUM_WARPS)
 #define A_ITERS (A_WORDS / THREADBLOCK_SIZE)
 #define B_ITERS (B_WORDS / THREADBLOCK_SIZE)
-#define C_ITERS (C_TILES / THREADBLOCK_SIZE)
 #define A_FULL_ITERS ((A_ITERS / ILP_MEM) * ILP_MEM)
 #define B_FULL_ITERS ((B_ITERS / ILP_MEM) * ILP_MEM)
 
 static_assert(BM % TM == 0, "Thread tile M must evenly divide the CTA tile M");
 static_assert(BN % TN == 0, "Thread tile N must evenly divide the CTA tile N");
 static_assert(TN % 2 == 0, "Thread tile N must contain packed BF16 pairs");
+static_assert(C_TILES % (MU_NUM_CORES * MU_NUM_THREADS) == 0, "CTA thread tiles must map to full resident Muon warps");
+static_assert(GEMM_SIMT_NUM_WARPS >= 1, "Derived warp occupancy must be at least 1");
+static_assert(GEMM_SIMT_NUM_WARPS <= MU_NUM_MAX_WARPS, "Derived warp occupancy exceeds Muon maximum");
+static_assert((GEMM_SIMT_NUM_WARPS & (GEMM_SIMT_NUM_WARPS - 1)) == 0, "Derived warp occupancy must be a power of two");
+static_assert(C_TILES == THREADBLOCK_SIZE, "Each resident thread must own exactly one C microtile");
 static_assert(A_WORDS % THREADBLOCK_SIZE == 0, "A tile load must evenly divide across the threadblock");
 static_assert(B_WORDS % THREADBLOCK_SIZE == 0, "B tile load must evenly divide across the threadblock");
-static_assert(C_TILES >= THREADBLOCK_SIZE, "C tile work must cover the threadblock");
-static_assert(C_TILES % THREADBLOCK_SIZE == 0, "C tile work must evenly divide across the threadblock");
 
 extern "C" uint32_t __mu_num_warps = GEMM_SIMT_NUM_WARPS;
 
@@ -86,12 +85,9 @@ static inline void gemm(
     uint32_t block_y_idx = block_idx % block_N;
 
     // clear out accum
-    _Float16 acc[C_ITERS][TM * TN];
+    _Float16 acc[TM * TN];
     #pragma unroll
-    for (uint32_t c_iter = 0; c_iter < C_ITERS; c_iter++) {
-      #pragma unroll
-      for (uint32_t i = 0; i < TM*TN; i++) acc[c_iter][i] = 0;
-    }
+    for (uint32_t i = 0; i < TM*TN; i++) acc[i] = 0;
 
     // stream across K
     for (uint32_t k_block = 0; k_block < K; k_block += BK) {
@@ -153,22 +149,18 @@ static inline void gemm(
 
       // compute
       // j and k can vector load 2 BF16
-      #pragma unroll
-      for (uint32_t c_iter = 0; c_iter < C_ITERS; c_iter++) {
-        uint32_t c_tile = tid + c_iter * THREADBLOCK_SIZE;
-        uint32_t thread_x = c_tile / TBN;
-        uint32_t thread_y = c_tile % TBN;
-        for (uint32_t k = 0; k < BK / 2; k++) {
-          for (uint32_t i = 0; i < TM; i++) {
-            uint32_t a_idx = thread_x * TM + i;
-            auto [a0, a1] = unpack_bf16x2(As[a_idx * BK / 2 + k]);
-            for (uint32_t j = 0; j < TN / 2; j++) {
-              uint32_t b_idx = thread_y * TN / 2 + j;
-              auto [b00, b10] = unpack_bf16x2(Bs[2*k * (BN / 2) + b_idx]);
-              auto [b01, b11] = unpack_bf16x2(Bs[(2*k + 1) * (BN / 2) + b_idx]);
-              acc[c_iter][i * TN + 2 * j] += a0 * b00 + a1 * b01;
-              acc[c_iter][i * TN + 2 * j + 1] += a0 * b10 + a1 * b11;
-            }
+      uint32_t thread_x = tid / TBN;
+      uint32_t thread_y = tid % TBN;
+      for (uint32_t k = 0; k < BK / 2; k++) {
+        for (uint32_t i = 0; i < TM; i++) {
+          uint32_t a_idx = thread_x * TM + i;
+          auto [a0, a1] = unpack_bf16x2(As[a_idx * BK / 2 + k]);
+          for (uint32_t j = 0; j < TN / 2; j++) {
+            uint32_t b_idx = thread_y * TN / 2 + j;
+            auto [b00, b10] = unpack_bf16x2(Bs[2*k * (BN / 2) + b_idx]);
+            auto [b01, b11] = unpack_bf16x2(Bs[(2*k + 1) * (BN / 2) + b_idx]);
+            acc[i * TN + 2 * j] += a0 * b00 + a1 * b01;
+            acc[i * TN + 2 * j + 1] += a0 * b10 + a1 * b11;
           }
         }
       }
@@ -177,20 +169,16 @@ static inline void gemm(
     }
 
     // store C
+    uint32_t thread_x = tid / TBN;
+    uint32_t thread_y = tid % TBN;
+    uint32_t c_row = block_x_idx * BM + thread_x * TM;
+    uint32_t c_col = block_y_idx * BN / 2 + thread_y * TN / 2;
     #pragma unroll
-    for (uint32_t c_iter = 0; c_iter < C_ITERS; c_iter++) {
-      uint32_t c_tile = tid + c_iter * THREADBLOCK_SIZE;
-      uint32_t thread_x = c_tile / TBN;
-      uint32_t thread_y = c_tile % TBN;
-      uint32_t c_row = block_x_idx * BM + thread_x * TM;
-      uint32_t c_col = block_y_idx * BN / 2 + thread_y * TN / 2;
-      #pragma unroll
-      for (uint32_t i = 0; i < TM; i++) {
-        uint32_t c_x = c_row + i;
-        for (uint32_t j = 0; j < TN / 2; j++) {
-          uint32_t c_y = c_col + j;
-          C[c_x * (N / 2) + c_y] = pack_bf16x2(acc[c_iter][i * TN + 2*j], acc[c_iter][i * TN + 2*j + 1]);
-        }
+    for (uint32_t i = 0; i < TM; i++) {
+      uint32_t c_x = c_row + i;
+      for (uint32_t j = 0; j < TN / 2; j++) {
+        uint32_t c_y = c_col + j;
+        C[c_x * (N / 2) + c_y] = pack_bf16x2(acc[i * TN + 2*j], acc[i * TN + 2*j + 1]);
       }
     }
   }
