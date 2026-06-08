@@ -4,8 +4,7 @@
 
 int main() {
 #if 1
-  WRITE_MMIO_32(RAD_HOST_GPU_RESET, 1);
-  // tohost = 0;
+  tohost = 0;
   *tocpu = tohost;
 
   // printf("start GPU\n");
