@@ -1,0 +1,7 @@
+iters: 4096
+unroll: 16
+num_warps: 8
+num_cores: 2
+result_words: 16
+
+expected_pointerchase_sink: pointerchase_nodes
