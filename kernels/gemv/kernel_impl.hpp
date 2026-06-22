@@ -13,6 +13,10 @@
 #define GEMV_ILP 1
 #endif
 
+#ifndef GEMV_UNROLL
+#define GEMV_UNROLL 8
+#endif
+
 extern "C" uint32_t __mu_num_warps = GEMV_NUM_WARPS;
 
 struct GEMVArgs {
@@ -34,6 +38,13 @@ static inline void reduce(uint32_t tid, uint32_t lane_id) {
 }
 
 template <uint32_t ILP>
+static inline void keep_accum_ordered(_Float16 (&accum)[ILP]) {
+  #pragma unroll
+  for (uint32_t i = 0; i < ILP; ++i)
+    asm volatile("" : "+r"(accum[i]) :: "memory");
+}
+
+template <uint32_t ILP>
 static inline void gemv_impl(
   void* arg,
   uint32_t tid_in_threadblock,
@@ -41,6 +52,8 @@ static inline void gemv_impl(
   uint32_t threadblock_id
 ) {
   static_assert(ILP > 0);
+  static_assert(GEMV_UNROLL > 0);
+  static_assert(GEMV_UNROLL % ILP == 0);
   static_assert((MU_NUM_THREADS & (MU_NUM_THREADS - 1)) == 0);
   auto* args = reinterpret_cast<GEMVArgs*>(arg);
   constexpr uint32_t kWarpWidth = MU_NUM_THREADS;
@@ -57,24 +70,26 @@ static inline void gemv_impl(
   for (uint32_t row = global_warp_id; row < args->m; row += global_warp_stride) {
     __global _Float16* A = args->A + row * row_elems;
     _Float16 accum[ILP] = {};
-    const uint32_t ilp_stride = kWarpWidth * ILP;
-    const uint32_t ilp_span = kWarpWidth * (ILP - 1);
+    constexpr uint32_t kUnroll = GEMV_UNROLL;
+    const uint32_t unroll_stride = kWarpWidth * kUnroll;
+    const uint32_t unroll_span = kWarpWidth * (kUnroll - 1);
 
-    // Benchmark assumption: each row slice is divisible into full ILP groups.
-    for (uint32_t base = lane_id; base + ilp_span < row_elems; base += ilp_stride) {
-      _Float16 a_vals[ILP];
-      _Float16 x_vals[ILP];
-
+    // Benchmark assumption: each row slice is divisible into full unroll groups.
+    for (uint32_t base = lane_id; base + unroll_span < row_elems; base += unroll_stride) {
+      // decouple unrolling factor from ILP; ILP determines how many lds/fmadds
+      // are batched together, unrolling determines how frequently
+      // branch/vx_split shows up in the sequence.
       #pragma unroll
-      for (uint32_t u = 0; u < ILP; ++u) {
-        const uint32_t idx = base + u * kWarpWidth;
-        a_vals[u] = A[idx];
-        x_vals[u] = x[idx];
+      for (uint32_t group = 0; group < kUnroll; group += ILP) {
+        #pragma unroll
+        for (uint32_t i = 0; i < ILP; ++i) {
+          const uint32_t idx = base + (group + i) * kWarpWidth;
+          _Float16 a_val = A[idx];
+          _Float16 x_val = x[idx];
+          accum[i] += a_val * x_val;
+        }
+        keep_accum_ordered(accum);
       }
-
-      #pragma unroll
-      for (uint32_t u = 0; u < ILP; ++u)
-        accum[u] += a_vals[u] * x_vals[u];
     }
 
     _Float16 sum = accum[0];
