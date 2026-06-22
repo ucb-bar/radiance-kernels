@@ -13,9 +13,6 @@
 #define GEMV_ILP 1
 #endif
 
-#define GEMV_BLOCK_NUM_WARPS MU_BLOCK_NUM_WARPS(GEMV_NUM_WARPS)
-#define GEMV_THREAD_DIV (MU_NUM_MAX_WARPS / GEMV_NUM_WARPS)
-
 extern "C" uint32_t __mu_num_warps = GEMV_NUM_WARPS;
 
 struct GEMVArgs {
@@ -44,58 +41,52 @@ static inline void gemv_impl(
   uint32_t threadblock_id
 ) {
   static_assert(ILP > 0);
+  static_assert((MU_NUM_THREADS & (MU_NUM_THREADS - 1)) == 0);
   auto* args = reinterpret_cast<GEMVArgs*>(arg);
-  uint32_t lane_id = tid_in_threadblock % 16;
-  uint32_t warp_id = tid_in_threadblock / 16;
-  uint32_t tid = tid_in_threadblock;
+  constexpr uint32_t kWarpWidth = MU_NUM_THREADS;
+  uint32_t lane_id = tid_in_threadblock % kWarpWidth;
+  uint32_t warp_id = tid_in_threadblock / kWarpWidth;
+  uint32_t warps_per_threadblock = threads_per_threadblock / kWarpWidth;
+  uint32_t global_warp_id = threadblock_id * warps_per_threadblock + warp_id;
+  uint32_t global_warp_stride = MU_NUM_CLUSTERS * warps_per_threadblock;
 
-  uint32_t row_elems = args->n;
-  uint32_t block_elem_idx = threadblock_id * row_elems;
-
-  __global _Float16* A = args->A + block_elem_idx;
+  const uint32_t row_elems = args->n;
   __global _Float16* x = args->x;
   __global _Float16* y = args->y;
 
-  _Float16 accum[ILP] = {};
-  const uint32_t ilp_stride = threads_per_threadblock * ILP;
-  const uint32_t ilp_span = threads_per_threadblock * (ILP - 1);
-  uint32_t base = tid;
+  for (uint32_t row = global_warp_id; row < args->m; row += global_warp_stride) {
+    __global _Float16* A = args->A + row * row_elems;
+    _Float16 accum[ILP] = {};
+    const uint32_t ilp_stride = kWarpWidth * ILP;
+    const uint32_t ilp_span = kWarpWidth * (ILP - 1);
 
-  // Assumes each thread's row slice is divisible into full ILP groups.
-  for (; base + ilp_span < row_elems; base += ilp_stride) {
-    _Float16 a_vals[ILP];
-    _Float16 x_vals[ILP];
+    // Benchmark assumption: each row slice is divisible into full ILP groups.
+    for (uint32_t base = lane_id; base + ilp_span < row_elems; base += ilp_stride) {
+      _Float16 a_vals[ILP];
+      _Float16 x_vals[ILP];
 
-    #pragma unroll
-    for (uint32_t u = 0; u < ILP; ++u) {
-      const uint32_t idx = base + u * threads_per_threadblock;
-      a_vals[u] = A[idx];
-      x_vals[u] = x[idx];
+      #pragma unroll
+      for (uint32_t u = 0; u < ILP; ++u) {
+        const uint32_t idx = base + u * kWarpWidth;
+        a_vals[u] = A[idx];
+        x_vals[u] = x[idx];
+      }
+
+      #pragma unroll
+      for (uint32_t u = 0; u < ILP; ++u)
+        accum[u] += a_vals[u] * x_vals[u];
     }
 
+    _Float16 sum = accum[0];
     #pragma unroll
-    for (uint32_t u = 0; u < ILP; ++u)
-      accum[u] += a_vals[u] * x_vals[u];
-  }
+    for (uint32_t u = 1; u < ILP; ++u)
+      sum += accum[u];
 
-  _Float16 sum = accum[0];
-  #pragma unroll
-  for (uint32_t u = 1; u < ILP; ++u)
-    sum += accum[u];
+    sdata[tid_in_threadblock] = sum;
+    reduce<kWarpWidth>(tid_in_threadblock, lane_id);
 
-  sdata[tid] = sum;
-
-  reduce<MU_NUM_THREADS>(tid, lane_id);
-
-  if (lane_id == 0)
-    sdata[warp_id] = sdata[tid];
-
-  mu_barrier(0, GEMV_BLOCK_NUM_WARPS);
-
-  if (warp_id == 0) {
-    reduce<MU_NUM_THREADS / GEMV_THREAD_DIV>(tid, lane_id);
     if (lane_id == 0)
-      y[threadblock_id] = sdata[0];
+      y[row] = sdata[tid_in_threadblock];
   }
 }
 
