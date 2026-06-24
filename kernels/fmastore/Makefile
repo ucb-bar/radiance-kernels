@@ -17,23 +17,27 @@ ifneq ($(strip $(FMASTORE_ITERS)),)
 MU_CFLAGS += -DFMASTORE_ITERS=$(FMASTORE_ITERS)
 endif
 
-# Sweep variants: CONSUMER x CHAINS -> kernel_<consumer>_k<K>
+# Sweep axes -> variants named kernel_<consumer>_k<K>_w<W>
+#   K = FMASTORE_CHAINS (independent depth-2 chains)
+#   W = FMASTORE_NUM_WARPS (occupancy)
 CHAINS_LIST ?= 1 2 4 8
-CONSUMERS ?= store fmadd
+WARPS_LIST  ?= 1 2 4 8     # occupancy axis, store consumer only
+FMADD_WARPS ?= 1           # fmadd consumer kept at single occupancy (comparison baseline)
 
 store_CODE := 0
 fmadd_CODE := 1
 
-ifneq ($(strip $(CHAINS_LIST)),)
-ifneq ($(strip $(CONSUMERS)),)
+# (consumer, K, W)
 define add_variant
-MU_VARIANTS += kernel_$(1)_k$(2)
-kernel_$(1)_k$(2).mu.o: kernel.cpp kernel_impl.hpp
-kernel_$(1)_k$(2).mu.o: MU_CFLAGS += -DFMASTORE_CONSUMER=$($(1)_CODE) -DFMASTORE_CHAINS=$(2)
+MU_VARIANTS += kernel_$(1)_k$(2)_w$(3)
+kernel_$(1)_k$(2)_w$(3).mu.o: kernel.cpp kernel_impl.hpp
+kernel_$(1)_k$(2)_w$(3).mu.o: MU_CFLAGS += -DFMASTORE_CONSUMER=$($(1)_CODE) -DFMASTORE_CHAINS=$(2) -DFMASTORE_NUM_WARPS=$(3)
 endef
-$(foreach c,$(CONSUMERS),$(foreach k,$(CHAINS_LIST),$(eval $(call add_variant,$(c),$(k)))))
-endif
-endif
+
+# store: full CHAINS x WARPS occupancy matrix
+$(foreach k,$(CHAINS_LIST),$(foreach w,$(WARPS_LIST),$(eval $(call add_variant,store,$(k),$(w)))))
+# fmadd: CHAINS x FMADD_WARPS (default w1) -- comparison only, no occupancy sweep
+$(foreach k,$(CHAINS_LIST),$(foreach w,$(FMADD_WARPS),$(eval $(call add_variant,fmadd,$(k),$(w)))))
 
 include ../common.mk
 
