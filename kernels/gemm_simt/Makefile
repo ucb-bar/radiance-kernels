@@ -38,6 +38,28 @@ $(eval $(call add_cta_tile_variant,1,16,1))
 $(eval $(call add_cta_tile_variant,2,8,1))
 $(eval $(call add_cta_tile_variant,4,4,1))
 $(eval $(call add_cta_tile_variant,8,2,1))
+
+define add_cta_bmbn_variant
+MU_VARIANTS += kernel_cta_tm$(1)_tn$(2)_w$(3)
+kernel_cta_tm$(1)_tn$(2)_w$(3).mu.o: kernel.cpp data kernel_impl.hpp
+kernel_cta_tm$(1)_tn$(2)_w$(3).mu.o: MU_CFLAGS += -DTM=$(1) -DTN=$(2) -DBM=$(4) -DBN=$(5)
+endef
+
+$(eval $(call add_cta_bmbn_variant,1,2,1,8,8))
+$(eval $(call add_cta_bmbn_variant,1,2,2,8,16))
+$(eval $(call add_cta_bmbn_variant,1,2,4,16,16))
+$(eval $(call add_cta_bmbn_variant,2,2,1,8,16))
+$(eval $(call add_cta_bmbn_variant,2,2,2,16,16))
+$(eval $(call add_cta_bmbn_variant,2,2,8,16,64))
+$(eval $(call add_cta_bmbn_variant,4,2,1,16,16))
+$(eval $(call add_cta_bmbn_variant,4,2,4,32,32))
+$(eval $(call add_cta_bmbn_variant,4,2,8,32,64))
+$(eval $(call add_cta_bmbn_variant,8,2,2,32,32))
+$(eval $(call add_cta_bmbn_variant,8,2,4,64,32))
+$(eval $(call add_cta_bmbn_variant,8,2,8,64,64))
+$(eval $(call add_cta_bmbn_variant,16,2,1,32,32))
+$(eval $(call add_cta_bmbn_variant,16,2,2,32,64))
+$(eval $(call add_cta_bmbn_variant,16,2,4,64,64))
 endif
 
 include ../common.mk

@@ -9,9 +9,15 @@
 #define ILP_MEM 2
 
 // all numbers below in number of BF16 elements
+#ifndef BK
 #define BK 32
+#endif
+#ifndef BM
 #define BM 16
+#endif
+#ifndef BN
 #define BN 32
+#endif
 #ifndef TM
 #define TM 1
 #endif
