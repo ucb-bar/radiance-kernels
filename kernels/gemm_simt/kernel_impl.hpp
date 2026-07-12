@@ -6,7 +6,9 @@
 #include <math.h>
 #include <stdint.h>
 
+#ifndef ILP_MEM
 #define ILP_MEM 2
+#endif
 
 // all numbers below in number of BF16 elements
 #define BK 32
@@ -107,6 +109,9 @@ static inline void gemm(
           uint32_t elem_idx = tid + (base + u) * THREADBLOCK_SIZE;
           As[elem_idx] = a_val[u];
         }
+#ifdef GEMM_BOUND_MLP_STRICT
+        mu_fence(); // strictest: drain after every A load batch (MLP <= ILP_MEM)
+#endif
       }
       #if (A_ITERS % ILP_MEM) != 0
       #pragma unroll
@@ -117,6 +122,14 @@ static inline void gemm(
         As[elem_idx] = A[A_x * (K / 2) + A_y];
       }
       #endif
+#ifdef GEMM_BOUND_MLP
+      // Workaround for L0d TLNBDCache (makeLandingPads=false) response-path bug:
+      // bound outstanding global loads to <= coalescer respQueueDepth (2) so the
+      // response queue can always absorb in-flight responses and never backpressures
+      // the cache. A + B load bursts (1 + ILP_MEM) can overlap to 3 outstanding;
+      // a global fence between them caps it at max(1, ILP_MEM)=2.
+      mu_fence();
+#endif
       #pragma unroll
       for (uint32_t base = 0; base < B_FULL_ITERS; base += ILP_MEM) {
         uint32_t b_val[ILP_MEM];
@@ -132,6 +145,9 @@ static inline void gemm(
           uint32_t elem_idx = tid + (base + u) * THREADBLOCK_SIZE;
           Bs[elem_idx] = b_val[u];
         }
+#ifdef GEMM_BOUND_MLP_STRICT
+        mu_fence(); // strictest: drain after every B load batch (MLP <= ILP_MEM)
+#endif
       }
       #if (B_ITERS % ILP_MEM) != 0
       #pragma unroll

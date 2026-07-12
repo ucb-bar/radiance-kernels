@@ -1,6 +1,6 @@
 PROJECT = gemm_simt
 
-MU_SRCS = kernel.cpp
+MU_SRCS = kernel.cpp kernel_bounded.cpp kernel_strict.cpp kernel_ilp1.cpp kernel_ilp1_fence.cpp kernel_tn4.cpp kernel_tn4_fence.cpp
 HOST_SRCS = host.cpp
 
 ifneq ($(strip $(TM)),)
