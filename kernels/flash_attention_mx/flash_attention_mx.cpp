@@ -63,11 +63,19 @@ static constexpr uint32_t CORR_SMEM = 0xB800;   // per-row rescale corr = exp(m_
 // Running unnormalized output accumulator O_acc[Sq][d] (bf16), persistent across blocks.
 static constexpr uint32_t OACC_SMEM = 0x18000;
 
+// Lightweight phase profiler: thread-0 stores the mcycle counter to a GMEM marker array
+// at each phase boundary. Parse stores to MARK_GMEM from the .out trace -> per-phase cycles.
+static constexpr uint32_t MARK_GMEM = 0x40050000;
+#define MARK() do { if (tid == 0) { uint32_t _c; asm volatile("csrr %0, mcycle" : "=r"(_c)); \
+                                    ((volatile uint32_t *)MARK_GMEM)[mki++] = _c; } } while (0)
+
 void fa_entry(void *arg, uint32_t tid_in_threadblock,
               uint32_t threads_per_threadblock, uint32_t threadblock_id) {
     const auto wpb = threads_per_threadblock / MU_NUM_THREADS;
     const auto tid = tid_in_threadblock;
     const auto thr = threads_per_threadblock;
+    uint32_t mki = 0;
+    MARK();  // 0: entry
 
     // ===== Streaming (flash) attention: loop over FA_NBLK key blocks of Bk. Running
     // online-softmax state (m, l, O_acc) lives in SMEM across blocks; 1/l is deferred to
@@ -80,7 +88,14 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
             &QK_A_in[0][0], &QK_B_blocks[j * FA_D][0],
             &QK_A_scales_row[0][0], &QK_B_scales_blocks[j * FA_GK][0],
             FA_SQ, FA_BK, FA_D, tid, thr);
-        mu_barrier(2, wpb);
+        mu_barrier(2, wpb); MARK();
+
+        // PREFETCH V_j for PV: async move-in (no fence) -> overlaps softmax+requant below,
+        // hiding PV's DMA/config latency (was ~50 k cyc). SKIP_A (A=P comes from requant).
+        mxgemm_prefetch_tile<PV, /*SKIP_A=*/true>(
+            &V_in[j * FA_BK][0], &V_in[j * FA_BK][0],
+            &V_scales[j * FA_GKB][0], &V_scales[j * FA_GKB][0],
+            FA_SQ, FA_D, FA_BK, tid);
 
         // online softmax(S_j*scale): update running m/l, emit corr, write UNNORMALIZED
         // P_j = exp(S_j*scale - m_new) (bf16) -> P_SMEM.
@@ -92,7 +107,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
             reinterpret_cast<__shared uint16_t *>(CORR_SMEM),
             SOFTMAX_SCALE_BF16, first, tid, thr);
         mu_fence_smem();
-        mu_barrier(3, wpb);
+        mu_barrier(3, wpb); MARK();
 
         // requant P_j -> fp8 A-spad (tiled) + per-32-block E8M0 scales -> SCALE_SMEM.
         requant_P_to_spad_tiled<FA_SQ, FA_BK>(
@@ -100,22 +115,18 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
             reinterpret_cast<__shared uint32_t *>(0 /* A-spad base */),
             reinterpret_cast<__shared uint32_t *>(SCALE_SMEM), tid, thr);
         mu_fence_smem();
-        mu_barrier(4, wpb);
+        mu_barrier(4, wpb); MARK();
 
         // pack scales -> A scale SRAM (SF_MEM_A) for the PV mesh.
         pack_scales_to_sfmem<FA_SQ, FA_BK>(
             reinterpret_cast<const __shared uint32_t *>(SCALE_SMEM),
             reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_A), tid);
         mu_fence_smem();
-        mu_barrier(5, wpb);
+        mu_barrier(5, wpb); MARK();
 
-        // PV_j: PV = P_j @ V_j  (SKIP_A: P in spad + scales in SF-SRAM). B=V_j row-slice
-        // V_in[j*Bk:(j+1)*Bk]; B_scales = V_scales[j*Bk/32:...]. -> bf16 PV @ SPAD_DEST.
-        mxgemm_single_output_tile<PV, /*barrier_tile=*/false, /*SKIP_A=*/true>(
-            &V_in[j * FA_BK][0], &V_in[j * FA_BK][0],
-            &V_scales[j * FA_GKB][0], &V_scales[j * FA_GKB][0],
-            FA_SQ, FA_D, FA_BK, tid, thr);
-        mu_barrier(6, wpb);
+        // PV_j COMPUTE: V_j prefetched during softmax+requant (async DMA hidden). Drain + matmul.
+        mxgemm_compute_tile<PV>(tid);
+        mu_barrier(6, wpb); MARK();
 
         // O_acc = (first ? 0 : O_acc*corr) + PV_j   (PV_j read from SPAD_DEST == S_SMEM).
         rescale_accumulate<FA_SQ, FA_D>(
@@ -123,7 +134,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
             reinterpret_cast<const __shared uint32_t *>(S_SMEM),
             reinterpret_cast<const __shared uint16_t *>(CORR_SMEM), first, tid, thr);
         mu_fence_smem();
-        mu_barrier(7, wpb);
+        mu_barrier(7, wpb); MARK();
     }
 
     // ---- finalize: O = O_acc / l  -> GMEM (bf16). ----
@@ -131,9 +142,10 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         reinterpret_cast<const __shared uint32_t *>(OACC_SMEM),
         reinterpret_cast<const __shared uint16_t *>(LS_SMEM),
         reinterpret_cast<uint32_t *>(O_GMEM), tid, thr);
+    MARK();  // final
 }
 
 int main() {
-    mu_schedule(fa_entry, nullptr, 2);  // 2 warps (low occupancy: avoids L0d issue)
+    mu_schedule(fa_entry, nullptr, 2);  // 2 warps (4+ overflows the physical register file)
     return 0;
 }
