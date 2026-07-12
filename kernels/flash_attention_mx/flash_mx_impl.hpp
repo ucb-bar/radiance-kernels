@@ -314,15 +314,16 @@ static __attribute__((noinline)) void fused_softmax_requant(
             s[c] = (_Float16)(as_bf16(Srow[c]) * scale);
             lmax = fmaxf(lmax, s[c]);
         }
-        // block-local reduce (within LPB-lane groups) -> buf[b*LPB] = block S-max
+        // block-local reduce (within LPB-lane groups) -> buf[b*LPB] = block S-max.
+        // No per-step fence: warp lockstep orders it (mirrors warp_tree_reduce).
         buf[lane] = __builtin_bit_cast(uint16_t, lmax);
         mu_fence_smem();
         for (uint32_t st = 1; st < LPB; st <<= 1) {
             if ((lane % (2 * st)) == 0)
                 buf[lane] = __builtin_bit_cast(uint16_t,
                     (_Float16)fmaxf(as_bf16(buf[lane]), as_bf16(buf[lane + st])));
-            mu_fence_smem();
         }
+        mu_fence_smem();
         _Float16 bSmax = as_bf16(buf[b_of_lane * LPB]);     // this lane's block max
         _Float16 rmax = as_bf16(NEG_INF_BF16_BITS);         // row max over block leaders
         for (uint32_t b = 0; b < NBLK; b++) rmax = fmaxf(rmax, as_bf16(buf[b * LPB]));
