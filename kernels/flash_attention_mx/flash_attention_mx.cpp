@@ -141,6 +141,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 }
 
 int main() {
-    mu_schedule(fa_entry, nullptr, 2);  // 2 warps (4+ overflows the physical register file)
+    mu_schedule(fa_entry, nullptr, 2);  // 2 warps: >=3 overflows the physical RF (Rename.sv),
+                                        // even post-fusion (gemm register pressure). Firm cap.
     return 0;
 }
