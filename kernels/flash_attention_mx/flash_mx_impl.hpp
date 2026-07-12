@@ -280,6 +280,88 @@ static __attribute__((noinline)) void online_softmax_block(
     }
 }
 
+// FUSED online-softmax + MX-FP8 requant (thorough perf rewrite). Contiguous 16-lane
+// ownership: lane owns cols [lane*CPL, +CPL), CPL=BK/16 (register-cheap; word-packed
+// disjoint spad stores, no sub-word hazard; no P_SMEM round-trip / double-read).
+// Per row: load owned cols of S_j, scale, per-lane max; block-reduce (per 32-col MX block)
+// + row-reduce (m/l); exp P in registers; e4m3 requant -> tiled A-spad; E8M0 -> scratch.
+// CPL must be a multiple of 4 (BK a multiple of 64) so each lane writes whole words.
+template <uint32_t SQ, uint32_t BK>
+static __attribute__((noinline)) void fused_softmax_requant(
+        const __shared uint16_t *S_smem16, __shared uint32_t *spad_u32,
+        __shared uint32_t *scale_scratch,
+        __shared uint16_t *m_state, __shared uint16_t *l_state, __shared uint16_t *corr_out,
+        uint16_t softmax_scale_bf16, uint32_t first_block,
+        uint32_t tid_in_threadblock, uint32_t threads_per_threadblock) {
+    constexpr uint32_t NT = MU_NUM_THREADS;      // 16 lanes
+    constexpr uint32_t CPL = BK / NT;            // contiguous cols per lane (mult of 4)
+    constexpr uint32_t NBLK = BK / 32;           // MX blocks per row
+    constexpr uint32_t LPB = 32 / CPL;           // lanes per MX block
+    constexpr uint32_t PE_TILES_K = BK / 16;
+    const uint32_t lane = tid_in_threadblock % NT;
+    const uint32_t warp = tid_in_threadblock / NT;
+    const uint32_t nwarps = threads_per_threadblock / NT;
+    const _Float16 scale = as_bf16(softmax_scale_bf16);
+    volatile __shared uint16_t *buf =
+        reinterpret_cast<volatile __shared uint16_t *>(0xC000) + warp * NT;
+    const uint32_t b_of_lane = lane / LPB;       // which MX block this lane serves
+
+    for (uint32_t row = warp; row < SQ; row += nwarps) {
+        const __shared uint16_t *Srow = S_smem16 + row * BK + lane * CPL;
+        _Float16 s[CPL];
+        _Float16 lmax = as_bf16(NEG_INF_BF16_BITS);
+        for (uint32_t c = 0; c < CPL; c++) {
+            s[c] = (_Float16)(as_bf16(Srow[c]) * scale);
+            lmax = fmaxf(lmax, s[c]);
+        }
+        // block-local reduce (within LPB-lane groups) -> buf[b*LPB] = block S-max
+        buf[lane] = __builtin_bit_cast(uint16_t, lmax);
+        mu_fence_smem();
+        for (uint32_t st = 1; st < LPB; st <<= 1) {
+            if ((lane % (2 * st)) == 0)
+                buf[lane] = __builtin_bit_cast(uint16_t,
+                    (_Float16)fmaxf(as_bf16(buf[lane]), as_bf16(buf[lane + st])));
+            mu_fence_smem();
+        }
+        _Float16 bSmax = as_bf16(buf[b_of_lane * LPB]);     // this lane's block max
+        _Float16 rmax = as_bf16(NEG_INF_BF16_BITS);         // row max over block leaders
+        for (uint32_t b = 0; b < NBLK; b++) rmax = fmaxf(rmax, as_bf16(buf[b * LPB]));
+
+        _Float16 m_old = first_block ? rmax : as_bf16(m_state[row]);
+        _Float16 m_new = fmaxf(m_old, rmax);
+        _Float16 corr = mu_fexp((_Float16)(m_old - m_new));
+
+        // exp P (unnormalized), per-lane sum
+        _Float16 lsum = (_Float16)0;
+        for (uint32_t c = 0; c < CPL; c++) { s[c] = mu_fexp((_Float16)(s[c] - m_new)); lsum = (_Float16)(lsum + s[c]); }
+        buf[lane] = __builtin_bit_cast(uint16_t, lsum);
+        mu_fence_smem(); warp_tree_reduce<false>(buf, lane); mu_fence_smem();
+        _Float16 rowsum = as_bf16(buf[0]);
+        if (lane == 0) {
+            _Float16 l_old = first_block ? (_Float16)0 : as_bf16(l_state[row]);
+            l_state[row] = __builtin_bit_cast(uint16_t, (_Float16)(l_old * corr + rowsum));
+            m_state[row] = __builtin_bit_cast(uint16_t, m_new);
+            corr_out[row] = __builtin_bit_cast(uint16_t, corr);
+        }
+        // requant: per-block E8M0 scale from block P-max = exp(bSmax - m_new)
+        _Float16 bPmax = mu_fexp((_Float16)(bSmax - m_new));
+        int se = bf16_floor_log2(__builtin_bit_cast(uint16_t, bPmax));
+        if ((lane % LPB) == 0) scale_scratch[b_of_lane * SQ + row] = (uint32_t)(uint8_t)(se + 127);
+        // convert owned cols to e4m3, word-packed (CPL/4 words), store tiled.
+        const uint32_t ti = row / 16, rr = row % 16;
+        for (uint32_t w = 0; w < CPL / 4; w++) {
+            const uint32_t col0 = lane * CPL + w * 4;
+            uint32_t packed = 0;
+            for (uint32_t k = 0; k < 4; k++) {
+                _Float16 ps = bf16_scale_pow2(s[w * 4 + k], -se);
+                packed |= (uint32_t)bf16_to_e4m3</*RNE=*/false>(__builtin_bit_cast(uint16_t, ps)) << (8 * k);
+            }
+            const uint32_t tk = col0 / 16, cc = col0 % 16;
+            spad_u32[((ti * PE_TILES_K + tk) * 256 + rr * 16 + cc) / 4] = packed;
+        }
+    }
+}
+
 // rescale_accumulate: O_acc[SQ][D] = (first ? 0 : O_acc*corr) + PV_j. PV_j is the mesh
 // PV output (bf16, packed 2/word) at SPAD_DEST; O_acc is a persistent SMEM buffer. per row.
 template <uint32_t SQ, uint32_t D>

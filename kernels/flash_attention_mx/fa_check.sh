@@ -20,15 +20,17 @@ CFG=RadianceTapeoutSimConfig
 
 [ $# -ge 3 ] || { echo "usage: fa_check.sh Sq Sk d [--bk=N] [--seed=N] [--thresh=PCT] [--profile] [--build-only]"; exit 2; }
 Sq=$1; Sk=$2; d=$3; shift 3
-seed=0; thresh=5.0; profile=0; buildonly=0; bk=0
+seed=0; thresh=5.0; profile=0; buildonly=0; bk=0; nodram=0
 for a in "$@"; do case $a in
   --bk=*)     bk=${a#*=} ;;
   --seed=*)   seed=${a#*=} ;;
   --thresh=*) thresh=${a#*=} ;;
   --profile)  profile=1 ;;
+  --no-dramsim) nodram=1 ;;
   --build-only) buildonly=1 ;;
   *) echo "unknown arg: $a"; exit 2 ;;
 esac; done
+DRAMFLAG=""; [ $nodram = 1 ] && DRAMFLAG="NO_DRAMSIM=1"   # idealized memory timing
 [ $bk = 0 ] && bk=$Sk    # default: single key block (Nblk=1)
 
 source $KG/kernel-build-env.sh 2>/dev/null
@@ -51,7 +53,7 @@ cd $VCS
 if [ $profile = 1 ]; then TGT=run-binary-debug; else TGT=run-binary; fi
 echo "[3/4] run VCS  ($TGT)"
 t0=$(date +%s)
-make CONFIG=$CFG $TGT LOADMEM=1 BINARY=$ELF BREAK_SIM_PREREQ=1 >/tmp/fa_run.log 2>&1
+make CONFIG=$CFG $TGT LOADMEM=1 BINARY=$ELF BREAK_SIM_PREREQ=1 $DRAMFLAG >/tmp/fa_run.log 2>&1
 rc=$?; dt=$(( $(date +%s) - t0 ))
 if ! grep -qaE '\$finish at' /tmp/fa_run.log; then
   echo "  RUN did not finish (rc=$rc, ${dt}s)"; tail -8 /tmp/fa_run.log; exit 1

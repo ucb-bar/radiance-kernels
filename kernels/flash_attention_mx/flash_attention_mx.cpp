@@ -97,11 +97,13 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
             &V_scales[j * FA_GKB][0], &V_scales[j * FA_GKB][0],
             FA_SQ, FA_D, FA_BK, tid);
 
-        // online softmax(S_j*scale): update running m/l, emit corr, write UNNORMALIZED
-        // P_j = exp(S_j*scale - m_new) (bf16) -> P_SMEM.
-        online_softmax_block<FA_SQ, FA_BK>(
-            reinterpret_cast<const __shared uint32_t *>(S_SMEM),
-            reinterpret_cast<__shared uint32_t *>(P_SMEM),
+        // FUSED online-softmax + MX-FP8 requant: update running m/l, emit corr, and write
+        // P_j fp8 directly to the A-spad (tiled) + E8M0 scales -> SCALE_SMEM. No P_SMEM
+        // round-trip / double-read (thorough SIMT rewrite; contiguous 16-lane ownership).
+        fused_softmax_requant<FA_SQ, FA_BK>(
+            reinterpret_cast<const __shared uint16_t *>(S_SMEM),
+            reinterpret_cast<__shared uint32_t *>(0 /* A-spad base */),
+            reinterpret_cast<__shared uint32_t *>(SCALE_SMEM),
             reinterpret_cast<__shared uint16_t *>(M_SMEM),
             reinterpret_cast<__shared uint16_t *>(LS_SMEM),
             reinterpret_cast<__shared uint16_t *>(CORR_SMEM),
@@ -109,24 +111,16 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         mu_fence_smem();
         mu_barrier(3, wpb); MARK();
 
-        // requant P_j -> fp8 A-spad (tiled) + per-32-block E8M0 scales -> SCALE_SMEM.
-        requant_P_to_spad_tiled<FA_SQ, FA_BK>(
-            reinterpret_cast<const __shared uint16_t *>(P_SMEM),
-            reinterpret_cast<__shared uint32_t *>(0 /* A-spad base */),
-            reinterpret_cast<__shared uint32_t *>(SCALE_SMEM), tid, thr);
-        mu_fence_smem();
-        mu_barrier(4, wpb); MARK();
-
         // pack scales -> A scale SRAM (SF_MEM_A) for the PV mesh.
         pack_scales_to_sfmem<FA_SQ, FA_BK>(
             reinterpret_cast<const __shared uint32_t *>(SCALE_SMEM),
             reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_A), tid);
         mu_fence_smem();
-        mu_barrier(5, wpb); MARK();
+        mu_barrier(4, wpb); MARK();
 
-        // PV_j COMPUTE: V_j prefetched during softmax+requant (async DMA hidden). Drain + matmul.
+        // PV_j COMPUTE: V_j prefetched during the fused SIMT (async DMA hidden). Drain + matmul.
         mxgemm_compute_tile<PV>(tid);
-        mu_barrier(6, wpb); MARK();
+        mu_barrier(5, wpb); MARK();
 
         // O_acc = (first ? 0 : O_acc*corr) + PV_j   (PV_j read from SPAD_DEST == S_SMEM).
         rescale_accumulate<FA_SQ, FA_D>(
@@ -134,7 +128,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
             reinterpret_cast<const __shared uint32_t *>(S_SMEM),
             reinterpret_cast<const __shared uint16_t *>(CORR_SMEM), first, tid, thr);
         mu_fence_smem();
-        mu_barrier(7, wpb); MARK();
+        mu_barrier(6, wpb); MARK();
     }
 
     // ---- finalize: O = O_acc / l  -> GMEM (bf16). ----
