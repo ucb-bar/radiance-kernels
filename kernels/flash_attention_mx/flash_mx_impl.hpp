@@ -219,6 +219,116 @@ static __attribute__((noinline)) void softmax_to_smem(const __shared uint32_t *S
     }
 }
 
+// ===== Streaming (flash) online-softmax helpers =====
+// online_softmax_block: for one key-block S_j [SQ][BK] (bf16 in SMEM), update the running
+// per-row max m and denom l, emit corr = exp(m_old - m_new) for rescaling the O
+// accumulator, and write the UNNORMALIZED probs P_j = exp(S_j*scale - m_new) (bf16, in
+// (0,1]) to P_smem. 1/l is deferred to finalize_O. Mirrors FA.mx_attention_flash.
+// One row per warp; 16 lanes reduce cooperatively (same strided scheme as softmax_to_smem).
+template <uint32_t SQ, uint32_t BK>
+static __attribute__((noinline)) void online_softmax_block(
+        const __shared uint32_t *S_smem32, __shared uint32_t *P_smem32,
+        __shared uint16_t *m_state, __shared uint16_t *l_state, __shared uint16_t *corr_out,
+        uint16_t softmax_scale_bf16, uint32_t first_block,
+        uint32_t tid_in_threadblock, uint32_t threads_per_threadblock) {
+    constexpr uint32_t NT = MU_NUM_THREADS;
+    constexpr uint32_t WPL = BK / (2 * NT);
+    constexpr uint32_t BKW = BK / 2;
+    const uint32_t lane = tid_in_threadblock % NT;
+    const uint32_t warp = tid_in_threadblock / NT;
+    const uint32_t nwarps = threads_per_threadblock / NT;
+    const _Float16 scale = as_bf16(softmax_scale_bf16);
+    volatile __shared uint16_t *buf =
+        reinterpret_cast<volatile __shared uint16_t *>(0xC000) + warp * NT;
+
+    for (uint32_t row = warp; row < SQ; row += nwarps) {
+        const __shared uint32_t *Srow = S_smem32 + row * BKW;
+        __shared uint32_t *Prow = P_smem32 + row * BKW;
+        _Float16 slo[WPL], shi[WPL];
+        _Float16 mloc = as_bf16(NEG_INF_BF16_BITS);
+        for (uint32_t j = 0; j < WPL; j++) {
+            uint32_t w = Srow[j * NT + lane];
+            _Float16 lo = (_Float16)(as_bf16((uint16_t)w) * scale);
+            _Float16 hi = (_Float16)(as_bf16((uint16_t)(w >> 16)) * scale);
+            slo[j] = lo; shi[j] = hi;
+            mloc = fmaxf(fmaxf(lo, hi), mloc);
+        }
+        buf[lane] = __builtin_bit_cast(uint16_t, mloc);
+        mu_fence_smem(); warp_tree_reduce<true>(buf, lane); mu_fence_smem();
+        _Float16 bmax = as_bf16(buf[0]);                       // block max (scaled)
+        _Float16 m_old = first_block ? bmax : as_bf16(m_state[row]);
+        _Float16 m_new = fmaxf(m_old, bmax);
+        _Float16 corr = mu_fexp((_Float16)(m_old - m_new));    // first-block -> exp(0)=1
+        _Float16 lloc = (_Float16)0;
+        for (uint32_t j = 0; j < WPL; j++) {
+            _Float16 a = mu_fexp((_Float16)(slo[j] - m_new));
+            _Float16 b = mu_fexp((_Float16)(shi[j] - m_new));
+            slo[j] = a; shi[j] = b;
+            lloc = (_Float16)(lloc + a + b);
+        }
+        buf[lane] = __builtin_bit_cast(uint16_t, lloc);
+        mu_fence_smem(); warp_tree_reduce<false>(buf, lane); mu_fence_smem();
+        _Float16 lsum = as_bf16(buf[0]);
+        for (uint32_t j = 0; j < WPL; j++)                     // P_j UNNORMALIZED
+            Prow[j * NT + lane] = pack_bf16x2(slo[j], shi[j]);
+        if (lane == 0) {
+            _Float16 l_old = first_block ? (_Float16)0 : as_bf16(l_state[row]);
+            l_state[row] = __builtin_bit_cast(uint16_t, (_Float16)(l_old * corr + lsum));
+            m_state[row] = __builtin_bit_cast(uint16_t, m_new);
+            corr_out[row] = __builtin_bit_cast(uint16_t, corr);
+        }
+    }
+}
+
+// rescale_accumulate: O_acc[SQ][D] = (first ? 0 : O_acc*corr) + PV_j. PV_j is the mesh
+// PV output (bf16, packed 2/word) at SPAD_DEST; O_acc is a persistent SMEM buffer. per row.
+template <uint32_t SQ, uint32_t D>
+static __attribute__((noinline)) void rescale_accumulate(
+        __shared uint32_t *O_acc32, const __shared uint32_t *PV32,
+        const __shared uint16_t *corr_out, uint32_t first_block,
+        uint32_t tid_in_threadblock, uint32_t threads_per_threadblock) {
+    constexpr uint32_t NT = MU_NUM_THREADS;
+    constexpr uint32_t DW = D / 2;
+    const uint32_t lane = tid_in_threadblock % NT;
+    const uint32_t warp = tid_in_threadblock / NT;
+    const uint32_t nwarps = threads_per_threadblock / NT;
+    for (uint32_t row = warp; row < SQ; row += nwarps) {
+        const _Float16 c = as_bf16(corr_out[row]);
+        for (uint32_t w = lane; w < DW; w += NT) {
+            uint32_t pv = PV32[row * DW + w];
+            _Float16 plo = as_bf16((uint16_t)pv), phi = as_bf16((uint16_t)(pv >> 16));
+            _Float16 olo = (_Float16)0, ohi = (_Float16)0;
+            if (!first_block) {
+                uint32_t a = O_acc32[row * DW + w];
+                olo = as_bf16((uint16_t)a); ohi = as_bf16((uint16_t)(a >> 16));
+            }
+            O_acc32[row * DW + w] = pack_bf16x2((_Float16)(olo * c + plo),
+                                                (_Float16)(ohi * c + phi));
+        }
+    }
+}
+
+// finalize_O: O[SQ][D] = O_acc / l  -> GMEM (packed bf16x2 word stores). per row.
+template <uint32_t SQ, uint32_t D>
+static __attribute__((noinline)) void finalize_O(
+        const __shared uint32_t *O_acc32, const __shared uint16_t *l_state,
+        uint32_t *O_gmem32, uint32_t tid_in_threadblock, uint32_t threads_per_threadblock) {
+    constexpr uint32_t NT = MU_NUM_THREADS;
+    constexpr uint32_t DW = D / 2;
+    const uint32_t lane = tid_in_threadblock % NT;
+    const uint32_t warp = tid_in_threadblock / NT;
+    const uint32_t nwarps = threads_per_threadblock / NT;
+    for (uint32_t row = warp; row < SQ; row += nwarps) {
+        const _Float16 inv_l =
+            (_Float16)(__builtin_bit_cast(_Float16, ONE_BF16_BITS) / as_bf16(l_state[row]));
+        for (uint32_t w = lane; w < DW; w += NT) {
+            uint32_t a = O_acc32[row * DW + w];
+            O_gmem32[row * DW + w] = pack_bf16x2((_Float16)(as_bf16((uint16_t)a) * inv_l),
+                                                 (_Float16)(as_bf16((uint16_t)(a >> 16)) * inv_l));
+        }
+    }
+}
+
 // Single-warp sequential copy of bf16 P from an SMEM scratch -> the requantizer SMEM
 // region. The MxRequantizer needs program-order writes from one warp; we read packed
 // words and write 16-bit halves in ascending address order.

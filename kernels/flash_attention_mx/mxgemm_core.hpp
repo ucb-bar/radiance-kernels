@@ -79,8 +79,11 @@ template <GemmConfig C>
 static inline void configure_mxgemmini(const uint32_t dim_m,
                                        const uint32_t dim_n,
                                        const uint32_t dim_k) {
-    static_assert(C.TILE_M == C.TILE_N,
-                  "currently only supports square SMEM tile dimensions");
+    // NOTE: non-square tiles (TILE_M != TILE_N) are supported -- the loop bounds are set
+    // per-dimension from PE_TILES_I/J/K below, and the A/B spad quarters are sized
+    // independently. Required for streaming FA (QK: N=Bk!=M=Sq; PV: N=d!=M=Sq).
+    static_assert(C.TILE_M % C.PE_M() == 0 && C.TILE_N % C.PE_N() == 0,
+                  "TILE_M/TILE_N must be multiples of the PE tile size");
     static_assert(C.TILE_K >= 32 && (C.TILE_K % 32) == 0,
                   "tile K dimension is not a multiple of block size (32)");
 

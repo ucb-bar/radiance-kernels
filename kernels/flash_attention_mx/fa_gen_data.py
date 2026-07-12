@@ -59,10 +59,14 @@ def main():
     ap.add_argument("--Sk", type=int, default=128)
     ap.add_argument("--d", type=int, default=64)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--block_n", type=int, default=0, help="key-block size Bk for streaming (0=Sk)")
     ap.add_argument("--out", type=str, default="include/fa_data.h")
     args = ap.parse_args()
     Sq, Sk, d = args.Sq, args.Sk, args.d
     assert d % GROUP == 0 and Sk % GROUP == 0 and Sq % 16 == 0
+    Bk = args.block_n or Sk
+    assert Sk % Bk == 0 and Bk % GROUP == 0, f"Bk={Bk} must divide Sk and be a multiple of {GROUP}"
+    Nblk = Sk // Bk
     softmax_scale = 1.0 / (d ** 0.5)
 
     Q, K, V = FA.make_inputs(Sq, Sk, d, args.seed, peaked=False)
@@ -93,6 +97,9 @@ def main():
         f.write(f"#define FA_SQ {Sq}\n#define FA_SK {Sk}\n#define FA_D {d}\n")
         f.write(f"#define FA_GK {GK}            // d/32 (QK^T contraction groups)\n")
         f.write(f"#define FA_GKV {Sk // GROUP}  // Sk/32 (PV contraction groups)\n")
+        f.write(f"#define FA_BK {Bk}            // streaming key-block size\n")
+        f.write(f"#define FA_NBLK {Nblk}        // Sk/Bk key blocks\n")
+        f.write(f"#define FA_GKB {Bk // GROUP}  // Bk/32 (per-block PV contraction groups)\n")
         scale_bf16 = int(torch.tensor([softmax_scale], dtype=torch.float32)
                          .to(torch.bfloat16).view(torch.int16).item() & 0xFFFF)
         f.write(f"// softmax_scale = 1/sqrt(d) = {softmax_scale:.8f}\n")
@@ -106,9 +113,20 @@ def main():
         f.write("// golden mesh QK^T output (bf16, BEFORE * softmax_scale)\n")
         emit_bf16(f, "QK_S_bf16", S_raw, "[FA_SQ][FA_SK]")
 
-        f.write("// ===== raw V (fp8) for the PV stage; grouped along Sk =====\n")
+        f.write("// ===== raw V (fp8) for the PV stage; grouped along Sk. V blocks are the\n"
+                "//       natural row-slices V_in[j*Bk : (j+1)*Bk] / V_scales[j*Bk/32 : ...]. =====\n")
         emit_fp8(f, "V_in", Vt_fp8.t().contiguous(), "[FA_SK][FA_D]")
         emit_scale(f, "V_scales", Vt_scales.t().contiguous(), "[FA_GKV][FA_D]")
+
+        # ===== streaming: K^T blocked as [Nblk][d][Bk] (each block's K_j^T contiguous, so
+        #       block j's QK^T gemm reads B=QK_B_blocks[j] with a block-local stride Bk).
+        Kt_blocks = torch.stack([K_fp8[j*Bk:(j+1)*Bk].t().contiguous() for j in range(Nblk)])
+        Ks_blocks = torch.stack([K_scales[j*Bk:(j+1)*Bk].t().contiguous() for j in range(Nblk)])
+        # 2D [Nblk*d][Bk] (not 3D -- a flat {row} list can't init a 3D C array); block j
+        # is rows [j*d : (j+1)*d]. Scales likewise [Nblk*GK][Bk], block j at [j*GK].
+        f.write("// ===== streaming K^T blocks: QK_B_blocks[j*FA_D : ] = K_j^T [d][Bk] =====\n")
+        emit_fp8(f, "QK_B_blocks", Kt_blocks.reshape(Nblk * d, Bk), "[FA_NBLK*FA_D][FA_BK]")
+        emit_scale(f, "QK_B_scales_blocks", Ks_blocks.reshape(Nblk * GK, Bk), "[FA_NBLK*FA_GK][FA_BK]")
 
         f.write("// ===== final reference attention output O (bf16) =====\n")
         emit_bf16(f, "O_ref_bf16", O_ref, "[FA_SQ][FA_D]")

@@ -22,12 +22,14 @@ static const uint8_t C_lut[64][16] = {0};
 #include "flash_mx_impl.hpp"
 
 // QK^T: S = Q@K^T, M=Sq N=Sk K=d. PV: O = P@V, M=Sq N=d K=Sk.
+// Streaming (flash) per-key-block gemms: QK_j = Q@K_j^T is [Sq][Bk] (N=Bk); PV_j = P_j@V_j
+// contracts over Bk (K=Bk). Non-square tiles (Bk != Sq/d) -> square assert relaxed.
 constexpr GemmConfig QK{
-    .TILE_M = FA_SQ, .TILE_N = FA_SK, .TILE_K = FA_D,
+    .TILE_M = FA_SQ, .TILE_N = FA_BK, .TILE_K = FA_D,
     .DATATYPE = GemmDatatype::FP8, .QUANT_OUTPUT = false,
 };
 constexpr GemmConfig PV{
-    .TILE_M = FA_SQ, .TILE_N = FA_D, .TILE_K = FA_SK,
+    .TILE_M = FA_SQ, .TILE_N = FA_D, .TILE_K = FA_BK,
     .DATATYPE = GemmDatatype::FP8, .QUANT_OUTPUT = false,
 };
 // Requantizer config: requantize the softmax P tile [Sq][Sk] (bf16) to MX FP8.
@@ -54,72 +56,81 @@ static constexpr uint32_t P_SMEM = 0x10000;
 // Per-scale SMEM scratch (one 32-bit word per E8M0 code) -- avoids overlapping
 // vectorized byte stores; packed to contiguous GMEM bytes by pack_scales_to_gmem.
 static constexpr uint32_t SCALE_SMEM = 0xD000;
+// Streaming online-softmax state (persistent across key blocks), each [Sq] uint16 (bf16).
+static constexpr uint32_t M_SMEM    = 0xB000;   // running row max
+static constexpr uint32_t LS_SMEM   = 0xB400;   // running row denom l
+static constexpr uint32_t CORR_SMEM = 0xB800;   // per-row rescale corr = exp(m_old-m_new)
+// Running unnormalized output accumulator O_acc[Sq][d] (bf16), persistent across blocks.
+static constexpr uint32_t OACC_SMEM = 0x18000;
 
 void fa_entry(void *arg, uint32_t tid_in_threadblock,
               uint32_t threads_per_threadblock, uint32_t threadblock_id) {
     const auto wpb = threads_per_threadblock / MU_NUM_THREADS;
+    const auto tid = tid_in_threadblock;
+    const auto thr = threads_per_threadblock;
 
-    // ---- QK^T: S = Q @ K^T (Gemmini MX FP8 mesh) -> bf16 S in SMEM @ SPAD_DEST ----
-    // single_output_tile leaves the bf16 result tile in SMEM (no GMEM move-out).
-    mxgemm_single_output_tile<QK>(&QK_A_in[0][0], &QK_B_in[0][0],
-                                  &QK_A_scales_row[0][0], &QK_B_scales_col[0][0],
-                                  FA_SQ, FA_SK, FA_D,
-                                  tid_in_threadblock, threads_per_threadblock);
-    mu_barrier(3, wpb);  // all warps wait for thread-0's gemm (+ gemmini_fence)
+    // ===== Streaming (flash) attention: loop over FA_NBLK key blocks of Bk. Running
+    // online-softmax state (m, l, O_acc) lives in SMEM across blocks; 1/l is deferred to
+    // the finalize. Mirrors FA.mx_attention_flash -> validated against golden_O_flash. =====
+    for (uint32_t j = 0; j < FA_NBLK; j++) {
+        const uint32_t first = (j == 0);
 
-    // ---- PREFETCH V for the PV gemm: thread-0 issues the V GMEM->SMEM move-in + config
-    //      + V-scale load ASYNC (no gemmini_fence), then falls through to softmax. The V
-    //      DMA overlaps the SIMT softmax+requant below (which produce P), hiding the PV
-    //      move-in latency that was ~40 % of the run. B=V, A(=P) skipped (SKIP_A). ----
-    mxgemm_prefetch_tile<PV, /*SKIP_A=*/true>(
-        &V_in[0][0] /*A unused*/, &V_in[0][0],
-        &V_scales[0][0] /*A scales unused*/, &V_scales[0][0],
-        FA_SQ, FA_D, FA_SK, tid_in_threadblock);
+        // QK_j: S_j = Q @ K_j^T  -> bf16 S_j @ SPAD_DEST. K_j^T = QK_B_blocks[j] [d][Bk].
+        mxgemm_single_output_tile<QK>(
+            &QK_A_in[0][0], &QK_B_blocks[j * FA_D][0],
+            &QK_A_scales_row[0][0], &QK_B_scales_blocks[j * FA_GK][0],
+            FA_SQ, FA_BK, FA_D, tid, thr);
+        mu_barrier(2, wpb);
 
-    // ---- softmax(S * scale): activate in SIMT, write normalized P (bf16) to SMEM ----
-    softmax_to_smem<FA_SQ, FA_SK>(
-        reinterpret_cast<const __shared uint32_t *>(S_SMEM),
-        reinterpret_cast<__shared uint32_t *>(P_SMEM),
-        reinterpret_cast<float *>(L_GMEM),
-        reinterpret_cast<__shared uint16_t *>(L_SMEM),
-        SOFTMAX_SCALE_BF16, tid_in_threadblock, threads_per_threadblock);
-    mu_fence_smem();
-    mu_barrier(4, wpb);
+        // online softmax(S_j*scale): update running m/l, emit corr, write UNNORMALIZED
+        // P_j = exp(S_j*scale - m_new) (bf16) -> P_SMEM.
+        online_softmax_block<FA_SQ, FA_BK>(
+            reinterpret_cast<const __shared uint32_t *>(S_SMEM),
+            reinterpret_cast<__shared uint32_t *>(P_SMEM),
+            reinterpret_cast<__shared uint16_t *>(M_SMEM),
+            reinterpret_cast<__shared uint16_t *>(LS_SMEM),
+            reinterpret_cast<__shared uint16_t *>(CORR_SMEM),
+            SOFTMAX_SCALE_BF16, first, tid, thr);
+        mu_fence_smem();
+        mu_barrier(3, wpb);
 
-    // ---- SIMT MX-FP8 requant of P, written ENTIRELY to SMEM (no GMEM round-trip / no
-    //      unreliable global fence): e4m3 elements -> A scratchpad (spad 0) in the tiled
-    //      layout the mesh expects; per-row E8M0 scales -> SMEM scratch (word per scale).
-    //      P is 1/l-normalized so PV yields the final O. Uses the validated encoder.
-    requant_P_to_spad_tiled<FA_SQ, FA_SK>(
-        reinterpret_cast<const __shared uint16_t *>(P_SMEM),
-        reinterpret_cast<__shared uint32_t *>(0 /* A-spad base = SMEM byte 0 */),
-        reinterpret_cast<__shared uint32_t *>(SCALE_SMEM),
-        tid_in_threadblock, threads_per_threadblock);
-    mu_fence_smem();
-    mu_barrier(7, wpb);
+        // requant P_j -> fp8 A-spad (tiled) + per-32-block E8M0 scales -> SCALE_SMEM.
+        requant_P_to_spad_tiled<FA_SQ, FA_BK>(
+            reinterpret_cast<const __shared uint16_t *>(P_SMEM),
+            reinterpret_cast<__shared uint32_t *>(0 /* A-spad base */),
+            reinterpret_cast<__shared uint32_t *>(SCALE_SMEM), tid, thr);
+        mu_fence_smem();
+        mu_barrier(4, wpb);
 
-    // ---- pack the SMEM scale scratch -> contiguous E8M0 bytes in the A scale SRAM
-    //      (GEMMINI_SF_MEM_A), where the PV mesh reads A scales. Word stores (4/word),
-    //      thread-0 -> no overlapping sub-word stores. fence.s makes it mesh-visible.
-    pack_scales_to_sfmem<FA_SQ, FA_SK>(
-        reinterpret_cast<const __shared uint32_t *>(SCALE_SMEM),
-        reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_A), tid_in_threadblock);
-    mu_fence_smem();
-    mu_barrier(6, wpb);
+        // pack scales -> A scale SRAM (SF_MEM_A) for the PV mesh.
+        pack_scales_to_sfmem<FA_SQ, FA_BK>(
+            reinterpret_cast<const __shared uint32_t *>(SCALE_SMEM),
+            reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_A), tid);
+        mu_fence_smem();
+        mu_barrier(5, wpb);
 
-    // ---- PV COMPUTE: O = P @ V. V was prefetched above (already in B-spad); A=P fp8 in
-    //      spad 0 + A-scales in SF-SRAM (from requant/pack). Just drain the V DMA + matmul.
-    mxgemm_compute_tile<PV>(tid_in_threadblock);
-    mu_barrier(5, wpb);
+        // PV_j: PV = P_j @ V_j  (SKIP_A: P in spad + scales in SF-SRAM). B=V_j row-slice
+        // V_in[j*Bk:(j+1)*Bk]; B_scales = V_scales[j*Bk/32:...]. -> bf16 PV @ SPAD_DEST.
+        mxgemm_single_output_tile<PV, /*barrier_tile=*/false, /*SKIP_A=*/true>(
+            &V_in[j * FA_BK][0], &V_in[j * FA_BK][0],
+            &V_scales[j * FA_GKB][0], &V_scales[j * FA_GKB][0],
+            FA_SQ, FA_D, FA_BK, tid, thr);
+        mu_barrier(6, wpb);
 
-    // ---- move final O (bf16) SPAD_DEST -> GMEM. SIMT copy (no /l: P was pre-normalized).
-    //  KNOWN ISSUE (see FA_kernel.md): post-requant SIMT stores use a corrupted base
-    //  register, AND the Gemmini-DMA move-out alternative asserts PutPartial on the SMEM
-    //  xbar. O-output is the open blocker; requires the requantizer usage protocol. ----
-    copy_smem_to_gmem_simt<FA_SQ, FA_D, sizeof(uint16_t)>(
-        reinterpret_cast<const __shared uint8_t *>(S_SMEM),
-        reinterpret_cast<uint8_t *>(O_GMEM),
-        tid_in_threadblock, threads_per_threadblock);
+        // O_acc = (first ? 0 : O_acc*corr) + PV_j   (PV_j read from SPAD_DEST == S_SMEM).
+        rescale_accumulate<FA_SQ, FA_D>(
+            reinterpret_cast<__shared uint32_t *>(OACC_SMEM),
+            reinterpret_cast<const __shared uint32_t *>(S_SMEM),
+            reinterpret_cast<const __shared uint16_t *>(CORR_SMEM), first, tid, thr);
+        mu_fence_smem();
+        mu_barrier(7, wpb);
+    }
+
+    // ---- finalize: O = O_acc / l  -> GMEM (bf16). ----
+    finalize_O<FA_SQ, FA_D>(
+        reinterpret_cast<const __shared uint32_t *>(OACC_SMEM),
+        reinterpret_cast<const __shared uint16_t *>(LS_SMEM),
+        reinterpret_cast<uint32_t *>(O_GMEM), tid, thr);
 }
 
 int main() {

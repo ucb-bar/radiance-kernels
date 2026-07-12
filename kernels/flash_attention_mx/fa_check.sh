@@ -18,23 +18,25 @@ ELF=$KDIR/flash_attention_mx.soc.elf
 OUT=$OUTD/flash_attention_mx.soc.out
 CFG=RadianceTapeoutSimConfig
 
-[ $# -ge 3 ] || { echo "usage: fa_check.sh Sq Sk d [--seed=N] [--thresh=PCT] [--profile] [--build-only]"; exit 2; }
+[ $# -ge 3 ] || { echo "usage: fa_check.sh Sq Sk d [--bk=N] [--seed=N] [--thresh=PCT] [--profile] [--build-only]"; exit 2; }
 Sq=$1; Sk=$2; d=$3; shift 3
-seed=0; thresh=5.0; profile=0; buildonly=0
+seed=0; thresh=5.0; profile=0; buildonly=0; bk=0
 for a in "$@"; do case $a in
+  --bk=*)     bk=${a#*=} ;;
   --seed=*)   seed=${a#*=} ;;
   --thresh=*) thresh=${a#*=} ;;
   --profile)  profile=1 ;;
   --build-only) buildonly=1 ;;
   *) echo "unknown arg: $a"; exit 2 ;;
 esac; done
+[ $bk = 0 ] && bk=$Sk    # default: single key block (Nblk=1)
 
 source $KG/kernel-build-env.sh 2>/dev/null
 cd $KDIR
 
-echo "[1/4] gen data+goldens  Sq=$Sq Sk=$Sk d=$d seed=$seed"
-python3 fa_gen_data.py    --Sq $Sq --Sk $Sk --d $d --seed $seed >/tmp/fa_gen.log 2>&1 || { echo "  GEN(data) FAIL"; tail -20 /tmp/fa_gen.log; exit 1; }
-python3 fa_gen_goldens.py --Sq $Sq --Sk $Sk --d $d --seed $seed >>/tmp/fa_gen.log 2>&1 || { echo "  GEN(golden) FAIL"; tail -20 /tmp/fa_gen.log; exit 1; }
+echo "[1/4] gen data+goldens  Sq=$Sq Sk=$Sk d=$d bk=$bk seed=$seed"
+python3 fa_gen_data.py    --Sq $Sq --Sk $Sk --d $d --block_n $bk --seed $seed >/tmp/fa_gen.log 2>&1 || { echo "  GEN(data) FAIL"; tail -20 /tmp/fa_gen.log; exit 1; }
+python3 fa_gen_goldens.py --Sq $Sq --Sk $Sk --d $d --block_n $bk --seed $seed >>/tmp/fa_gen.log 2>&1 || { echo "  GEN(golden) FAIL"; tail -20 /tmp/fa_gen.log; exit 1; }
 
 echo "[2/4] build"
 rm -f flash_attention_mx.mu.o
@@ -60,7 +62,7 @@ echo "  finished in ${dt}s, ${cyc:-?} cycles"
 echo "[4/4] verify O vs golden_O_normfirst"
 nb=$(( Sq * d * 2 ))
 rep=$(python3 $KDIR/fa_verify_out.py "$OUT" --base 0x40040000 --nbytes $nb \
-        --golden $KDIR/golden_O_normfirst_u16.npy --rows $Sq --cols $d --elem-bytes 2 2>&1)
+        --golden $KDIR/golden_O_flash_u16.npy --rows $Sq --cols $d --elem-bytes 2 2>&1)
 echo "$rep" | grep -iE 'cells covered|Frobenius'
 err=$(echo "$rep" | grep -oE 'rel err vs golden: [0-9.]+' | grep -oE '[0-9.]+' | head -1)
 if [ -z "$err" ]; then echo "RESULT: FAIL (no O parsed)"; exit 1; fi
