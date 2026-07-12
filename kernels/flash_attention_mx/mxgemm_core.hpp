@@ -87,7 +87,8 @@ static inline void configure_mxgemmini(const uint32_t dim_m,
     static_assert(C.TILE_K >= 32 && (C.TILE_K % 32) == 0,
                   "tile K dimension is not a multiple of block size (32)");
 
-    gemmini_flush(0);
+    // NOTE: gemmini_flush hoisted to once-per-kernel (fa_entry); between gemms the mesh is
+    // fenced-idle so a per-gemm flush is redundant overhead.
 
     constexpr auto GEMMINI_FORMAT =
         C.DATATYPE == GemmDatatype::FP8 ? GEMMINI_FORMAT_FP8 :
@@ -129,20 +130,15 @@ static inline void configure_mxgemmini(const uint32_t dim_m,
     // Configure loop bounds for the loop FSM
     // This only needs to be done once since the kernel does not change the
     // SMEM tile size
+    // Configure the two loop FSMs (issued back-to-back); a single fence drains both.
     gemmini_loop_ws_config_bounds(
         C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
         0, 0, 0 // pad_I=0, pad_J=0, pad_K=0
     );
-
-    // wait for configuration finish
-    gemmini_fence();
-
-    // NOTE: we need to run this twice to configure the two FSMs
     gemmini_loop_ws_config_bounds(
         C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
         0, 0, 0 // pad_I=0, pad_J=0, pad_K=0
     );
-    // wait for configuration finish
     gemmini_fence();
 }
 

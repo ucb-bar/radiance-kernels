@@ -75,6 +75,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     const auto tid = tid_in_threadblock;
     const auto thr = threads_per_threadblock;
     uint32_t mki = 0;
+    if (tid == 0) gemmini_flush(0);   // once per kernel (hoisted out of per-gemm config)
     MARK();  // 0: entry
 
     // ===== Streaming (flash) attention: loop over FA_NBLK key blocks of Bk. Running
