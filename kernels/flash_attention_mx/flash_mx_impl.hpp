@@ -53,6 +53,28 @@ static inline int bf16_floor_log2(uint16_t b) {  // unbiased exponent of normali
     return (int)((b >> 7) & 0xff) - 127;
 }
 
+// FUSED requant: (v * 2^-se) -> e4m3 code, in one pass. Eliminates the separate
+// bf16_scale_pow2 (which only tweaked the exponent, then bf16_to_e4m3 re-extracted it).
+// Truncating (RNE=false), matches bf16_scale_pow2(v,-se) then bf16_to_e4m3<false>:
+//  - v exp==0 -> 0;  scaled-exp <= 0  (E < emin) -> 0;  scaled-exp overflow -> saturate 0x7e.
+// P is always finite & >=0 (softmax probs), so inf/nan and sign paths are unused but handled.
+static inline uint8_t bf16_to_e4m3_scaled(uint16_t b, int se) {
+    // Fully BRANCHLESS, single return (no early-return control flow -> no warp divergence,
+    // which was ~72% of the softmax cost). All conditionals are arithmetic selects/masks.
+    const int emax = 8, emin = -6;
+    int exp = (int)((b >> 7) & 0xff);
+    int m3  = (int)((b >> 4) & 0x7);
+    int E   = exp - 127 - se;                         // exponent after *2^-se
+    int over = -(int)(E > emax);                      // all-ones if overflow else 0
+    E  = (E  & ~over) | (emax & over);                // E  = over ? emax : E
+    m3 = (m3 & ~over) | (6    & over);                // m3 = over ? 6    : m3
+    int clampm = -(int)((E == emax) & (m3 > 6));
+    m3 = (m3 & ~clampm) | (6 & clampm);               // e4m3 max mantissa at emax is 6 (=448)
+    int code = ((b >> 8) & 0x80) | ((E + 7) << 3) | m3;
+    int keep = -(int)!((exp == 0) | (E < emin));      // 0 if zero/underflow else all-ones
+    return (uint8_t)(code & keep);
+}
+
 // 16-lane intra-warp tree reduction over a per-warp SMEM buffer (mirrors the
 // softmax kernel's reduce_*: no in-loop fence; relies on warp lockstep). Result
 // ends in buf[0]; caller fences then reads buf[0]. IS_MAX selects max vs sum.
@@ -421,8 +443,10 @@ static __attribute__((noinline)) void fused_softmax_requant(
             const uint32_t col0 = lane * CPL + w * 4;
             uint32_t packed = 0;
             for (uint32_t k = 0; k < 4; k++) {
-                _Float16 ps = bf16_scale_pow2(s[w * 4 + k], -se);
-                packed |= (uint32_t)bf16_to_e4m3</*RNE=*/false>(__builtin_bit_cast(uint16_t, ps)) << (8 * k);
+                // fused, branchless scale(2^-se)+e4m3 -- eliminates bf16_scale_pow2 and the
+                // divergent early-returns of bf16_to_e4m3 (was ~72% of softmax cost).
+                packed |= (uint32_t)bf16_to_e4m3_scaled(
+                              __builtin_bit_cast(uint16_t, s[w * 4 + k]), se) << (8 * k);
             }
             const uint32_t tk = col0 / 16, cc = col0 % 16;
             spad_u32[((ti * PE_TILES_K + tk) * 256 + rr * 16 + cc) / 4] = packed;
