@@ -87,10 +87,15 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         const uint32_t first = (j == 0);
 
         // QK_j: S_j = Q @ K_j^T  -> bf16 S_j @ SPAD_DEST. K_j^T = QK_B_blocks[j] [d][Bk].
-        mxgemm_single_output_tile<QK, /*barrier_tile=*/false, /*SKIP_A=*/false, /*DO_CONFIG=*/false>(
+        // FA QK is a SINGLE K-tile (dim_k=FA_D=TILE_K), so use the slim prefetch+compute
+        // path (like PV) instead of mxgemm_single_output_tile's dead software-pipelined
+        // K-loop -- drops the heavy gemm fn (33 arch regs) from the call graph, shrinking
+        // the per-warp register footprint F toward the <=63 needed for 4 warps.
+        mxgemm_prefetch_tile<QK, /*SKIP_A=*/false, /*DO_CONFIG=*/false>(
             &QK_A_in[0][0], &QK_B_blocks[j * FA_D][0],
             &QK_A_scales_row[0][0], &QK_B_scales_blocks[j * FA_GK][0],
-            FA_SQ, FA_BK, FA_D, tid, thr);
+            FA_SQ, FA_BK, FA_D, tid);
+        mxgemm_compute_tile<QK>(tid);
         mu_barrier(2, wpb); MARK();
 
         // PREFETCH V_j for PV: async move-in (no fence) -> overlaps softmax+requant below,
@@ -143,7 +148,8 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 }
 
 int main() {
-    mu_schedule(fa_entry, nullptr, 2);  // 2 warps: >=3 overflows the physical RF (Rename.sv),
-                                        // even post-fusion (gemm register pressure). Firm cap.
+    mu_schedule(fa_entry, nullptr, 3);  // 3 warps/core (occupancy): slim QK path dropped F to ~57;
+                                        // occ=4 overflowed the 256 phys-reg file, occ=3 (3*57=171)
+                                        // has margin. More warps hide the latency-bound SIMT softmax.
     return 0;
 }
