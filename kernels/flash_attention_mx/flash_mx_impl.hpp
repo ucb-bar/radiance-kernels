@@ -280,6 +280,73 @@ static __attribute__((noinline)) void online_softmax_block(
     }
 }
 
+// THREAD-PER-ROW fused softmax + requant. Each lane owns a WHOLE row (grid-strided by
+// the total lane count), so ALL reductions (row max, row sum, per-block max) are done in
+// registers -- NO cross-lane communication, hence NO per-row mu_fence_smem. This kills the
+// dominant cost of the cooperative version: ~4 fence.s/row that each drained the SMEM store
+// queue under 96-lane contention (~1000+ cyc each => ~60% of total kernel cycles). S is
+// re-read from SMEM per pass (cheap) to keep the register footprint (F) small. The caller
+// issues ONE mu_fence_smem after this returns to publish P/scales to the PV mesh.
+// Same math + same output layout as the cooperative version (verified identical results).
+template <uint32_t SQ, uint32_t BK>
+static __attribute__((noinline)) void fused_softmax_requant_tpr(
+        const __shared uint16_t *S_smem16, __shared uint32_t *spad_u32,
+        __shared uint32_t *scale_scratch,
+        __shared uint16_t *m_state, __shared uint16_t *l_state, __shared uint16_t *corr_out,
+        uint16_t softmax_scale_bf16, uint32_t first_block,
+        uint32_t tid_in_threadblock, uint32_t threads_per_threadblock) {
+    constexpr uint32_t NBLK = BK / 32;            // MX blocks per row
+    constexpr uint32_t PE_TILES_K = BK / 16;
+    const uint32_t glane = tid_in_threadblock;    // this lane's global index
+    const uint32_t nlanes = threads_per_threadblock;
+    const _Float16 scale = as_bf16(softmax_scale_bf16);
+
+    for (uint32_t row = glane; row < SQ; row += nlanes) {
+        const __shared uint16_t *Srow = S_smem16 + row * BK;
+        // Pass A: row max of scaled S (registers only).
+        _Float16 rmax = as_bf16(NEG_INF_BF16_BITS);
+        for (uint32_t c = 0; c < BK; c++)
+            rmax = fmaxf(rmax, (_Float16)(as_bf16(Srow[c]) * scale));
+        const _Float16 m_old = first_block ? rmax : as_bf16(m_state[row]);
+        const _Float16 m_new = fmaxf(m_old, rmax);
+        const _Float16 corr = mu_fexp((_Float16)(m_old - m_new));
+
+        // Pass B: per 32-col MX block -> block max (E8M0 scale) then requant; accumulate rowsum.
+        _Float16 rowsum = (_Float16)0;
+        const uint32_t ti = row / 16, rr = row % 16;
+        for (uint32_t b = 0; b < NBLK; b++) {
+            const uint32_t base = b * 32;
+            _Float16 bmax = (_Float16)0;          // block max of exp(P)
+            for (uint32_t k = 0; k < 32; k++) {
+                const _Float16 s = (_Float16)(as_bf16(Srow[base + k]) * scale);
+                const _Float16 e = mu_fexp((_Float16)(s - m_new));
+                bmax = fmaxf(bmax, e);
+                rowsum = (_Float16)(rowsum + e);
+            }
+            const int se = bf16_floor_log2(__builtin_bit_cast(uint16_t, bmax));
+            scale_scratch[b * SQ + row] = (uint32_t)(uint8_t)(se + 127);
+            for (uint32_t w = 0; w < 32 / 4; w++) {   // 4 e4m3 per word, tiled store
+                const uint32_t col0 = base + w * 4;
+                uint32_t packed = 0;
+                for (uint32_t k = 0; k < 4; k++) {
+                    const _Float16 s = (_Float16)(as_bf16(Srow[col0 + k]) * scale);
+                    const _Float16 e = mu_fexp((_Float16)(s - m_new));
+                    const _Float16 ps = bf16_scale_pow2(e, -se);
+                    packed |= (uint32_t)bf16_to_e4m3</*RNE=*/false>(
+                                  __builtin_bit_cast(uint16_t, ps)) << (8 * k);
+                }
+                const uint32_t tk = col0 / 16, cc = col0 % 16;
+                spad_u32[((ti * PE_TILES_K + tk) * 256 + rr * 16 + cc) / 4] = packed;
+            }
+        }
+        // Update online-softmax state (this lane owns the row -> no cross-lane, no fence).
+        const _Float16 l_old = first_block ? (_Float16)0 : as_bf16(l_state[row]);
+        l_state[row]  = __builtin_bit_cast(uint16_t, (_Float16)(l_old * corr + rowsum));
+        m_state[row]  = __builtin_bit_cast(uint16_t, m_new);
+        corr_out[row] = __builtin_bit_cast(uint16_t, corr);
+    }
+}
+
 // FUSED online-softmax + MX-FP8 requant (thorough perf rewrite). Contiguous 16-lane
 // ownership: lane owns cols [lane*CPL, +CPL), CPL=BK/16 (register-cheap; word-packed
 // disjoint spad stores, no sub-word hazard; no P_SMEM round-trip / double-read).
