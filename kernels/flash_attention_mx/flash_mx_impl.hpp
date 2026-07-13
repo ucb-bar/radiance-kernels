@@ -102,7 +102,7 @@ static inline void softmax_requant(const __shared uint32_t *S_smem32, uint8_t *P
     const _Float16 scale = as_bf16(softmax_scale_bf16);
 
     volatile __shared uint16_t *buf =
-        reinterpret_cast<volatile __shared uint16_t *>(0xC000) + warp * NT;
+        reinterpret_cast<volatile __shared uint16_t *>(0x15000) + warp * NT;
 
     _Float16 plo[WPL], phi[WPL];
     for (uint32_t row = warp; row < SQ; row += nwarps) {
@@ -183,7 +183,7 @@ static __attribute__((noinline)) void softmax_to_smem(const __shared uint32_t *S
     const uint32_t nwarps = threads_per_threadblock / NT;
     const _Float16 scale = as_bf16(softmax_scale_bf16);
     volatile __shared uint16_t *buf =
-        reinterpret_cast<volatile __shared uint16_t *>(0xC000) + warp * NT;
+        reinterpret_cast<volatile __shared uint16_t *>(0x15000) + warp * NT;
 
     for (uint32_t row = warp; row < SQ; row += nwarps) {
         const __shared uint32_t *Srow = S_smem32 + row * SKW;
@@ -239,7 +239,7 @@ static __attribute__((noinline)) void online_softmax_block(
     const uint32_t nwarps = threads_per_threadblock / NT;
     const _Float16 scale = as_bf16(softmax_scale_bf16);
     volatile __shared uint16_t *buf =
-        reinterpret_cast<volatile __shared uint16_t *>(0xC000) + warp * NT;
+        reinterpret_cast<volatile __shared uint16_t *>(0x15000) + warp * NT;
 
     for (uint32_t row = warp; row < SQ; row += nwarps) {
         const __shared uint32_t *Srow = S_smem32 + row * BKW;
@@ -303,7 +303,7 @@ static __attribute__((noinline)) void fused_softmax_requant(
     const uint32_t nwarps = threads_per_threadblock / NT;
     const _Float16 scale = as_bf16(softmax_scale_bf16);
     volatile __shared uint16_t *buf =
-        reinterpret_cast<volatile __shared uint16_t *>(0xC000) + warp * NT;
+        reinterpret_cast<volatile __shared uint16_t *>(0x15000) + warp * NT;
     const uint32_t b_of_lane = lane / LPB;       // which MX block this lane serves
 
     for (uint32_t row = warp; row < SQ; row += nwarps) {

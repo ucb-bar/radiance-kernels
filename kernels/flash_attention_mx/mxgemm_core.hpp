@@ -54,7 +54,8 @@ constexpr auto GEMMINI_FORMAT_FP4 = 2;
 constexpr auto GEMMINI_FORMAT_FULL = 3;
 constexpr auto QUANT_LUT_UPDATE_GRANULARITY = 1;
 constexpr auto GEMMINI_ACC_ADDR = (1u << (ADDR_LEN - 1));
-constexpr auto SPAD_DEST = 256; // TODO: arbitrary
+constexpr auto SPAD_DEST = 1024; // C-output spad row: clears the A-spad P-fp8 region up to
+                                 // 128x128 fp8 (1024 rows) so it works for FA tiles up to 128.
 
 // Performance benchmark options -----------------------------------------------
 
@@ -547,7 +548,7 @@ static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_
 
 /** Do matmul on a single TILE_M * TILE_N output tile, accumulating over the
  *  full GEMM_K. */
-template <GemmConfig C, bool barrier_tile = false, bool SKIP_A = false>
+template <GemmConfig C, bool barrier_tile = false, bool SKIP_A = false, bool DO_CONFIG = true>
 __attribute__((noinline)) void mxgemm_single_output_tile(const uint8_t *A_in, const uint8_t *B_in,
                                const uint8_t *A_scales, const uint8_t *B_scales,
                                const uint32_t dim_m, const uint32_t dim_n,
@@ -563,7 +564,10 @@ __attribute__((noinline)) void mxgemm_single_output_tile(const uint8_t *A_in, co
         return;
     }
 
-    configure_mxgemmini<C>(dim_m, dim_n, dim_k);
+    // DO_CONFIG=false: the persistent gemmini config was set once by the caller (valid
+    // when successive gemms share dims -- e.g. square streaming FA blocks Bk=Sq=d, where
+    // QK and PV configs are identical). Skips ~half the per-gemm ROCC command overhead.
+    if constexpr (DO_CONFIG) configure_mxgemmini<C>(dim_m, dim_n, dim_k);
 
     // -----------------
     // Initiate pipeline
@@ -686,7 +690,7 @@ __attribute__((noinline)) void mxgemm_single_output_tile(const uint8_t *A_in, co
  *  WITHOUT waiting (no gemmini_fence), so the caller can run other work (e.g. SIMT
  *  softmax/requant) while the DMA is in flight. `mxgemm_compute_tile` then drains the DMA
  *  (leading gemmini_fence) and runs the matmul, leaving C at SPAD_DEST. thread-0 only. */
-template <GemmConfig C, bool SKIP_A = false>
+template <GemmConfig C, bool SKIP_A = false, bool DO_CONFIG = true>
 __attribute__((noinline)) void mxgemm_prefetch_tile(
         const uint8_t *A_in, const uint8_t *B_in,
         const uint8_t *A_scales, const uint8_t *B_scales,
@@ -694,7 +698,7 @@ __attribute__((noinline)) void mxgemm_prefetch_tile(
         const uint32_t tid_in_threadblock) {
     asm volatile ("mxgemm_prefetch_tile_start_%=:" :: );
     if (tid_in_threadblock != 0) return;
-    configure_mxgemmini<C>(dim_m, dim_n, dim_k);
+    if constexpr (DO_CONFIG) configure_mxgemmini<C>(dim_m, dim_n, dim_k);
     copy_gmem_to_smem_async<C, SKIP_A>(A_in, B_in, dim_m, dim_n, dim_k, 0, 0, 0);
     if constexpr (!SKIP_A) {
         load_scale_factors(calculate_scale_factor_smem_addr<false>(0),

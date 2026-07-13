@@ -51,17 +51,16 @@ static constexpr uint16_t SOFTMAX_SCALE_BF16 = FA_SOFTMAX_SCALE_BF16;
 static constexpr uint32_t S_SMEM = SPAD_DEST * DIM;  // 0x1000
 // l (row denom, bf16) kept in SMEM so normalize avoids a GMEM load (which stalls).
 static constexpr uint32_t L_SMEM = 0xE000;
-// P (softmax probabilities, bf16 packed) scratch in SMEM, then fed to the requantizer.
-static constexpr uint32_t P_SMEM = 0x10000;
-// Per-scale SMEM scratch (one 32-bit word per E8M0 code) -- avoids overlapping
-// vectorized byte stores; packed to contiguous GMEM bytes by pack_scales_to_gmem.
-static constexpr uint32_t SCALE_SMEM = 0xD000;
-// Streaming online-softmax state (persistent across key blocks), each [Sq] uint16 (bf16).
-static constexpr uint32_t M_SMEM    = 0xB000;   // running row max
-static constexpr uint32_t LS_SMEM   = 0xB400;   // running row denom l
-static constexpr uint32_t CORR_SMEM = 0xB800;   // per-row rescale corr = exp(m_old-m_new)
-// Running unnormalized output accumulator O_acc[Sq][d] (bf16), persistent across blocks.
-static constexpr uint32_t OACC_SMEM = 0x18000;
+// SMEM layout sized for FA tiles up to 128x128 (bytes). A-spad (Q/P-fp8) 0..0x4000 (16KB);
+// C=SPAD_DEST (S/PV bf16) 0x4000..0xC000 (32KB); O_acc 0xC000..0x14000 (32KB); scratch
+// 0x14000+; B-spad (K/V) at the top. All non-overlapping for Sq=Bk=d in {64,128}.
+static constexpr uint32_t P_SMEM = 0x10000;     // (unused: fused_softmax_requant writes P-fp8 direct)
+static constexpr uint32_t OACC_SMEM = 0xC000;   // running unnormalized O accumulator [Sq][d] bf16
+static constexpr uint32_t SCALE_SMEM = 0x14000; // per-scale word scratch (packed -> SF-SRAM)
+static constexpr uint32_t M_SMEM    = 0x14800;  // running row max
+static constexpr uint32_t LS_SMEM   = 0x14A00;  // running row denom l
+static constexpr uint32_t CORR_SMEM = 0x14C00;  // per-row rescale corr
+static constexpr uint32_t REDBUF_SMEM = 0x15000; // per-warp tree-reduce scratch (was 0xC000)
 
 // Lightweight phase profiler: thread-0 stores the mcycle counter to a GMEM marker array
 // at each phase boundary. Parse stores to MARK_GMEM from the .out trace -> per-phase cycles.
@@ -75,7 +74,10 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     const auto tid = tid_in_threadblock;
     const auto thr = threads_per_threadblock;
     uint32_t mki = 0;
-    if (tid == 0) gemmini_flush(0);   // once per kernel (hoisted out of per-gemm config)
+    // One-time gemmini setup (hoisted out of the per-block gemms). For square streaming
+    // blocks (Bk=Sq=d) QK and PV share an identical config, so configure ONCE here and
+    // pass DO_CONFIG=false below -> skips ~half the per-gemm ROCC command overhead.
+    if (tid == 0) { gemmini_flush(0); configure_mxgemmini<QK>(FA_SQ, FA_BK, FA_D); }
     MARK();  // 0: entry
 
     // ===== Streaming (flash) attention: loop over FA_NBLK key blocks of Bk. Running
@@ -85,7 +87,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         const uint32_t first = (j == 0);
 
         // QK_j: S_j = Q @ K_j^T  -> bf16 S_j @ SPAD_DEST. K_j^T = QK_B_blocks[j] [d][Bk].
-        mxgemm_single_output_tile<QK>(
+        mxgemm_single_output_tile<QK, /*barrier_tile=*/false, /*SKIP_A=*/false, /*DO_CONFIG=*/false>(
             &QK_A_in[0][0], &QK_B_blocks[j * FA_D][0],
             &QK_A_scales_row[0][0], &QK_B_scales_blocks[j * FA_GK][0],
             FA_SQ, FA_BK, FA_D, tid, thr);
@@ -93,7 +95,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 
         // PREFETCH V_j for PV: async move-in (no fence) -> overlaps softmax+requant below,
         // hiding PV's DMA/config latency (was ~50 k cyc). SKIP_A (A=P comes from requant).
-        mxgemm_prefetch_tile<PV, /*SKIP_A=*/true>(
+        mxgemm_prefetch_tile<PV, /*SKIP_A=*/true, /*DO_CONFIG=*/false>(
             &V_in[j * FA_BK][0], &V_in[j * FA_BK][0],
             &V_scales[j * FA_GKB][0], &V_scales[j * FA_GKB][0],
             FA_SQ, FA_D, FA_BK, tid);
