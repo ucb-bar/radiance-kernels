@@ -576,7 +576,9 @@ static __attribute__((noinline)) void requant_P_to_spad_tiled(
 template <uint32_t SQ, uint32_t SK>
 static __attribute__((noinline)) void pack_scales_to_sfmem(
         const __shared uint32_t *scale_scratch, __shared uint32_t *sfmem_a32,
-        uint32_t tid_in_threadblock) {
+        uint32_t tid_in_threadblock, uint32_t threads_per_threadblock) {
+    // NOTE: MUST be single-warp, program-order writes -- the SF-SRAM/requantizer scale
+    // interface corrupts under multi-warp parallel writes (verified: parallel -> 0 output).
     if (tid_in_threadblock != 0) return;
     constexpr uint32_t NS = (SK / 32) * SQ;             // total E8M0 scale bytes
     for (uint32_t w = 0; w < NS / 4; w++) {

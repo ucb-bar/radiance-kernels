@@ -130,7 +130,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         // pack scales -> A scale SRAM (SF_MEM_A) for the PV mesh.
         pack_scales_to_sfmem<FA_SQ, FA_BK>(
             reinterpret_cast<const __shared uint32_t *>(SCALE_SMEM),
-            reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_A), tid);
+            reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_A), tid, thr);
         mu_fence_smem();
         mu_barrier(4, wpb); MARK();
 
