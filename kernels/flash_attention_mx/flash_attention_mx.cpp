@@ -55,18 +55,24 @@ static constexpr uint32_t L_SMEM = 0xE000;
 // C=SPAD_DEST (S/PV bf16) 0x4000..0xC000 (32KB); O_acc 0xC000..0x14000 (32KB); scratch
 // 0x14000+; B-spad (K/V) at the top. All non-overlapping for Sq=Bk=d in {64,128}.
 static constexpr uint32_t P_SMEM = 0x10000;     // (unused: fused_softmax_requant writes P-fp8 direct)
-// ===== OVERLAP layout (Sq=64,Bk=64): Q resident @0 (const), double-buffered S0/S1, P off the
-// A-spad so QK_{j+1} (reads Q@0) and softmax_j (writes P) don't collide, separate PVout + O_acc. =====
-static constexpr uint32_t S0_SMEM   = 0x4000;   // S buffer 0 (byte); row = SPAD_DEST(1024)
-static constexpr uint32_t S1_SMEM   = 0x6000;   // S buffer 1 (byte); row = 1536
-static constexpr uint32_t PSPAD_SMEM= 0x8000;   // softmax P output (byte); PV reads A here (row 2048)
-static constexpr uint32_t PVOUT_SMEM= 0x9000;   // PV output (byte); row 2304
-static constexpr uint32_t OACC_SMEM = 0xD000;   // running unnormalized O accumulator [Sq][d] bf16
-static constexpr uint32_t SCALE_SMEM = 0x14000; // per-scale word scratch (packed -> SF-SRAM)
-static constexpr uint32_t M_SMEM    = 0x14800;  // running row max
-static constexpr uint32_t LS_SMEM   = 0x14A00;  // running row denom l
-static constexpr uint32_t CORR_SMEM = 0x14C00;  // per-row rescale corr
-static constexpr uint32_t REDBUF_SMEM = 0x15000; // per-warp tree-reduce scratch (was 0xC000)
+// ===== BANK-AWARE OVERLAP layout (Sq=64,Bk=64). CRITICAL: the scratchpad has 4 banks of
+// BANK_ROWS*DIM=32KB each; each bank's DMA read queue is depth-4 and un-backpressured. During
+// overlap the mesh reads Q (bank0) + K (bank3) while SIMT reads S[cur] (bank1/2) + scratch (bank3)
+// -- these MUST be on different banks or the read queue overflows (Scratchpad.scala:220). So:
+//   bank0(0x0)   : Q (mesh A, streamed) + P (softmax out / PV A)
+//   bank1(0x8000): S0 + O_acc
+//   bank2(0x10000): S1 + PVout
+//   bank3(0x18000): scratch (SIMT) + K/V (mesh B, loaded-once low-rate) at the top
+static constexpr uint32_t PSPAD_SMEM= 0x2000;   // softmax P output (bank0); PV reads A here (row 512)
+static constexpr uint32_t S0_SMEM   = 0x8000;   // S buffer 0 (bank1); row 2048
+static constexpr uint32_t OACC_SMEM = 0xA000;   // O accumulator [Sq][d] bf16 (bank1)
+static constexpr uint32_t S1_SMEM   = 0x10000;  // S buffer 1 (bank2); row 4096
+static constexpr uint32_t PVOUT_SMEM= 0x12000;  // PV output (bank2); row 4608
+static constexpr uint32_t SCALE_SMEM = 0x18000; // per-scale word scratch (bank3, packed -> SF-SRAM)
+static constexpr uint32_t M_SMEM    = 0x18800;  // running row max (bank3)
+static constexpr uint32_t LS_SMEM   = 0x18A00;  // running row denom l (bank3)
+static constexpr uint32_t CORR_SMEM = 0x18C00;  // per-row rescale corr (bank3)
+static constexpr uint32_t REDBUF_SMEM = 0x19000; // per-warp tree-reduce scratch (bank3)
 
 // Lightweight phase profiler: thread-0 stores the mcycle counter to a GMEM marker array
 // at each phase boundary. Parse stores to MARK_GMEM from the .out trace -> per-phase cycles.
@@ -87,7 +93,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     // is issued ASYNC into S[nxt] (mesh computes it during softmax_j reading S[cur]); drained
     // before PV_j. Q resident @ row 0 (const); softmax writes P to PSPAD (row 2048) so it never
     // collides with Q. S=16KB double-buffers in-region. =====
-    constexpr uint32_t S_ROW[2]  = {SPAD_DEST, S1_SMEM / DIM};   // QK C-output spad rows
+    constexpr uint32_t S_ROW[2]  = {S0_SMEM / DIM, S1_SMEM / DIM};   // QK C-output spad rows
     constexpr uint32_t S_BYTE[2] = {S0_SMEM, S1_SMEM};           // softmax S read (byte)
     constexpr uint32_t PSPAD_ROW = PSPAD_SMEM / DIM;             // PV A(=P) spad row (2048)
     constexpr uint32_t PVOUT_ROW = PVOUT_SMEM / DIM;             // PV C-output spad row (2304)
