@@ -115,28 +115,30 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         const uint32_t first = (j == 0);
         const uint32_t cur = j & 1, nxt = (j + 1) & 1;
 
-        // Issue QK_{j+1} ASYNC -> S[nxt] (overlaps softmax_j below). Reload Q(@0)+Qscales since
-        // the prev block's PV overwrote SF_MEM_A with P scales.
-        if (j + 1 < FA_NBLK) {
-            mxgemm_prefetch_tile<QK, /*SKIP_A=*/false, /*DO_CONFIG=*/true>(
-                &QK_A_in[0][0], &QK_B_blocks[(j + 1) * FA_D][0], &QK_A_scales_row[0][0],
-                &QK_B_scales_blocks[(j + 1) * FA_GK][0], FA_SQ, FA_BK, FA_D, tid);
-            mxgemm_compute_issue<QK>(tid, /*c_spad=*/S_ROW[nxt]);   // async, no fence
+        // WARPSPEC (virgo-style): warp 0 = PRODUCER (drives ONLY the mesh: issue QK_{j+1} + fence,
+        // no SIMT work -> clean gemmini command stream); warps 1+ = CONSUMERS (softmax_j on S[cur]).
+        // Producer's fenced gemm runs on the mesh WHILE consumers do softmax on SIMT -> overlap.
+        const uint32_t warp = tid / MU_NUM_THREADS;
+        if (warp == 0) {
+            if (j + 1 < FA_NBLK) {
+                mxgemm_prefetch_tile<QK, /*SKIP_A=*/false, /*DO_CONFIG=*/true>(
+                    &QK_A_in[0][0], &QK_B_blocks[(j + 1) * FA_D][0], &QK_A_scales_row[0][0],
+                    &QK_B_scales_blocks[(j + 1) * FA_GK][0], FA_SQ, FA_BK, FA_D, tid);
+                mxgemm_compute_tile<QK>(tid, /*c_spad=*/S_ROW[nxt]);   // WITH fence (producer owns mesh)
+            }
+        } else {
+            // consumers: warps 1..nwarps-1 (shift tid/thr by one warp so warp1->warp0 internally).
+            fused_softmax_requant<FA_SQ, FA_BK>(
+                reinterpret_cast<const __shared uint16_t *>(S_BYTE[cur]),
+                reinterpret_cast<__shared uint32_t *>(P_BYTE[cur]),
+                reinterpret_cast<__shared uint32_t *>(SCALE_SMEM),
+                reinterpret_cast<__shared uint16_t *>(M_SMEM),
+                reinterpret_cast<__shared uint16_t *>(LS_SMEM),
+                reinterpret_cast<__shared uint16_t *>(CORR_SMEM),
+                SOFTMAX_SCALE_BF16, first, tid - MU_NUM_THREADS, thr - MU_NUM_THREADS);
         }
-
-        // softmax_j reads S[cur], writes P[cur] -- both on bank_cur (NO mesh access), so no
-        // read-queue overflow / mesh-starvation. mesh computes QK_{j+1} concurrently on banks 0/3/nxt.
-        fused_softmax_requant<FA_SQ, FA_BK>(
-            reinterpret_cast<const __shared uint16_t *>(S_BYTE[cur]),
-            reinterpret_cast<__shared uint32_t *>(P_BYTE[cur]),
-            reinterpret_cast<__shared uint32_t *>(SCALE_SMEM),
-            reinterpret_cast<__shared uint16_t *>(M_SMEM),
-            reinterpret_cast<__shared uint16_t *>(LS_SMEM),
-            reinterpret_cast<__shared uint16_t *>(CORR_SMEM),
-            SOFTMAX_SCALE_BF16, first, tid, thr);
         mu_fence_smem();
-        if (j + 1 < FA_NBLK) mxgemm_drain(tid);   // QK_{j+1} done -> S[nxt] ready + SF_MEM free
-        mu_barrier(2, wpb); MARK();
+        mu_barrier(2, wpb); MARK();   // sync producer (mesh done) + consumers (softmax done)
 
         // pack P scales -> SF_MEM_A (safe now: QK_{j+1} drained, no longer reading SF_MEM).
         pack_scales_to_sfmem<FA_SQ, FA_BK>(
