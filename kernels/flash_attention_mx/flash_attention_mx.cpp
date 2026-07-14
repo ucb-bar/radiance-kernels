@@ -60,19 +60,22 @@ static constexpr uint32_t P_SMEM = 0x10000;     // (unused: fused_softmax_requan
 // During overlap: mesh reads Q(bank0)+K(bank3), writes S[nxt]; SIMT reads S[cur]+scratch, writes
 // P. Key trick: P OVERWRITES S[cur] in-place (softmax loads S to regs first, then S[cur] is dead)
 // so P always lands on bank_cur -- a bank with NO mesh access. scratch shares bank0 w/ Q (low rate).
-//   bank0(0x0)    : Q (mesh A, streamed -- kept ALONE during overlap) + PVout (post-drain only)
-//   bank1(0x8000) : S0/P0 + O_acc
+// CRITICAL: mesh READ banks (Q=bank0, K=bank3) must be CLEAN of SIMT (SIMT scratch on K's bank
+// starved the mesh K-read -> reservation-station stall). So scratch lives on bank1 (an S bank);
+// it only shares with SIMT accesses (temporally separated from S-reads). K/V stay bank3 (mesh-only).
+//   bank0(0x0)    : Q (mesh A) + PVout (post-drain only)
+//   bank1(0x8000) : S0/P0 + O_acc + scratch (all SIMT)
 //   bank2(0x10000): S1/P1
-//   bank3(0x18000): scratch (SIMT) + K/V (mesh B, weight-stationary: loaded once, brief) at top
+//   bank3(0x18000): K/V (mesh B) at top -- CLEAN of SIMT during overlap
 static constexpr uint32_t PVOUT_SMEM= 0x2000;   // PV output (bank0; row 512); post-drain only
-static constexpr uint32_t SCALE_SMEM = 0x18000; // per-scale word scratch (bank3, packed -> SF-SRAM)
-static constexpr uint32_t M_SMEM    = 0x18800;  // running row max (bank3)
-static constexpr uint32_t LS_SMEM   = 0x18A00;  // running row denom l (bank3)
-static constexpr uint32_t CORR_SMEM = 0x18C00;  // per-row rescale corr (bank3)
-static constexpr uint32_t REDBUF_SMEM = 0x19000; // per-warp tree-reduce scratch (bank3)
 static constexpr uint32_t S0_SMEM   = 0x8000;   // S buffer 0 (bank1); row 2048
 static constexpr uint32_t P0_SMEM   = 0xA000;   // P for cur=0 (bank1, co-located w/ S0); row 2560
 static constexpr uint32_t OACC_SMEM = 0xB000;   // O accumulator [Sq][d] bf16 (bank1)
+static constexpr uint32_t SCALE_SMEM = 0xF000;  // per-scale word scratch (bank1, packed -> SF-SRAM)
+static constexpr uint32_t M_SMEM    = 0xF400;   // running row max (bank1)
+static constexpr uint32_t LS_SMEM   = 0xF600;   // running row denom l (bank1)
+static constexpr uint32_t CORR_SMEM = 0xF800;   // per-row rescale corr (bank1)
+static constexpr uint32_t REDBUF_SMEM = 0xFA00; // per-warp tree-reduce scratch (bank1)
 static constexpr uint32_t S1_SMEM   = 0x10000;  // S buffer 1 (bank2); row 4096
 static constexpr uint32_t P1_SMEM   = 0x12000;  // P for cur=1 (bank2, co-located w/ S1); row 4608
 
