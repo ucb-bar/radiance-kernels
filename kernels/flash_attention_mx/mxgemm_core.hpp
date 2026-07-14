@@ -713,6 +713,49 @@ __attribute__((noinline)) void mxgemm_prefetch_tile(
     asm volatile ("mxgemm_prefetch_tile_end_%=:" :: );
 }
 
+// ---- CISC QK path (option 2): issue the SAME loop_ws matmul via the Gemmini CISC
+// microcode engine (csrw 0xacc) WITHOUT muon fences between commands. MX scales are read
+// from SF_MEM (populated by load_scale_factors, as usual) -- RTL-confirmed identical.
+// Hexadeciles (spadHexadecile = BANK_NUM*BANK_ROWS/16 = 512 rows): Q(A)->hex 0 (byte 0x0),
+// S(C)->hex 2 (byte 0x4000 == S_SMEM, where softmax reads), K(B)->hex 15 (top, B end=8192).
+// On the muon core, csrw 0xacc is an illegal CSR (that path is Vortex-only). CISC commands
+// are issued via MMIO to the gemmini CISC command register at GEMMINI_CTRL + 0x30.
+#define FA_CISC_CMD(x) store_shared(GEMMINI_CTRL, 0x30, (uint32_t)(x))
+enum { FA_CISC_COMPUTE_AND_STORE_TO_SPAD = 1, FA_CISC_SET_AB_STRIDE = 8,
+       FA_CISC_LOAD_TO_HEXADECILES = 10 };
+template <GemmConfig C>
+__attribute__((noinline)) void mxgemm_cisc_qk(const uint8_t *Q_in, const uint8_t *K_in,
+                                              const uint8_t *A_scales, const uint8_t *B_scales,
+                                              const uint32_t dim_m, const uint32_t dim_n,
+                                              const uint32_t dim_k, const uint32_t tid) {
+    asm volatile ("mxgemm_cisc_qk_start_%=:" :: );
+    if (tid != 0) return;
+    constexpr uint32_t Q_HEX = 0, K_HEX = 15, S_HEX = SPAD_DEST / ((BANK_NUM * BANK_ROWS) / 16);
+    // MX scales -> SF_MEM (mesh reads these during the CISC-issued loop_ws matmul).
+    load_scale_factors(calculate_scale_factor_smem_addr<false>(0),
+                       calculate_scale_factor_gmem_addr<C, false>(A_scales, 0, dim_m, dim_n),
+                       C.SCALE_FACTORS_PER_TILE());
+    load_scale_factors(calculate_scale_factor_smem_addr<true>(0),
+                       calculate_scale_factor_gmem_addr<C, true>(B_scales, 0, dim_m, dim_n),
+                       C.SCALE_FACTORS_PER_TILE());
+    gemmini_mxquant_config_mvout(
+        rad_device_to_host_address(reinterpret_cast<uint32_t>(&C_scale_factors[0])),
+        C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(), 0, 0, QUANT_LUT_UPDATE_GRANULARITY);
+    mu_fence_smem();
+    // GMEM base addresses for A(Q) and B(K) tiles (device->host address space).
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC,
+        rad_device_to_host_address(reinterpret_cast<uint32_t>(Q_in)),
+        rad_device_to_host_address(reinterpret_cast<uint32_t>(K_in)), k_LOOP_WS_CONFIG_ADDRS_AB);
+    // SET_AB_STRIDE: A row stride = dim_k, B row stride = dim_n (elements). [n<<20 | k<<8 | op]
+    FA_CISC_CMD((dim_n << 20) | (dim_k << 8) | FA_CISC_SET_AB_STRIDE);
+    // LOAD_TO_HEXADECILES: DMA A->Q_HEX, B->K_HEX.  [b_hex<<16 | a_hex<<8 | op]
+    FA_CISC_CMD((K_HEX << 16) | (Q_HEX << 8) | FA_CISC_LOAD_TO_HEXADECILES);
+    // COMPUTE_AND_STORE_TO_SPAD: S = Q@K^T -> S_HEX (bf16). [d_hex<<24 | b_hex<<16 | a_hex<<8 | op]
+    FA_CISC_CMD((S_HEX << 24) | (K_HEX << 16) | (Q_HEX << 8) | FA_CISC_COMPUTE_AND_STORE_TO_SPAD);
+    gemmini_fence();
+    asm volatile ("mxgemm_cisc_qk_end_%=:" :: );
+}
+
 template <GemmConfig C>
 __attribute__((noinline)) void mxgemm_compute_tile(const uint32_t tid_in_threadblock) {
     asm volatile ("mxgemm_compute_tile_start_%=:" :: );

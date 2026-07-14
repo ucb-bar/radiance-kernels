@@ -91,11 +91,19 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         // path (like PV) instead of mxgemm_single_output_tile's dead software-pipelined
         // K-loop -- drops the heavy gemm fn (33 arch regs) from the call graph, shrinking
         // the per-warp register footprint F toward the <=63 needed for 4 warps.
+#ifdef USE_CISC_QK
+        // CISC QK (option 2): issue loop_ws via csrw 0xacc, no muon fences.
+        mxgemm_cisc_qk<QK>(
+            &QK_A_in[0][0], &QK_B_blocks[j * FA_D][0],
+            &QK_A_scales_row[0][0], &QK_B_scales_blocks[j * FA_GK][0],
+            FA_SQ, FA_BK, FA_D, tid);
+#else
         mxgemm_prefetch_tile<QK, /*SKIP_A=*/false, /*DO_CONFIG=*/false>(
             &QK_A_in[0][0], &QK_B_blocks[j * FA_D][0],
             &QK_A_scales_row[0][0], &QK_B_scales_blocks[j * FA_GK][0],
             FA_SQ, FA_BK, FA_D, tid);
         mxgemm_compute_tile<QK>(tid);
+#endif
         mu_barrier(2, wpb); MARK();
 
         // PREFETCH V_j for PV: async move-in (no fence) -> overlaps softmax+requant below,
