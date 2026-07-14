@@ -55,24 +55,26 @@ static constexpr uint32_t L_SMEM = 0xE000;
 // C=SPAD_DEST (S/PV bf16) 0x4000..0xC000 (32KB); O_acc 0xC000..0x14000 (32KB); scratch
 // 0x14000+; B-spad (K/V) at the top. All non-overlapping for Sq=Bk=d in {64,128}.
 static constexpr uint32_t P_SMEM = 0x10000;     // (unused: fused_softmax_requant writes P-fp8 direct)
-// ===== BANK-AWARE OVERLAP layout (Sq=64,Bk=64). CRITICAL: the scratchpad has 4 banks of
-// BANK_ROWS*DIM=32KB each; each bank's DMA read queue is depth-4 and un-backpressured. During
-// overlap the mesh reads Q (bank0) + K (bank3) while SIMT reads S[cur] (bank1/2) + scratch (bank3)
-// -- these MUST be on different banks or the read queue overflows (Scratchpad.scala:220). So:
-//   bank0(0x0)   : Q (mesh A, streamed) + P (softmax out / PV A)
-//   bank1(0x8000): S0 + O_acc
-//   bank2(0x10000): S1 + PVout
-//   bank3(0x18000): scratch (SIMT) + K/V (mesh B, loaded-once low-rate) at the top
-static constexpr uint32_t PSPAD_SMEM= 0x2000;   // softmax P output (bank0); PV reads A here (row 512)
-static constexpr uint32_t S0_SMEM   = 0x8000;   // S buffer 0 (bank1); row 2048
-static constexpr uint32_t OACC_SMEM = 0xA000;   // O accumulator [Sq][d] bf16 (bank1)
-static constexpr uint32_t S1_SMEM   = 0x10000;  // S buffer 1 (bank2); row 4096
-static constexpr uint32_t PVOUT_SMEM= 0x12000;  // PV output (bank2); row 4608
+// ===== BANK-AWARE OVERLAP layout (Sq=64,Bk=64). 4 banks x 32KB; each bank's DMA read queue is
+// depth-4 + un-backpressured, and a mesh read starves if a high-rate SIMT write shares its bank.
+// During overlap: mesh reads Q(bank0)+K(bank3), writes S[nxt]; SIMT reads S[cur]+scratch, writes
+// P. Key trick: P OVERWRITES S[cur] in-place (softmax loads S to regs first, then S[cur] is dead)
+// so P always lands on bank_cur -- a bank with NO mesh access. scratch shares bank0 w/ Q (low rate).
+//   bank0(0x0)    : Q (mesh A, streamed -- kept ALONE during overlap) + PVout (post-drain only)
+//   bank1(0x8000) : S0/P0 + O_acc
+//   bank2(0x10000): S1/P1
+//   bank3(0x18000): scratch (SIMT) + K/V (mesh B, weight-stationary: loaded once, brief) at top
+static constexpr uint32_t PVOUT_SMEM= 0x2000;   // PV output (bank0; row 512); post-drain only
 static constexpr uint32_t SCALE_SMEM = 0x18000; // per-scale word scratch (bank3, packed -> SF-SRAM)
 static constexpr uint32_t M_SMEM    = 0x18800;  // running row max (bank3)
 static constexpr uint32_t LS_SMEM   = 0x18A00;  // running row denom l (bank3)
 static constexpr uint32_t CORR_SMEM = 0x18C00;  // per-row rescale corr (bank3)
 static constexpr uint32_t REDBUF_SMEM = 0x19000; // per-warp tree-reduce scratch (bank3)
+static constexpr uint32_t S0_SMEM   = 0x8000;   // S buffer 0 (bank1); row 2048
+static constexpr uint32_t P0_SMEM   = 0xA000;   // P for cur=0 (bank1, co-located w/ S0); row 2560
+static constexpr uint32_t OACC_SMEM = 0xB000;   // O accumulator [Sq][d] bf16 (bank1)
+static constexpr uint32_t S1_SMEM   = 0x10000;  // S buffer 1 (bank2); row 4096
+static constexpr uint32_t P1_SMEM   = 0x12000;  // P for cur=1 (bank2, co-located w/ S1); row 4608
 
 // Lightweight phase profiler: thread-0 stores the mcycle counter to a GMEM marker array
 // at each phase boundary. Parse stores to MARK_GMEM from the .out trace -> per-phase cycles.
@@ -94,9 +96,10 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     // before PV_j. Q resident @ row 0 (const); softmax writes P to PSPAD (row 2048) so it never
     // collides with Q. S=16KB double-buffers in-region. =====
     constexpr uint32_t S_ROW[2]  = {S0_SMEM / DIM, S1_SMEM / DIM};   // QK C-output spad rows
-    constexpr uint32_t S_BYTE[2] = {S0_SMEM, S1_SMEM};           // softmax S read (byte)
-    constexpr uint32_t PSPAD_ROW = PSPAD_SMEM / DIM;             // PV A(=P) spad row (2048)
-    constexpr uint32_t PVOUT_ROW = PVOUT_SMEM / DIM;             // PV C-output spad row (2304)
+    constexpr uint32_t S_BYTE[2] = {S0_SMEM, S1_SMEM};              // softmax S read (byte)
+    constexpr uint32_t P_BYTE[2] = {P0_SMEM, P1_SMEM};              // softmax P write (byte, bank_cur)
+    constexpr uint32_t P_ROW[2]  = {P0_SMEM / DIM, P1_SMEM / DIM};  // PV A(=P) spad row
+    constexpr uint32_t PVOUT_ROW = PVOUT_SMEM / DIM;               // PV C-output spad row
 
     // Prologue: QK_0 -> S0 (loads Q resident @0 + K_0, configs QK).
     mxgemm_prefetch_tile<QK, /*SKIP_A=*/false, /*DO_CONFIG=*/true>(
@@ -118,10 +121,11 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
             mxgemm_compute_issue<QK>(tid, /*c_spad=*/S_ROW[nxt]);   // async, no fence
         }
 
-        // softmax_j on S[cur] -> P @ PSPAD_SMEM (mesh computes QK_{j+1} concurrently).
+        // softmax_j reads S[cur], writes P[cur] -- both on bank_cur (NO mesh access), so no
+        // read-queue overflow / mesh-starvation. mesh computes QK_{j+1} concurrently on banks 0/3/nxt.
         fused_softmax_requant<FA_SQ, FA_BK>(
             reinterpret_cast<const __shared uint16_t *>(S_BYTE[cur]),
-            reinterpret_cast<__shared uint32_t *>(PSPAD_SMEM),
+            reinterpret_cast<__shared uint32_t *>(P_BYTE[cur]),
             reinterpret_cast<__shared uint32_t *>(SCALE_SMEM),
             reinterpret_cast<__shared uint16_t *>(M_SMEM),
             reinterpret_cast<__shared uint16_t *>(LS_SMEM),
@@ -142,7 +146,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         mxgemm_prefetch_tile<PV, /*SKIP_A=*/true, /*DO_CONFIG=*/true>(
             &V_in[j * FA_BK][0], &V_in[j * FA_BK][0],
             &V_scales[j * FA_GKB][0], &V_scales[j * FA_GKB][0], FA_SQ, FA_D, FA_BK, tid);
-        mxgemm_compute_tile<PV>(tid, /*c_spad=*/PVOUT_ROW, /*a_spad=*/PSPAD_ROW);
+        mxgemm_compute_tile<PV>(tid, /*c_spad=*/PVOUT_ROW, /*a_spad=*/S_ROW[cur]);
         mu_barrier(4, wpb); MARK();
 
         // O_acc = (first ? 0 : O_acc*corr) + PV_j  (PV read from PVOUT_SMEM).
