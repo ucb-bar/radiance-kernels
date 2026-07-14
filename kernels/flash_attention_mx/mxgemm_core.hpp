@@ -514,7 +514,8 @@ static void copy_accmem_to_gmem_dma_sync(uint8_t *dest_gmem,
  *  Move out accumulator data to SMEM if `acc_move_out` is true. */
 template <GemmConfig C>
 static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_out,
-                                     const uint32_t c_spad = SPAD_DEST) {
+                                     const uint32_t c_spad = SPAD_DEST,
+                                     const uint32_t a_spad_override = 0xffffffffu) {
     asm volatile ("matmul_tile_async_start_%=:" :: );
 
     const uint32_t skip_stc = acc_move_out ? 0 : 1;
@@ -522,7 +523,10 @@ static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_
       loop_matmul_skips(/*skip_lda=*/1, /*skip_ldb=*/1, /*skip_ldd=*/1,
                         /*skip_ex=*/0, /*skip_stc=*/skip_stc);
 
-    const uint32_t a_spad_addr_start = calculate_spad_addr<false>(tile_k);
+    // a_spad_override lets the caller place A at a custom spad row (e.g. PV's A=P at a row
+    // distinct from QK's A=Q, so QK_{j+1} and softmax_j's P-write don't collide during overlap).
+    const uint32_t a_spad_addr_start = (a_spad_override != 0xffffffffu)
+                                       ? a_spad_override : calculate_spad_addr<false>(tile_k);
     const uint32_t b_spad_addr_end = calculate_spad_addr<true>(tile_k);
 
     const bool first_k = tile_k == 0;
@@ -759,7 +763,8 @@ __attribute__((noinline)) void mxgemm_cisc_qk(const uint8_t *Q_in, const uint8_t
 
 template <GemmConfig C>
 __attribute__((noinline)) void mxgemm_compute_tile(const uint32_t tid_in_threadblock,
-                                                   const uint32_t c_spad = SPAD_DEST) {
+                                                   const uint32_t c_spad = SPAD_DEST,
+                                                   const uint32_t a_spad = 0xffffffffu) {
     asm volatile ("mxgemm_compute_tile_start_%=:" :: );
     if (tid_in_threadblock != 0) return;
     gemmini_fence();      // drain the prefetch move-in DMA (V already streaming)
@@ -767,7 +772,7 @@ __attribute__((noinline)) void mxgemm_compute_tile(const uint32_t tid_in_threadb
         rad_device_to_host_address(reinterpret_cast<uint32_t>(&C_scale_factors[0])),
         C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
         0, 0, QUANT_LUT_UPDATE_GRANULARITY);
-    matmul_tile_async<C>(0, /*acc_move_out (last_k)=*/true, c_spad);
+    matmul_tile_async<C>(0, /*acc_move_out (last_k)=*/true, c_spad, a_spad);
     gemmini_fence();
     asm volatile ("mxgemm_compute_tile_end_%=:" :: );
 }
@@ -778,7 +783,8 @@ __attribute__((noinline)) void mxgemm_compute_tile(const uint32_t tid_in_threadb
 // overlap QK_{j+1} with softmax_j (double-buffered S). thread-0 only.
 template <GemmConfig C>
 __attribute__((noinline)) void mxgemm_compute_issue(const uint32_t tid_in_threadblock,
-                                                    const uint32_t c_spad) {
+                                                    const uint32_t c_spad,
+                                                    const uint32_t a_spad = 0xffffffffu) {
     asm volatile ("mxgemm_compute_issue_start_%=:" :: );
     if (tid_in_threadblock != 0) return;
     gemmini_fence();      // drain this gemm's own move-in DMA (must be resident before matmul)
@@ -786,7 +792,7 @@ __attribute__((noinline)) void mxgemm_compute_issue(const uint32_t tid_in_thread
         rad_device_to_host_address(reinterpret_cast<uint32_t>(&C_scale_factors[0])),
         C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
         0, 0, QUANT_LUT_UPDATE_GRANULARITY);
-    matmul_tile_async<C>(0, /*acc_move_out=*/true, c_spad);   // kicked off; NO trailing fence
+    matmul_tile_async<C>(0, /*acc_move_out=*/true, c_spad, a_spad);   // kicked off; NO trailing fence
     asm volatile ("mxgemm_compute_issue_end_%=:" :: );
 }
 
