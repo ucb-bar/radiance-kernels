@@ -98,7 +98,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
             &QK_A_scales_row[0][0], &QK_B_scales_blocks[j * FA_GK][0],
             FA_SQ, FA_BK, FA_D, tid);
 #else
-        mxgemm_prefetch_tile<QK, /*SKIP_A=*/false, /*DO_CONFIG=*/false>(
+        mxgemm_prefetch_tile<QK, /*SKIP_A=*/false, /*DO_CONFIG=*/true>(
             &QK_A_in[0][0], &QK_B_blocks[j * FA_D][0],
             &QK_A_scales_row[0][0], &QK_B_scales_blocks[j * FA_GK][0],
             FA_SQ, FA_BK, FA_D, tid);
@@ -106,9 +106,10 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 #endif
         mu_barrier(2, wpb); MARK();
 
+
         // PREFETCH V_j for PV: async move-in (no fence) -> overlaps softmax+requant below,
         // hiding PV's DMA/config latency (was ~50 k cyc). SKIP_A (A=P comes from requant).
-        mxgemm_prefetch_tile<PV, /*SKIP_A=*/true, /*DO_CONFIG=*/false>(
+        mxgemm_prefetch_tile<PV, /*SKIP_A=*/true, /*DO_CONFIG=*/true>(
             &V_in[j * FA_BK][0], &V_in[j * FA_BK][0],
             &V_scales[j * FA_GKB][0], &V_scales[j * FA_GKB][0],
             FA_SQ, FA_D, FA_BK, tid);

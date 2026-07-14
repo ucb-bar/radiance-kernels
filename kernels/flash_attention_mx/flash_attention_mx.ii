@@ -11229,6 +11229,41 @@ __attribute__((noinline)) void mxgemm_prefetch_tile(
     mu_fence_smem();
     asm volatile ("mxgemm_prefetch_tile_end_%=:" :: );
 }
+# 724 "./mxgemm_core.hpp"
+enum { FA_CISC_COMPUTE_AND_STORE_TO_SPAD = 1, FA_CISC_SET_AB_STRIDE = 8,
+       FA_CISC_LOAD_TO_HEXADECILES = 10 };
+template <GemmConfig C>
+__attribute__((noinline)) void mxgemm_cisc_qk(const uint8_t *Q_in, const uint8_t *K_in,
+                                              const uint8_t *A_scales, const uint8_t *B_scales,
+                                              const uint32_t dim_m, const uint32_t dim_n,
+                                              const uint32_t dim_k, const uint32_t tid) {
+    asm volatile ("mxgemm_cisc_qk_start_%=:" :: );
+    if (tid != 0) return;
+    constexpr uint32_t Q_HEX = 0, K_HEX = 15, S_HEX = SPAD_DEST / ((4 * 2048) / 16);
+
+    load_scale_factors(calculate_scale_factor_smem_addr<false>(0),
+                       calculate_scale_factor_gmem_addr<C, false>(A_scales, 0, dim_m, dim_n),
+                       C.SCALE_FACTORS_PER_TILE());
+    load_scale_factors(calculate_scale_factor_smem_addr<true>(0),
+                       calculate_scale_factor_gmem_addr<C, true>(B_scales, 0, dim_m, dim_n),
+                       C.SCALE_FACTORS_PER_TILE());
+    { store64_shared(0x00084000, 0x10, gemmini_arg_to_u64(((uint64_t)(0) << 61) | ((uint64_t)(0) << 60) | ((uint64_t)(C.PE_TILES_K()) << 51) | ((uint64_t)(C.PE_TILES_J()) << 42) | ((uint64_t)(C.PE_TILES_I()) << 33) | (uint64_t)(rad_device_to_host_address(reinterpret_cast<uint32_t>(&C_scale_factors[0]))))); store64_shared(0x00084000, 0x18, gemmini_arg_to_u64((uint64_t)(QUANT_LUT_UPDATE_GRANULARITY) & 0xFFFF)); store_shared (0x00084000, 0x0, (0x7B) | (0 << 7) | (3 << 12) | (1 << 15) | (2 << 20) | ((26) << 25)); };
+
+
+    mu_fence_smem();
+
+    { store64_shared(0x00084000, 0x10, gemmini_arg_to_u64(rad_device_to_host_address(reinterpret_cast<uint32_t>(Q_in)))); store64_shared(0x00084000, 0x18, gemmini_arg_to_u64(rad_device_to_host_address(reinterpret_cast<uint32_t>(K_in)))); store_shared (0x00084000, 0x0, (0x7B) | (0 << 7) | (3 << 12) | (1 << 15) | (2 << 20) | ((10) << 25)); };
+
+
+
+    store_shared(0x00084000, 0x30, (uint32_t)((dim_n << 20) | (dim_k << 8) | FA_CISC_SET_AB_STRIDE));
+
+    store_shared(0x00084000, 0x30, (uint32_t)((K_HEX << 16) | (Q_HEX << 8) | FA_CISC_LOAD_TO_HEXADECILES));
+
+    store_shared(0x00084000, 0x30, (uint32_t)((S_HEX << 24) | (K_HEX << 16) | (Q_HEX << 8) | FA_CISC_COMPUTE_AND_STORE_TO_SPAD));
+    gemmini_fence();
+    asm volatile ("mxgemm_cisc_qk_end_%=:" :: );
+}
 
 template <GemmConfig C>
 __attribute__((noinline)) void mxgemm_compute_tile(const uint32_t tid_in_threadblock) {
@@ -11720,18 +11755,25 @@ static __attribute__((noinline)) void rescale_accumulate(
     const uint32_t lane = tid_in_threadblock % NT;
     const uint32_t warp = tid_in_threadblock / NT;
     const uint32_t nwarps = threads_per_threadblock / NT;
+    constexpr uint32_t NPL = DW / NT;
     for (uint32_t row = warp; row < SQ; row += nwarps) {
         const _Float16 c = as_bf16(corr_out[row]);
-        for (uint32_t w = lane; w < DW; w += NT) {
-            uint32_t pv = PV32[row * DW + w];
-            _Float16 plo = as_bf16((uint16_t)pv), phi = as_bf16((uint16_t)(pv >> 16));
+
+
+        uint32_t pv[NPL], oa[NPL];
+#pragma unroll
+        for (uint32_t k = 0; k < NPL; k++) pv[k] = PV32[row * DW + lane + k * NT];
+        if (!first_block) {
+#pragma unroll
+            for (uint32_t k = 0; k < NPL; k++) oa[k] = O_acc32[row * DW + lane + k * NT];
+        }
+#pragma unroll
+        for (uint32_t k = 0; k < NPL; k++) {
+            _Float16 plo = as_bf16((uint16_t)pv[k]), phi = as_bf16((uint16_t)(pv[k] >> 16));
             _Float16 olo = (_Float16)0, ohi = (_Float16)0;
-            if (!first_block) {
-                uint32_t a = O_acc32[row * DW + w];
-                olo = as_bf16((uint16_t)a); ohi = as_bf16((uint16_t)(a >> 16));
-            }
-            O_acc32[row * DW + w] = pack_bf16x2((_Float16)(olo * c + plo),
-                                                (_Float16)(ohi * c + phi));
+            if (!first_block) { olo = as_bf16((uint16_t)oa[k]); ohi = as_bf16((uint16_t)(oa[k] >> 16)); }
+            O_acc32[row * DW + lane + k * NT] =
+                pack_bf16x2((_Float16)(olo * c + plo), (_Float16)(ohi * c + phi));
         }
     }
 }
@@ -11746,14 +11788,18 @@ static __attribute__((noinline)) void finalize_O(
     const uint32_t lane = tid_in_threadblock % NT;
     const uint32_t warp = tid_in_threadblock / NT;
     const uint32_t nwarps = threads_per_threadblock / NT;
+    constexpr uint32_t NPL = DW / NT;
     for (uint32_t row = warp; row < SQ; row += nwarps) {
         const _Float16 inv_l =
             (_Float16)(__builtin_bit_cast(_Float16, ((uint16_t)0x3f80)) / as_bf16(l_state[row]));
-        for (uint32_t w = lane; w < DW; w += NT) {
-            uint32_t a = O_acc32[row * DW + w];
-            O_gmem32[row * DW + w] = pack_bf16x2((_Float16)(as_bf16((uint16_t)a) * inv_l),
-                                                 (_Float16)(as_bf16((uint16_t)(a >> 16)) * inv_l));
-        }
+        uint32_t a[NPL];
+#pragma unroll
+        for (uint32_t k = 0; k < NPL; k++) a[k] = O_acc32[row * DW + lane + k * NT];
+#pragma unroll
+        for (uint32_t k = 0; k < NPL; k++)
+            O_gmem32[row * DW + lane + k * NT] =
+                pack_bf16x2((_Float16)(as_bf16((uint16_t)a[k]) * inv_l),
+                            (_Float16)(as_bf16((uint16_t)(a[k] >> 16)) * inv_l));
     }
 }
 
@@ -11772,7 +11818,7 @@ static __attribute__((noinline)) void copy_P_to_requant(const __attribute__((add
         requant_smem[2 * i + 1] = (uint16_t)(w >> 16);
     }
 }
-# 534 "./flash_mx_impl.hpp"
+# 545 "./flash_mx_impl.hpp"
 template <uint32_t SQ, uint32_t SK>
 static __attribute__((noinline)) void requant_P_to_spad_tiled(
         const __attribute__((address_space(1))) uint16_t *P_smem16, __attribute__((address_space(1))) uint32_t *spad_u32,
@@ -11818,7 +11864,9 @@ static __attribute__((noinline)) void requant_P_to_spad_tiled(
 template <uint32_t SQ, uint32_t SK>
 static __attribute__((noinline)) void pack_scales_to_sfmem(
         const __attribute__((address_space(1))) uint32_t *scale_scratch, __attribute__((address_space(1))) uint32_t *sfmem_a32,
-        uint32_t tid_in_threadblock) {
+        uint32_t tid_in_threadblock, uint32_t threads_per_threadblock) {
+
+
     if (tid_in_threadblock != 0) return;
     constexpr uint32_t NS = (SK / 32) * SQ;
     for (uint32_t w = 0; w < NS / 4; w++) {
@@ -11924,17 +11972,13 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 
     for (uint32_t j = 0; j < 2; j++) {
         const uint32_t first = (j == 0);
-
-
-
-
-
-
+# 101 "flash_attention_mx.cpp"
         mxgemm_prefetch_tile<QK, false, false>(
             &QK_A_in[0][0], &QK_B_blocks[j * 128][0],
             &QK_A_scales_row[0][0], &QK_B_scales_blocks[j * 4][0],
             128, 128, 128, tid);
         mxgemm_compute_tile<QK>(tid);
+
         mu_barrier(2, wpb); do { if (tid == 0) { uint32_t _c; asm volatile("csrr %0, mcycle" : "=r"(_c)); ((volatile uint32_t *)MARK_GMEM)[mki++] = _c; } } while (0);
 
 
@@ -11961,7 +12005,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 
         pack_scales_to_sfmem<128, 128>(
             reinterpret_cast<const __attribute__((address_space(1))) uint32_t *>(SCALE_SMEM),
-            reinterpret_cast<__attribute__((address_space(1))) uint32_t *>((0x00088000 + 0x2000)), tid);
+            reinterpret_cast<__attribute__((address_space(1))) uint32_t *>((0x00088000 + 0x2000)), tid, thr);
         mu_fence_smem();
         mu_barrier(4, wpb); do { if (tid == 0) { uint32_t _c; asm volatile("csrr %0, mcycle" : "=r"(_c)); ((volatile uint32_t *)MARK_GMEM)[mki++] = _c; } } while (0);
 
