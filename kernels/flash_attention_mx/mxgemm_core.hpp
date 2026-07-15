@@ -151,9 +151,12 @@ static inline uint32_t calculate_spad_addr(const uint32_t tile_k) {
     static_assert(SMEM_QUARTER_ROWS != 0);
     constexpr auto A_SPAD_ADDR_EVEN = 0;
     constexpr auto A_SPAD_ADDR_ODD = SMEM_QUARTER_ROWS;
-    // B spad address is counted from the end (SMEM_SIZE_ROWS)
-    // TODO: might want to swap even and odd (do bank 0-2, 1-3 instead of 0-3, 1-2)
-    constexpr auto B_SPAD_ADDR_EVEN = SMEM_SIZE_ROWS;
+    // B spad address is counted from the end (B grows DOWN from B_SPAD_ADDR_EVEN).
+    // FA-OVERLAP: place B(K/V) in bank0 right after A(Q) [Q=512 rows @0..0x2000, K/V=512 rows
+    // @0x2000..0x4000] so B_end=1024. This keeps ALL mesh operands (Q,K,V) on bank0, freeing
+    // banks 1/2/3 for the muon (S0/S1/scratch) -> mesh & muon never share a bank during overlap.
+    // (Valid for Sq=64,d=128,Bk=64: A=B=512 rows. Generalize if tile sizes change.)
+    constexpr auto B_SPAD_ADDR_EVEN = SMEM_SIZE_ROWS;  // ISOLATION: revert to bank3-top (was 1024=bank0)
     constexpr auto B_SPAD_ADDR_ODD = SMEM_SIZE_ROWS - SMEM_QUARTER_ROWS;
 
     const uint32_t odd_k = (tile_k & 1);

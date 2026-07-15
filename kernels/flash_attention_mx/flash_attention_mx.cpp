@@ -55,27 +55,26 @@ static constexpr uint32_t L_SMEM = 0xE000;
 // C=SPAD_DEST (S/PV bf16) 0x4000..0xC000 (32KB); O_acc 0xC000..0x14000 (32KB); scratch
 // 0x14000+; B-spad (K/V) at the top. All non-overlapping for Sq=Bk=d in {64,128}.
 static constexpr uint32_t P_SMEM = 0x10000;     // (unused: fused_softmax_requant writes P-fp8 direct)
-// ===== BANK-AWARE OVERLAP layout (Sq=64,Bk=64). 4 banks x 32KB; each bank's DMA read queue is
-// depth-4 + un-backpressured, and a mesh read starves if a high-rate SIMT write shares its bank.
-// During overlap: mesh reads Q(bank0)+K(bank3), writes S[nxt]; SIMT reads S[cur]+scratch, writes
-// P. Key trick: P OVERWRITES S[cur] in-place (softmax loads S to regs first, then S[cur] is dead)
-// so P always lands on bank_cur -- a bank with NO mesh access. scratch shares bank0 w/ Q (low rate).
-// CRITICAL: mesh READ banks (Q=bank0, K=bank3) must be CLEAN of SIMT (SIMT scratch on K's bank
-// starved the mesh K-read -> reservation-station stall). So scratch lives on bank1 (an S bank);
-// it only shares with SIMT accesses (temporally separated from S-reads). K/V stay bank3 (mesh-only).
-//   bank0(0x0)    : Q (mesh A) + PVout (post-drain only)
-//   bank1(0x8000) : S0/P0 + O_acc + scratch (all SIMT)
+// ===== COLLISION-FREE OVERLAP layout (Sq=64,Bk=64). 4 banks x 32KB. The shared scratchpad
+// arbitrates muon-BEFORE-gemmini (lowestIndexFirst), so ANY bank shared by the mesh and the muon
+// starves the mesh. The mesh touches {Q,K,V @ bank0 (via B_SPAD_ADDR_EVEN=1024), S[nxt] @ bank1|2}.
+// The muon touches {S[cur] @ bank2|1 (opposite of nxt), P[cur] co-located, scratch @ bank3}. Thus
+// NO bank is ever shared: mesh S[nxt] (nxt) vs muon S[cur] (cur) differ every iter (nxt!=cur);
+// bank0 (mesh Q/K/V) & bank3 (muon scratch) are disjoint. This is what lets QK_{j+1} overlap
+// softmax_j without the mesh stalling.
+//   bank0(0x0)    : Q (0..0x2000) + K/V (0x2000..0x4000, mesh B) + PVout (0x4000..0x8000, post-drain)
+//   bank1(0x8000) : S0/P0 + O_acc
 //   bank2(0x10000): S1/P1
-//   bank3(0x18000): K/V (mesh B) at top -- CLEAN of SIMT during overlap
-static constexpr uint32_t PVOUT_SMEM= 0x2000;   // PV output (bank0; row 512); post-drain only
+//   bank3(0x18000): scratch (muon-only) -- disjoint from all mesh accesses
+static constexpr uint32_t PVOUT_SMEM= 0x4000;   // PV output (bank0, after K/V); post-drain only
 static constexpr uint32_t S0_SMEM   = 0x8000;   // S buffer 0 (bank1); row 2048
 static constexpr uint32_t P0_SMEM   = 0xA000;   // P for cur=0 (bank1, co-located w/ S0); row 2560
 static constexpr uint32_t OACC_SMEM = 0xB000;   // O accumulator [Sq][d] bf16 (bank1)
-static constexpr uint32_t SCALE_SMEM = 0xF000;  // per-scale word scratch (bank1, packed -> SF-SRAM)
-static constexpr uint32_t M_SMEM    = 0xF400;   // running row max (bank1)
-static constexpr uint32_t LS_SMEM   = 0xF600;   // running row denom l (bank1)
-static constexpr uint32_t CORR_SMEM = 0xF800;   // per-row rescale corr (bank1)
-static constexpr uint32_t REDBUF_SMEM = 0xFA00; // per-warp tree-reduce scratch (bank1)
+static constexpr uint32_t SCALE_SMEM = 0x18000; // per-scale word scratch (bank3, packed -> SF-SRAM)
+static constexpr uint32_t M_SMEM    = 0x18400;  // running row max (bank3)
+static constexpr uint32_t LS_SMEM   = 0x18600;  // running row denom l (bank3)
+static constexpr uint32_t CORR_SMEM = 0x18800;  // per-row rescale corr (bank3)
+static constexpr uint32_t REDBUF_SMEM = 0x18A00;// per-warp tree-reduce scratch (bank3)
 static constexpr uint32_t S1_SMEM   = 0x10000;  // S buffer 1 (bank2); row 4096
 static constexpr uint32_t P1_SMEM   = 0x12000;  // P for cur=1 (bank2, co-located w/ S1); row 4608
 
@@ -115,30 +114,26 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         const uint32_t first = (j == 0);
         const uint32_t cur = j & 1, nxt = (j + 1) & 1;
 
-        // WARPSPEC (virgo-style): warp 0 = PRODUCER (drives ONLY the mesh: issue QK_{j+1} + fence,
-        // no SIMT work -> clean gemmini command stream); warps 1+ = CONSUMERS (softmax_j on S[cur]).
-        // Producer's fenced gemm runs on the mesh WHILE consumers do softmax on SIMT -> overlap.
-        const uint32_t warp = tid / MU_NUM_THREADS;
-        if (warp == 0) {
-            if (j + 1 < FA_NBLK) {
-                mxgemm_prefetch_tile<QK, /*SKIP_A=*/false, /*DO_CONFIG=*/true>(
-                    &QK_A_in[0][0], &QK_B_blocks[(j + 1) * FA_D][0], &QK_A_scales_row[0][0],
-                    &QK_B_scales_blocks[(j + 1) * FA_GK][0], FA_SQ, FA_BK, FA_D, tid);
-                mxgemm_compute_tile<QK>(tid, /*c_spad=*/S_ROW[nxt]);   // WITH fence (producer owns mesh)
-            }
-        } else {
-            // consumers: warps 1..nwarps-1 (shift tid/thr by one warp so warp1->warp0 internally).
-            fused_softmax_requant<FA_SQ, FA_BK>(
-                reinterpret_cast<const __shared uint16_t *>(S_BYTE[cur]),
-                reinterpret_cast<__shared uint32_t *>(P_BYTE[cur]),
-                reinterpret_cast<__shared uint32_t *>(SCALE_SMEM),
-                reinterpret_cast<__shared uint16_t *>(M_SMEM),
-                reinterpret_cast<__shared uint16_t *>(LS_SMEM),
-                reinterpret_cast<__shared uint16_t *>(CORR_SMEM),
-                SOFTMAX_SCALE_BF16, first, tid - MU_NUM_THREADS, thr - MU_NUM_THREADS);
+        // ISOLATION TEST: SERIAL (no overlap) -- QK_{j+1} (thread0) THEN softmax_j (all warps).
+        // Keeps bank0-KV. If correct -> the overlap concurrency causes the 34% err. If 34% ->
+        // bank0-KV corrupts the matmul.
+        if (j + 1 < FA_NBLK) {
+            mxgemm_prefetch_tile<QK, /*SKIP_A=*/false, /*DO_CONFIG=*/true>(
+                &QK_A_in[0][0], &QK_B_blocks[(j + 1) * FA_D][0], &QK_A_scales_row[0][0],
+                &QK_B_scales_blocks[(j + 1) * FA_GK][0], FA_SQ, FA_BK, FA_D, tid);
+            mxgemm_compute_tile<QK>(tid, /*c_spad=*/S_ROW[nxt]);
         }
+        mu_barrier(1, wpb);   // QK_{j+1} fully done before softmax (serial)
+        fused_softmax_requant<FA_SQ, FA_BK>(
+            reinterpret_cast<const __shared uint16_t *>(S_BYTE[cur]),
+            reinterpret_cast<__shared uint32_t *>(P_BYTE[cur]),
+            reinterpret_cast<__shared uint32_t *>(SCALE_SMEM),
+            reinterpret_cast<__shared uint16_t *>(M_SMEM),
+            reinterpret_cast<__shared uint16_t *>(LS_SMEM),
+            reinterpret_cast<__shared uint16_t *>(CORR_SMEM),
+            SOFTMAX_SCALE_BF16, first, tid, thr);
         mu_fence_smem();
-        mu_barrier(2, wpb); MARK();   // sync producer (mesh done) + consumers (softmax done)
+        mu_barrier(2, wpb); MARK();
 
         // pack P scales -> SF_MEM_A (safe now: QK_{j+1} drained, no longer reading SF_MEM).
         pack_scales_to_sfmem<FA_SQ, FA_BK>(
@@ -151,7 +146,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         mxgemm_prefetch_tile<PV, /*SKIP_A=*/true, /*DO_CONFIG=*/true>(
             &V_in[j * FA_BK][0], &V_in[j * FA_BK][0],
             &V_scales[j * FA_GKB][0], &V_scales[j * FA_GKB][0], FA_SQ, FA_D, FA_BK, tid);
-        mxgemm_compute_tile<PV>(tid, /*c_spad=*/PVOUT_ROW, /*a_spad=*/S_ROW[cur]);
+        mxgemm_compute_tile<PV>(tid, /*c_spad=*/PVOUT_ROW, /*a_spad=*/P_ROW[cur]);  // A=P (softmax fp8 out), not S
         mu_barrier(4, wpb); MARK();
 
         // O_acc = (first ? 0 : O_acc*corr) + PV_j  (PV read from PVOUT_SMEM).
@@ -172,7 +167,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 }
 
 int main() {
-    mu_schedule(fa_entry, nullptr, 3);  // 3 warps/core (occupancy): slim QK path dropped F to ~57;
+    mu_schedule(fa_entry, nullptr, 2);  // TEMP occ=2 to clear warpspec RF overflow + validate overlap correctness;
                                         // occ=4 overflowed the 256 phys-reg file, occ=3 (3*57=171)
                                         // has margin. More warps hide the latency-bound SIMT softmax.
     return 0;
