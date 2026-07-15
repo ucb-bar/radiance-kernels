@@ -66,15 +66,15 @@ static constexpr uint32_t P_SMEM = 0x10000;     // (unused: fused_softmax_requan
 //   bank1(0x8000) : S0/P0 + O_acc
 //   bank2(0x10000): S1/P1
 //   bank3(0x18000): scratch (muon-only) -- disjoint from all mesh accesses
-static constexpr uint32_t PVOUT_SMEM= 0x4000;   // PV output (bank0, after K/V); post-drain only
-static constexpr uint32_t S0_SMEM   = 0x8000;   // S buffer 0 (bank1); row 2048
-static constexpr uint32_t P0_SMEM   = 0xA000;   // P for cur=0 (bank1, co-located w/ S0); row 2560
+static constexpr uint32_t PVOUT_SMEM= 0x4000;   // PV output (bank0); post-drain only
+static constexpr uint32_t S0_SMEM   = 0x8000;   // S buffer 0 (bank1)
+static constexpr uint32_t P0_SMEM   = 0xA000;   // P for cur=0 (bank1)
 static constexpr uint32_t OACC_SMEM = 0xB000;   // O accumulator [Sq][d] bf16 (bank1)
-static constexpr uint32_t SCALE_SMEM = 0x18000; // per-scale word scratch (bank3, packed -> SF-SRAM)
-static constexpr uint32_t M_SMEM    = 0x18400;  // running row max (bank3)
-static constexpr uint32_t LS_SMEM   = 0x18600;  // running row denom l (bank3)
-static constexpr uint32_t CORR_SMEM = 0x18800;  // per-row rescale corr (bank3)
-static constexpr uint32_t REDBUF_SMEM = 0x18A00;// per-warp tree-reduce scratch (bank3)
+static constexpr uint32_t SCALE_SMEM = 0x14000; // scratch (bank2 = only gemmini-free bank)
+static constexpr uint32_t M_SMEM    = 0x14800;  // running row max (bank2)
+static constexpr uint32_t LS_SMEM   = 0x14A00;  // running row denom l (bank2)
+static constexpr uint32_t CORR_SMEM = 0x14C00;  // per-row rescale corr (bank2)
+static constexpr uint32_t REDBUF_SMEM = 0x15000;// per-warp tree-reduce scratch (bank2)
 static constexpr uint32_t S1_SMEM   = 0x10000;  // S buffer 1 (bank2); row 4096
 static constexpr uint32_t P1_SMEM   = 0x12000;  // P for cur=1 (bank2, co-located w/ S1); row 4608
 
