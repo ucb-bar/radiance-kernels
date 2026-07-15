@@ -66,8 +66,8 @@ static constexpr uint32_t P_SMEM = 0x10000;     // (unused: fused_softmax_requan
 //   bank1(0x8000) : S0/P0 + O_acc
 //   bank2(0x10000): S1/P1
 //   bank3(0x18000): scratch (muon-only) -- disjoint from all mesh accesses
-static constexpr uint32_t PVOUT_SMEM= 0x4000;   // PV output (bank0); post-drain only
-static constexpr uint32_t S0_SMEM   = 0x8000;   // S buffer 0 (bank1)
+static constexpr uint32_t PVOUT_SMEM= 0x1A000;  // PV output (bank3-mid, avoids B_ODD/B_EVEN)
+static constexpr uint32_t S0_SMEM   = 0x4000;   // S buffer 0 (SPAD_DEST, avoids A_ODD@0x8000)
 static constexpr uint32_t P0_SMEM   = 0xA000;   // P for cur=0 (bank1)
 static constexpr uint32_t OACC_SMEM = 0xB000;   // O accumulator [Sq][d] bf16 (bank1)
 static constexpr uint32_t SCALE_SMEM = 0x14000; // scratch (bank2 = only gemmini-free bank)
@@ -109,6 +109,16 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         FA_SQ, FA_BK, FA_D, tid);
     mxgemm_compute_tile<QK>(tid, /*c_spad=*/S_ROW[0]);
     mu_barrier(1, wpb); MARK();
+
+#ifdef DUMP_S0
+    // TEMP DIAG: copy S_0 (prologue QK_0 bf16 [Sq][Bk], row-major) SMEM->S_GMEM for golden compare.
+    {
+        volatile __shared uint32_t *s = reinterpret_cast<volatile __shared uint32_t *>(S_BYTE[0]);
+        volatile uint32_t *g = reinterpret_cast<volatile uint32_t *>(S_GMEM);
+        for (uint32_t w = tid; w < (FA_SQ * FA_BK) / 2; w += thr) g[w] = s[w];
+    }
+    mu_fence_smem(); mu_barrier(1, wpb);
+#endif
 
     for (uint32_t j = 0; j < FA_NBLK; j++) {
         const uint32_t first = (j == 0);
