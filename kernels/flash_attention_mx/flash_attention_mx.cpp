@@ -100,10 +100,12 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         &QK_B_blocks[0][0], &QK_A_scales_row[0][0], &QK_B_scales_blocks[0][0],
         FA_SQ, FA_BK, FA_D, tid);
     mxgemm_compute_tile<QK>(tid);
-    mu_barrier(2, wpb);
+    MARK();                        // dbg A: QK_0 done
+    mu_barrier(2, wpb); MARK();    // dbg B: barrier2 passed
     copy_smem_u32(reinterpret_cast<__shared uint32_t*>(SBUF[0]),
                   reinterpret_cast<const __shared uint32_t*>(S_SMEM), SW, tid, thr);
-    mu_fence_smem(); mu_barrier(3, wpb); MARK();
+    MARK();                        // dbg C: copy done
+    mu_fence_smem(); mu_barrier(3, wpb); MARK();  // dbg D: prologue done
     for (uint32_t j = 0; j < FA_NBLK; j++) {
         const uint32_t first = (j == 0), cur = j & 1u, nxt = (j + 1u) & 1u;
         // async QK_{j+1} -> SPAD_DEST (SKIP_A: Q persists; K_{j+1}@B_EVEN); overlaps softmax_j
@@ -111,7 +113,11 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
             mxgemm_prefetch_tile<QK, /*SKIP_A=*/true, /*DO_CONFIG=*/true>(&QK_A_in[0][0],
                 &QK_B_blocks[(j + 1) * FA_D][0], &QK_A_scales_row[0][0],
                 &QK_B_scales_blocks[(j + 1) * FA_GK][0], FA_SQ, FA_BK, FA_D, tid);
+#ifdef WSSYNC
+            mxgemm_compute_tile<QK>(tid);                 // SYNC: isolate async-vs-structure
+#else
             mxgemm_compute_issue<QK>(tid);                // async: no trailing fence
+#endif
         }
         fused_softmax_requant<FA_SQ, FA_BK>(
             reinterpret_cast<const __shared uint16_t*>(SBUF[cur]),
