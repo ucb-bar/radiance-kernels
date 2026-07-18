@@ -110,9 +110,15 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         const uint32_t first = (j == 0), cur = j & 1u, nxt = (j + 1u) & 1u;
         // async QK_{j+1} -> SPAD_DEST (SKIP_A: Q persists; K_{j+1}@B_EVEN); overlaps softmax_j
         if (j + 1 < FA_NBLK) {
+#ifdef WS_RELOADQ
+            mxgemm_prefetch_tile<QK, /*SKIP_A=*/false, /*DO_CONFIG=*/true>(&QK_A_in[0][0],
+                &QK_B_blocks[(j + 1) * FA_D][0], &QK_A_scales_row[0][0],
+                &QK_B_scales_blocks[(j + 1) * FA_GK][0], FA_SQ, FA_BK, FA_D, tid);
+#else
             mxgemm_prefetch_tile<QK, /*SKIP_A=*/true, /*DO_CONFIG=*/true>(&QK_A_in[0][0],
                 &QK_B_blocks[(j + 1) * FA_D][0], &QK_A_scales_row[0][0],
                 &QK_B_scales_blocks[(j + 1) * FA_GK][0], FA_SQ, FA_BK, FA_D, tid);
+#endif
 #ifdef WSSYNC
             mxgemm_compute_tile<QK>(tid);                 // SYNC: isolate async-vs-structure
 #else
