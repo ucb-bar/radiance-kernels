@@ -68,6 +68,13 @@ static constexpr uint32_t MARK_GMEM = 0x40050000;
 #define MARK() do { if (tid == 0) { uint32_t _c; asm volatile("csrr %0, mcycle" : "=r"(_c)); \
                                     ((volatile uint32_t *)MARK_GMEM)[mki++] = _c; } } while (0)
 
+// Cooperative SMEM->SMEM copy (all threads), n uint32 words. Used to double-buffer S
+// (mesh C-output can't relocate -> copy S off SPAD_DEST so QK_{j+1} can overwrite it).
+static __attribute__((noinline)) void copy_smem_u32(__shared uint32_t *dst,
+        const __shared uint32_t *src, uint32_t n, uint32_t tid, uint32_t thr) {
+    for (uint32_t i = tid; i < n; i += thr) dst[i] = src[i];
+}
+
 void fa_entry(void *arg, uint32_t tid_in_threadblock,
               uint32_t threads_per_threadblock, uint32_t threadblock_id) {
     const auto wpb = threads_per_threadblock / MU_NUM_THREADS;
@@ -80,6 +87,67 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     if (tid == 0) { gemmini_flush(0); configure_mxgemmini<QK>(FA_SQ, FA_BK, FA_D); }
     MARK();  // 0: entry
 
+#ifdef WARPSPEC
+    // ===== Software-pipelined overlap: QK_{j+1} (async) runs on the mesh while the SIMT
+    // does softmax_j. Q persistent @A_EVEN; P @A_ODD(0x8000, off Q); S double-buffered via
+    // SIMT-copy (mesh C-output can't relocate). Tests whether the QK drain hides. =====
+    {
+    constexpr uint32_t SBUF[2] = {0x6000u, 0xA000u};      // S double-buffer (bytes)
+    constexpr uint32_t P_LOC_ROW = 2048u;                 // A_ODD row (byte 0x8000)
+    constexpr uint32_t SW = (FA_SQ * FA_BK) / 2;          // S words (bf16 packed 2/word)
+    // prologue: load Q (persistent) + QK_0 -> SPAD_DEST -> Sbuf[0]
+    mxgemm_prefetch_tile<QK, /*SKIP_A=*/false, /*DO_CONFIG=*/true>(&QK_A_in[0][0],
+        &QK_B_blocks[0][0], &QK_A_scales_row[0][0], &QK_B_scales_blocks[0][0],
+        FA_SQ, FA_BK, FA_D, tid);
+    mxgemm_compute_tile<QK>(tid);
+    mu_barrier(2, wpb);
+    copy_smem_u32(reinterpret_cast<__shared uint32_t*>(SBUF[0]),
+                  reinterpret_cast<const __shared uint32_t*>(S_SMEM), SW, tid, thr);
+    mu_fence_smem(); mu_barrier(3, wpb); MARK();
+    for (uint32_t j = 0; j < FA_NBLK; j++) {
+        const uint32_t first = (j == 0), cur = j & 1u, nxt = (j + 1u) & 1u;
+        // async QK_{j+1} -> SPAD_DEST (SKIP_A: Q persists; K_{j+1}@B_EVEN); overlaps softmax_j
+        if (j + 1 < FA_NBLK) {
+            mxgemm_prefetch_tile<QK, /*SKIP_A=*/true, /*DO_CONFIG=*/true>(&QK_A_in[0][0],
+                &QK_B_blocks[(j + 1) * FA_D][0], &QK_A_scales_row[0][0],
+                &QK_B_scales_blocks[(j + 1) * FA_GK][0], FA_SQ, FA_BK, FA_D, tid);
+            mxgemm_compute_issue<QK>(tid);                // async: no trailing fence
+        }
+        fused_softmax_requant<FA_SQ, FA_BK>(
+            reinterpret_cast<const __shared uint16_t*>(SBUF[cur]),
+            reinterpret_cast<__shared uint32_t*>(0x8000 /*P @ A_ODD, off Q*/),
+            reinterpret_cast<__shared uint32_t*>(SCALE_SMEM),
+            reinterpret_cast<__shared uint16_t*>(M_SMEM),
+            reinterpret_cast<__shared uint16_t*>(LS_SMEM),
+            reinterpret_cast<__shared uint16_t*>(CORR_SMEM),
+            SOFTMAX_SCALE_BF16, first, tid, thr);
+        mu_fence_smem();
+        pack_scales_to_sfmem<FA_SQ, FA_BK>(
+            reinterpret_cast<const __shared uint32_t*>(SCALE_SMEM),
+            reinterpret_cast<__shared uint32_t*>(GEMMINI_SF_MEM_A), tid, thr);
+        mu_fence_smem(); mu_barrier(4, wpb); MARK();
+        // drain QK_{j+1}, stash S_{j+1} -> Sbuf[nxt] (frees SPAD_DEST for PV)
+        if (j + 1 < FA_NBLK) {
+            if (tid == 0) gemmini_fence();
+            mu_barrier(5, wpb);
+            copy_smem_u32(reinterpret_cast<__shared uint32_t*>(SBUF[nxt]),
+                          reinterpret_cast<const __shared uint32_t*>(S_SMEM), SW, tid, thr);
+            mu_fence_smem(); mu_barrier(6, wpb);
+        }
+        // PV_j: V_j@B_EVEN (K consumed); read P@A_ODD via a_spad_override -> SPAD_DEST
+        mxgemm_prefetch_tile<PV, /*SKIP_A=*/true, /*DO_CONFIG=*/true>(&V_in[j * FA_BK][0],
+            &V_in[j * FA_BK][0], &V_scales[j * FA_GKB][0], &V_scales[j * FA_GKB][0],
+            FA_SQ, FA_D, FA_BK, tid);
+        mxgemm_compute_tile<PV>(tid, /*c_spad_dest=*/SPAD_DEST, /*a_spad_override=*/P_LOC_ROW);
+        mu_barrier(7, wpb); MARK();
+        rescale_accumulate<FA_SQ, FA_D>(
+            reinterpret_cast<__shared uint32_t*>(OACC_SMEM),
+            reinterpret_cast<const __shared uint32_t*>(S_SMEM),
+            reinterpret_cast<const __shared uint16_t*>(CORR_SMEM), first, tid, thr);
+        mu_fence_smem(); mu_barrier(1, wpb); MARK();
+    }
+    }
+#else
     // ===== Streaming (flash) attention: loop over FA_NBLK key blocks of Bk. Running
     // online-softmax state (m, l, O_acc) lives in SMEM across blocks; 1/l is deferred to
     // the finalize. Mirrors FA.mx_attention_flash -> validated against golden_O_flash. =====
@@ -160,6 +228,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         mu_fence_smem();
         mu_barrier(6, wpb); MARK();
     }
+#endif  // WARPSPEC
 
     // ---- finalize: O = O_acc / l  -> GMEM (bf16). ----
     finalize_O<FA_SQ, FA_D>(

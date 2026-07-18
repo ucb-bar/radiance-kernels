@@ -701,17 +701,17 @@ __attribute__((noinline)) void mxgemm_prefetch_tile(
         const uint8_t *A_in, const uint8_t *B_in,
         const uint8_t *A_scales, const uint8_t *B_scales,
         const uint32_t dim_m, const uint32_t dim_n, const uint32_t dim_k,
-        const uint32_t tid_in_threadblock) {
+        const uint32_t tid_in_threadblock, const uint32_t tile_k = 0) {
     asm volatile ("mxgemm_prefetch_tile_start_%=:" :: );
     if (tid_in_threadblock != 0) return;
     if constexpr (DO_CONFIG) configure_mxgemmini<C>(dim_m, dim_n, dim_k);
-    copy_gmem_to_smem_async<C, SKIP_A>(A_in, B_in, dim_m, dim_n, dim_k, 0, 0, 0);
+    copy_gmem_to_smem_async<C, SKIP_A>(A_in, B_in, dim_m, dim_n, dim_k, 0, 0, tile_k);
     if constexpr (!SKIP_A) {
-        load_scale_factors(calculate_scale_factor_smem_addr<false>(0),
+        load_scale_factors(calculate_scale_factor_smem_addr<false>(tile_k),
                            calculate_scale_factor_gmem_addr<C, false>(A_scales, 0, dim_m, dim_n),
                            C.SCALE_FACTORS_PER_TILE());
     }
-    load_scale_factors(calculate_scale_factor_smem_addr<true>(0),
+    load_scale_factors(calculate_scale_factor_smem_addr<true>(tile_k),
                        calculate_scale_factor_gmem_addr<C, true>(B_scales, 0, dim_m, dim_n),
                        C.SCALE_FACTORS_PER_TILE());
     load_lut<C>();
@@ -779,7 +779,9 @@ __attribute__((noinline)) void mxgemm_compute_issue(const uint32_t tid_in_thread
 
 template <GemmConfig C>
 __attribute__((noinline)) void mxgemm_compute_tile(const uint32_t tid_in_threadblock,
-                                                   const uint32_t c_spad_dest = SPAD_DEST) {
+                                                   const uint32_t c_spad_dest = SPAD_DEST,
+                                                   const uint32_t a_spad_override = 0xffffffffu,
+                                                   const uint32_t b_spad_override = 0xffffffffu) {
     asm volatile ("mxgemm_compute_tile_start_%=:" :: );
     if (tid_in_threadblock != 0) return;
     gemmini_fence();      // drain the prefetch move-in DMA (V already streaming)
@@ -788,7 +790,7 @@ __attribute__((noinline)) void mxgemm_compute_tile(const uint32_t tid_in_threadb
         C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
         0, 0, QUANT_LUT_UPDATE_GRANULARITY);
     matmul_tile_async<C>(0, /*acc_move_out (last_k)=*/true, /*accumulate=*/false,
-                         /*b_spad_override=*/0xffffffffu, /*c_spad_dest=*/c_spad_dest); // C -> c_spad_dest
+                         b_spad_override, c_spad_dest, a_spad_override);
     gemmini_fence();
     asm volatile ("mxgemm_compute_tile_end_%=:" :: );
 }
