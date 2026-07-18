@@ -516,7 +516,8 @@ template <GemmConfig C>
 static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_out,
                                      const bool accumulate = false,
                                      const uint32_t b_spad_override = 0xffffffffu,
-                                     const uint32_t c_spad_dest = SPAD_DEST) {
+                                     const uint32_t c_spad_dest = SPAD_DEST,
+                                     const uint32_t a_spad_override = 0xffffffffu) {
     asm volatile ("matmul_tile_async_start_%=:" :: );
 
     const uint32_t skip_stc = acc_move_out ? 0 : 1;
@@ -524,7 +525,8 @@ static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_
       loop_matmul_skips(/*skip_lda=*/1, /*skip_ldb=*/1, /*skip_ldd=*/1,
                         /*skip_ex=*/0, /*skip_stc=*/skip_stc);
 
-    const uint32_t a_spad_addr_start = calculate_spad_addr<false>(tile_k);
+    const uint32_t a_spad_addr_start = (a_spad_override != 0xffffffffu)
+                                       ? a_spad_override : calculate_spad_addr<false>(tile_k);
     const uint32_t b_spad_addr_end = (b_spad_override != 0xffffffffu)
                                      ? b_spad_override : calculate_spad_addr<true>(tile_k);
 

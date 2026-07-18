@@ -409,13 +409,17 @@ static __attribute__((noinline)) void fused_softmax_requant(
         _Float16 bSmax = lmax, rmax = lmax;  // ABLATION: skip cross-lane max reduce (timing only)
 #else
         buf[lane] = __builtin_bit_cast(uint16_t, lmax);
+#ifndef FA_SM_NOFENCE
         mu_fence_smem();
+#endif
         for (uint32_t st = 1; st < LPB; st <<= 1) {
             if ((lane % (2 * st)) == 0)
                 buf[lane] = __builtin_bit_cast(uint16_t,
                     (_Float16)fmaxf(as_bf16(buf[lane]), as_bf16(buf[lane + st])));
         }
+#ifndef FA_SM_NOFENCE
         mu_fence_smem();
+#endif
         _Float16 bSmax = as_bf16(buf[b_of_lane * LPB]);     // this lane's block max
         _Float16 rmax = as_bf16(NEG_INF_BF16_BITS);         // row max over block leaders
         for (uint32_t b = 0; b < NBLK; b++) rmax = fmaxf(rmax, as_bf16(buf[b * LPB]));
@@ -432,7 +436,13 @@ static __attribute__((noinline)) void fused_softmax_requant(
         _Float16 rowsum = lsum;  // ABLATION: skip cross-lane sum reduce (timing only)
 #else
         buf[lane] = __builtin_bit_cast(uint16_t, lsum);
-        mu_fence_smem(); warp_tree_reduce<false>(buf, lane); mu_fence_smem();
+#ifndef FA_SM_NOFENCE
+        mu_fence_smem();
+#endif
+        warp_tree_reduce<false>(buf, lane);
+#ifndef FA_SM_NOFENCE
+        mu_fence_smem();
+#endif
         _Float16 rowsum = as_bf16(buf[0]);
 #endif
         if (lane == 0) {
