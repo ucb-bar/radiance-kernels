@@ -55,28 +55,12 @@ static constexpr uint32_t L_SMEM = 0xE000;
 // C=SPAD_DEST (S/PV bf16) 0x4000..0xC000 (32KB); O_acc 0xC000..0x14000 (32KB); scratch
 // 0x14000+; B-spad (K/V) at the top. All non-overlapping for Sq=Bk=d in {64,128}.
 static constexpr uint32_t P_SMEM = 0x10000;     // (unused: fused_softmax_requant writes P-fp8 direct)
-// ===== COLLISION-FREE OVERLAP layout (Sq=64,Bk=64). 4 banks x 32KB. The shared scratchpad
-// arbitrates muon-BEFORE-gemmini (lowestIndexFirst), so ANY bank shared by the mesh and the muon
-// starves the mesh. The mesh touches {Q,K,V @ bank0 (via B_SPAD_ADDR_EVEN=1024), S[nxt] @ bank1|2}.
-// The muon touches {S[cur] @ bank2|1 (opposite of nxt), P[cur] co-located, scratch @ bank3}. Thus
-// NO bank is ever shared: mesh S[nxt] (nxt) vs muon S[cur] (cur) differ every iter (nxt!=cur);
-// bank0 (mesh Q/K/V) & bank3 (muon scratch) are disjoint. This is what lets QK_{j+1} overlap
-// softmax_j without the mesh stalling.
-//   bank0(0x0)    : Q (0..0x2000) + K/V (0x2000..0x4000, mesh B) + PVout (0x4000..0x8000, post-drain)
-//   bank1(0x8000) : S0/P0 + O_acc
-//   bank2(0x10000): S1/P1
-//   bank3(0x18000): scratch (muon-only) -- disjoint from all mesh accesses
-static constexpr uint32_t PVOUT_SMEM= 0x1A000;  // PV output (bank3-mid, avoids B_ODD/B_EVEN)
-static constexpr uint32_t S0_SMEM   = 0x4000;   // S buffer 0 (SPAD_DEST, avoids A_ODD@0x8000)
-static constexpr uint32_t P0_SMEM   = 0xA000;   // P for cur=0 (bank1)
-static constexpr uint32_t OACC_SMEM = 0xB000;   // O accumulator [Sq][d] bf16 (bank1)
-static constexpr uint32_t SCALE_SMEM = 0x14000; // scratch (bank2 = only gemmini-free bank)
-static constexpr uint32_t M_SMEM    = 0x14800;  // running row max (bank2)
-static constexpr uint32_t LS_SMEM   = 0x14A00;  // running row denom l (bank2)
-static constexpr uint32_t CORR_SMEM = 0x14C00;  // per-row rescale corr (bank2)
-static constexpr uint32_t REDBUF_SMEM = 0x15000;// per-warp tree-reduce scratch (bank2)
-static constexpr uint32_t S1_SMEM   = 0x10000;  // S buffer 1 (bank2); row 4096
-static constexpr uint32_t P1_SMEM   = 0x12000;  // P for cur=1 (bank2, co-located w/ S1); row 4608
+static constexpr uint32_t OACC_SMEM = 0xC000;   // running unnormalized O accumulator [Sq][d] bf16
+static constexpr uint32_t SCALE_SMEM = 0x14000; // per-scale word scratch (packed -> SF-SRAM)
+static constexpr uint32_t M_SMEM    = 0x14800;  // running row max
+static constexpr uint32_t LS_SMEM   = 0x14A00;  // running row denom l
+static constexpr uint32_t CORR_SMEM = 0x14C00;  // per-row rescale corr
+static constexpr uint32_t REDBUF_SMEM = 0x15000; // per-warp tree-reduce scratch (was 0xC000)
 
 // Lightweight phase profiler: thread-0 stores the mcycle counter to a GMEM marker array
 // at each phase boundary. Parse stores to MARK_GMEM from the .out trace -> per-phase cycles.
@@ -90,82 +74,91 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     const auto tid = tid_in_threadblock;
     const auto thr = threads_per_threadblock;
     uint32_t mki = 0;
-    if (tid == 0) gemmini_flush(0);
+    // One-time gemmini setup (hoisted out of the per-block gemms). For square streaming
+    // blocks (Bk=Sq=d) QK and PV share an identical config, so configure ONCE here and
+    // pass DO_CONFIG=false below -> skips ~half the per-gemm ROCC command overhead.
+    if (tid == 0) { gemmini_flush(0); configure_mxgemmini<QK>(FA_SQ, FA_BK, FA_D); }
     MARK();  // 0: entry
 
-    // ===== ASYNC-OVERLAP streaming FA (softmax || QK on the mesh). Double-buffered S: QK_{j+1}
-    // is issued ASYNC into S[nxt] (mesh computes it during softmax_j reading S[cur]); drained
-    // before PV_j. Q resident @ row 0 (const); softmax writes P to PSPAD (row 2048) so it never
-    // collides with Q. S=16KB double-buffers in-region. =====
-    constexpr uint32_t S_ROW[2]  = {S0_SMEM / DIM, S1_SMEM / DIM};   // QK C-output spad rows
-    constexpr uint32_t S_BYTE[2] = {S0_SMEM, S1_SMEM};              // softmax S read (byte)
-    constexpr uint32_t P_BYTE[2] = {P0_SMEM, P1_SMEM};              // softmax P write (byte, bank_cur)
-    constexpr uint32_t P_ROW[2]  = {P0_SMEM / DIM, P1_SMEM / DIM};  // PV A(=P) spad row
-    constexpr uint32_t PVOUT_ROW = PVOUT_SMEM / DIM;               // PV C-output spad row
-
-    // Prologue: QK_0 -> S0 (loads Q resident @0 + K_0, configs QK).
-    mxgemm_prefetch_tile<QK, /*SKIP_A=*/false, /*DO_CONFIG=*/true>(
-        &QK_A_in[0][0], &QK_B_blocks[0][0], &QK_A_scales_row[0][0], &QK_B_scales_blocks[0][0],
-        FA_SQ, FA_BK, FA_D, tid);
-    mxgemm_compute_tile<QK>(tid, /*c_spad=*/S_ROW[0]);
-    mu_barrier(1, wpb); MARK();
-
-#ifdef DUMP_S0
-    // TEMP DIAG: copy S_0 (prologue QK_0 bf16 [Sq][Bk], row-major) SMEM->S_GMEM for golden compare.
-    {
-        volatile __shared uint32_t *s = reinterpret_cast<volatile __shared uint32_t *>(S_BYTE[0]);
-        volatile uint32_t *g = reinterpret_cast<volatile uint32_t *>(S_GMEM);
-        for (uint32_t w = tid; w < (FA_SQ * FA_BK) / 2; w += thr) g[w] = s[w];
-    }
-    mu_fence_smem(); mu_barrier(1, wpb);
-#endif
-
+    // ===== Streaming (flash) attention: loop over FA_NBLK key blocks of Bk. Running
+    // online-softmax state (m, l, O_acc) lives in SMEM across blocks; 1/l is deferred to
+    // the finalize. Mirrors FA.mx_attention_flash -> validated against golden_O_flash. =====
     for (uint32_t j = 0; j < FA_NBLK; j++) {
         const uint32_t first = (j == 0);
-        const uint32_t cur = j & 1, nxt = (j + 1) & 1;
 
-        // ISOLATION TEST: SERIAL (no overlap) -- QK_{j+1} (thread0) THEN softmax_j (all warps).
-        // Keeps bank0-KV. If correct -> the overlap concurrency causes the 34% err. If 34% ->
-        // bank0-KV corrupts the matmul.
-        if (j + 1 < FA_NBLK) {
-            mxgemm_prefetch_tile<QK, /*SKIP_A=*/false, /*DO_CONFIG=*/true>(
-                &QK_A_in[0][0], &QK_B_blocks[(j + 1) * FA_D][0], &QK_A_scales_row[0][0],
-                &QK_B_scales_blocks[(j + 1) * FA_GK][0], FA_SQ, FA_BK, FA_D, tid);
-            mxgemm_compute_tile<QK>(tid, /*c_spad=*/S_ROW[nxt]);
-        }
-        mu_barrier(1, wpb);   // QK_{j+1} fully done before softmax (serial)
+        // QK_j: S_j = Q @ K_j^T  -> bf16 S_j @ SPAD_DEST. K_j^T = QK_B_blocks[j] [d][Bk].
+        // FA QK is a SINGLE K-tile (dim_k=FA_D=TILE_K), so use the slim prefetch+compute
+        // path (like PV) instead of mxgemm_single_output_tile's dead software-pipelined
+        // K-loop -- drops the heavy gemm fn (33 arch regs) from the call graph, shrinking
+        // the per-warp register footprint F toward the <=63 needed for 4 warps.
+#ifdef USE_CISC_QK
+        // CISC QK (option 2): issue loop_ws via csrw 0xacc, no muon fences.
+        mxgemm_cisc_qk<QK>(
+            &QK_A_in[0][0], &QK_B_blocks[j * FA_D][0],
+            &QK_A_scales_row[0][0], &QK_B_scales_blocks[j * FA_GK][0],
+            FA_SQ, FA_BK, FA_D, tid);
+#else
+        mxgemm_prefetch_tile<QK, /*SKIP_A=*/false, /*DO_CONFIG=*/true>(
+            &QK_A_in[0][0], &QK_B_blocks[j * FA_D][0],
+            &QK_A_scales_row[0][0], &QK_B_scales_blocks[j * FA_GK][0],
+            FA_SQ, FA_BK, FA_D, tid);
+#ifdef RELOC_TEST
+        mxgemm_compute_tile<QK>(tid, /*c_spad_dest=*/1536);   // S -> spad row 1536 (byte 0x6000)
+#elif defined(QK_SPLIT)
+        MARK();                          // after prefetch DMA issue
+        mxgemm_compute_issue<QK>(tid);   // leading move-in drain + config + matmul ISSUE (no trailing fence)
+        MARK();                          // issue side done
+        if (tid == 0) gemmini_fence();   // trailing drain: matmul compute + mvout
+#else
+        mxgemm_compute_tile<QK>(tid);
+#endif
+#endif
+        mu_barrier(2, wpb); MARK();      // (QK_SPLIT: this is the 3rd mark = drain done)
+
+
+        // PREFETCH V_j for PV: async move-in (no fence) -> overlaps softmax+requant below,
+        // hiding PV's DMA/config latency (was ~50 k cyc). SKIP_A (A=P comes from requant).
+        mxgemm_prefetch_tile<PV, /*SKIP_A=*/true, /*DO_CONFIG=*/true>(
+            &V_in[j * FA_BK][0], &V_in[j * FA_BK][0],
+            &V_scales[j * FA_GKB][0], &V_scales[j * FA_GKB][0],
+            FA_SQ, FA_D, FA_BK, tid);
+
+        // FUSED online-softmax + MX-FP8 requant: update running m/l, emit corr, and write
+        // P_j fp8 directly to the A-spad (tiled) + E8M0 scales -> SCALE_SMEM. No P_SMEM
+        // round-trip / double-read (thorough SIMT rewrite; contiguous 16-lane ownership).
         fused_softmax_requant<FA_SQ, FA_BK>(
-            reinterpret_cast<const __shared uint16_t *>(S_BYTE[cur]),
-            reinterpret_cast<__shared uint32_t *>(P_BYTE[cur]),
+#ifdef RELOC_TEST
+            reinterpret_cast<const __shared uint16_t *>(0x6000),  // read relocated S
+#else
+            reinterpret_cast<const __shared uint16_t *>(S_SMEM),
+#endif
+            reinterpret_cast<__shared uint32_t *>(0 /* A-spad base */),
             reinterpret_cast<__shared uint32_t *>(SCALE_SMEM),
             reinterpret_cast<__shared uint16_t *>(M_SMEM),
             reinterpret_cast<__shared uint16_t *>(LS_SMEM),
             reinterpret_cast<__shared uint16_t *>(CORR_SMEM),
             SOFTMAX_SCALE_BF16, first, tid, thr);
         mu_fence_smem();
-        mu_barrier(2, wpb); MARK();
+        mu_barrier(3, wpb); MARK();
 
-        // pack P scales -> SF_MEM_A (safe now: QK_{j+1} drained, no longer reading SF_MEM).
+        // pack scales -> A scale SRAM (SF_MEM_A) for the PV mesh.
         pack_scales_to_sfmem<FA_SQ, FA_BK>(
             reinterpret_cast<const __shared uint32_t *>(SCALE_SMEM),
             reinterpret_cast<__shared uint32_t *>(GEMMINI_SF_MEM_A), tid, thr);
         mu_fence_smem();
-        mu_barrier(3, wpb);
-
-        // PV_j: V_j move-in (B-even, K consumed) + config PV; matmul A=P@PSPAD -> C=PVOUT.
-        mxgemm_prefetch_tile<PV, /*SKIP_A=*/true, /*DO_CONFIG=*/true>(
-            &V_in[j * FA_BK][0], &V_in[j * FA_BK][0],
-            &V_scales[j * FA_GKB][0], &V_scales[j * FA_GKB][0], FA_SQ, FA_D, FA_BK, tid);
-        mxgemm_compute_tile<PV>(tid, /*c_spad=*/PVOUT_ROW, /*a_spad=*/P_ROW[cur]);  // A=P (softmax fp8 out), not S
         mu_barrier(4, wpb); MARK();
 
-        // O_acc = (first ? 0 : O_acc*corr) + PV_j  (PV read from PVOUT_SMEM).
+        // PV_j COMPUTE: V_j prefetched during the fused SIMT (async DMA hidden). Drain + matmul.
+        mxgemm_compute_tile<PV>(tid);
+        mu_barrier(5, wpb); MARK();
+
+        // O_acc = (first ? 0 : O_acc*corr) + PV_j   (PV_j read from SPAD_DEST == S_SMEM).
         rescale_accumulate<FA_SQ, FA_D>(
             reinterpret_cast<__shared uint32_t *>(OACC_SMEM),
-            reinterpret_cast<const __shared uint32_t *>(PVOUT_SMEM),
+            reinterpret_cast<const __shared uint32_t *>(S_SMEM),
             reinterpret_cast<const __shared uint16_t *>(CORR_SMEM), first, tid, thr);
         mu_fence_smem();
-        mu_barrier(5, wpb); MARK();
+        mu_barrier(6, wpb); MARK();
     }
 
     // ---- finalize: O = O_acc / l  -> GMEM (bf16). ----
@@ -177,7 +170,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 }
 
 int main() {
-    mu_schedule(fa_entry, nullptr, 2);  // TEMP occ=2 to clear warpspec RF overflow + validate overlap correctness;
+    mu_schedule(fa_entry, nullptr, 3);  // 3 warps/core (occupancy): slim QK path dropped F to ~57;
                                         // occ=4 overflowed the 256 phys-reg file, occ=3 (3*57=171)
                                         // has margin. More warps hide the latency-bound SIMT softmax.
     return 0;
