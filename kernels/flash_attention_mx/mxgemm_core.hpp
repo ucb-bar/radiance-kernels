@@ -517,7 +517,8 @@ static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_
                                      const bool accumulate = false,
                                      const uint32_t b_spad_override = 0xffffffffu,
                                      const uint32_t c_spad_dest = SPAD_DEST,
-                                     const uint32_t a_spad_override = 0xffffffffu) {
+                                     const uint32_t a_spad_override = 0xffffffffu,
+                                     const int force_first = -1) {
     asm volatile ("matmul_tile_async_start_%=:" :: );
 
     const uint32_t skip_stc = acc_move_out ? 0 : 1;
@@ -530,7 +531,9 @@ static inline void matmul_tile_async(const uint32_t tile_k, const bool acc_move_
     const uint32_t b_spad_addr_end = (b_spad_override != 0xffffffffu)
                                      ? b_spad_override : calculate_spad_addr<true>(tile_k);
 
-    const bool first_k = tile_k == 0;
+    // first_k gates ex_accumulate (overwrite vs accumulate). Normally tile_k==0, but parity-
+    // decoupled callers (odd double-buffer for a single-tile OVERWRITE matmul) pass force_first.
+    const bool first_k = (force_first < 0) ? (tile_k == 0) : (force_first != 0);
     // `accumulate` forces in-accumulator add (mesh-accumulate PV across blocks -> no SIMT rescale)
 
     // TODO: support skipping move-out to SMEM
@@ -781,16 +784,18 @@ template <GemmConfig C>
 __attribute__((noinline)) void mxgemm_compute_tile(const uint32_t tid_in_threadblock,
                                                    const uint32_t c_spad_dest = SPAD_DEST,
                                                    const uint32_t a_spad_override = 0xffffffffu,
-                                                   const uint32_t b_spad_override = 0xffffffffu) {
+                                                   const uint32_t b_spad_override = 0xffffffffu,
+                                                   const uint32_t tile_k = 0) {
     asm volatile ("mxgemm_compute_tile_start_%=:" :: );
     if (tid_in_threadblock != 0) return;
+    const uint32_t odd = tile_k & 1u;
     gemmini_fence();      // drain the prefetch move-in DMA (V already streaming)
     gemmini_mxquant_config_mvout(
         rad_device_to_host_address(reinterpret_cast<uint32_t>(&C_scale_factors[0])),
         C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
-        0, 0, QUANT_LUT_UPDATE_GRANULARITY);
-    matmul_tile_async<C>(0, /*acc_move_out (last_k)=*/true, /*accumulate=*/false,
-                         b_spad_override, c_spad_dest, a_spad_override);
+        odd, odd, QUANT_LUT_UPDATE_GRANULARITY);   // A/B double-buffer parity MUST match tile_k
+    matmul_tile_async<C>(tile_k, /*acc_move_out (last_k)=*/true, /*accumulate=*/false,
+                         b_spad_override, c_spad_dest, a_spad_override, /*force_first=*/1);
     gemmini_fence();
     asm volatile ("mxgemm_compute_tile_end_%=:" :: );
 }
