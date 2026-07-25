@@ -7,4 +7,4 @@
 	url = https://github.com/richardyrh/muon-isa-tests.git
 [submodule "gemmini-rocc-tests"]
 	path = lib/mxgemmini
-	url = git@github.com:Rakanic/gemmini-rocc-tests.git
+	url = https://github.com/Rakanic/gemmini-rocc-tests.git

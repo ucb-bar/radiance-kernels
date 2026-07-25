@@ -4,6 +4,26 @@
 **/*.o
 **/*.s
 
+# simulation / benchmark artifacts
+**/*.sqlite
+**/*.log
+**/*.runlog
+**/*.trace
+**/*.npy
+**/*.bak
+**/performance_logs/
+
 # clangd
 **/compile_commands.json
 **/.cache/
+# data-generator scratch
+**/_gen/
+
+# Generated kernel data -- regenerate with `make -C kernels data` (see regen_data.sh).
+# Two files the generators cannot reproduce are kept committed: the fp6 gemm header
+# (LUT-requant format) and ws_restream's re-tiled scales.
+**/data
+!gemm_mxgemmini_ws_restream/data
+**/include/fa_data.h
+gemm_mxgemmini/mxgemm.data.fp8.*.h
+gemm_mxgemmini/mxgemm.data.fp4.*.h

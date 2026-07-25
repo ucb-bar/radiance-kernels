@@ -1,0 +1,18 @@
+radiance-kernels
+Copyright The radiance-kernels authors.
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE) and
+includes third-party code under the BSD 3-Clause License:
+
+- Gemmini (https://github.com/ucb-bar/gemmini)
+  Copyright (c) The Regents of the University of California (Berkeley Architecture
+  Research). BSD 3-Clause License.
+  The MX-Gemmini mesh drivers derive from Gemmini's ISA/config and host library:
+    kernels/*/mxgemm_lib.hpp, kernels/*/mxgemm_core.hpp, kernels/*/flash_mx_impl.hpp
+  and they build against the vendored gemmini-rocc-tests submodule at lib/mxgemmini
+  (include/gemmini.h, the Python MX matmul models).
+
+- Spike / riscv-isa-sim (https://github.com/riscv-software-src/riscv-isa-sim)
+  Copyright (c) The Regents of the University of California. BSD 3-Clause License.
+  lib/golden/mx_fp_math.h reuses Spike's MX floating-point primitives (via the
+  gemmini spike extension), and lib/golden/mx_golden.cpp is built on them.
