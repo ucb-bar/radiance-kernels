@@ -22,6 +22,7 @@ int main(void) {
         finished = READ_MMIO_32(RAD_HOST_GPU_ALL_FINISHED);
     }
     printf("finished\n");
+#endif
 
     return 0;
 }

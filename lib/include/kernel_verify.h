@@ -12,6 +12,7 @@
 #define KERNEL_VERIFY_H
 
 #include <stdint.h>
+#include <shared_mem.h>   // __global address-space qualifier (don't rely on include order)
 
 static inline float mu_fabsf(float x) { return x < 0.0f ? -x : x; }
 

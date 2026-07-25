@@ -8,7 +8,8 @@ includes third-party code under the BSD 3-Clause License:
   Copyright (c) The Regents of the University of California (Berkeley Architecture
   Research). BSD 3-Clause License.
   The MX-Gemmini mesh drivers derive from Gemmini's ISA/config and host library:
-    kernels/*/mxgemm_lib.hpp, kernels/*/mxgemm_core.hpp, kernels/*/flash_mx_impl.hpp
+    lib/mxgemm/mxgemm_lib.hpp, lib/mxgemm/mxgemm_lib_fused.hpp,
+    kernels/*/mxgemm_core.hpp, kernels/*/flash_mx_impl.hpp
   and they build against the vendored gemmini-rocc-tests submodule at lib/mxgemmini
   (include/gemmini.h, the Python MX matmul models).
 
