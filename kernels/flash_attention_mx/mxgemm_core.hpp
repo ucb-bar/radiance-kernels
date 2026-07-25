@@ -30,6 +30,8 @@ struct GemmConfig {
     constexpr uint32_t PE_TILES_K() const { return TILE_K / PE_K(); }
     // TODO: TILE_N not differentiated
     constexpr uint32_t SCALE_FACTORS_PER_TILE() const { return TILE_M * TILE_K / 32; }
+    // B (K-operand) scales are counted along N, not M: needed for non-square tiles (e.g. full-attn QKF N=Sk).
+    constexpr uint32_t SCALE_FACTORS_PER_TILE_B() const { return TILE_N * TILE_K / 32; }
     constexpr uint32_t VALUES_PER_BYTE() const { return (IS_FP8() ? 1 : 2); }
     // Size of each C element *after column-packing*.
     constexpr uint32_t OUT_ELEM_SIZE() const {
@@ -61,6 +63,17 @@ constexpr auto SPAD_DEST = 1024; // C-output spad row: clears the A-spad P-fp8 r
 
 // use MxGemmini DMA for GMEM->SMEM move-in
 constexpr bool GEMMINI_DMA = true;
+
+// PMARK: cycle stamps for intra-prefetch profiling -> GMEM 0x40060000 + 4*(8*call + slot).
+// Only thread 0 stamps. PMARK_CALL is bumped by the caller between prefetch invocations.
+#ifndef PMARK_ENABLE
+#define PMARK(slot) do {} while (0)
+#else
+extern uint32_t g_pmark_call;
+#define PMARK(slot) do { if (tid_in_threadblock == 0) { uint32_t _c; \
+    asm volatile("csrr %0, mcycle" : "=r"(_c)); \
+    ((volatile uint32_t*)0x40060000)[8*g_pmark_call + (slot)] = _c; } } while (0)
+#endif
 // always read from the first-k tile position to incur high cache hits
 constexpr bool ZERO_STRIDE_K = false;
 // disable GMEM->SMEM DMA copy after 0th tile and have MxGemmini work on stale
@@ -197,6 +210,30 @@ calculate_scale_factor_gmem_addr(const uint8_t *scales_base_addr,
     return scales_addr;
 }
 
+// LANE-PARALLEL scale load: 16 lanes of ONE warp write 16 consecutive SF-SRAM words (coalesced).
+// The SF/requantizer scale interface only corrupts under MULTI-WARP parallel writes; a single warp's
+// lanes are fine, and because the matmul is issued by lane 0 of the SAME warp afterwards, program
+// order + `fence.s` suffice (NO cross-warp barrier needed). Single-threaded load_scale_factors was
+// ~100 cyc/word => ~64k cycles total across the 3 call sites (33% of the whole kernel).
+// NOTE the partitioning: lanes take CONTIGUOUS BLOCKS, not an interleave. An interleaved
+// (i = lane; i += 16) pattern makes the 16 lanes write 16 CONSECUTIVE words in one cycle, which the
+// coalescer merges into a 64B burst -- and the SF-SRAM scale-write path rejects that
+// (FlitMergeNode_1.sv:115 "Assertion failed: start address not aligned" -> $finish). Block-partitioning
+// keeps every lane's store a single 4B write to a far-apart address (no merge) while still putting 16
+// writes in flight, which is what actually hides the ~100 cyc/word SF-SRAM latency.
+static void __attribute__((noinline))
+load_scale_factors_lanes(volatile __shared uint32_t *sf_mem, const uint8_t *scale_factors,
+                         const int n, const uint32_t lane) {
+    auto src = reinterpret_cast<const uint32_t *>(scale_factors);
+    const uint32_t nw = (uint32_t)n / 4;
+    const uint32_t per = (nw + MU_NUM_THREADS - 1) / MU_NUM_THREADS;
+    const uint32_t base = lane * per;
+    for (uint32_t j = 0; j < per; j++) {
+        const uint32_t i = base + j;
+        if (i < nw) sf_mem[i] = src[i];
+    }
+}
+
 static void __attribute__((noinline))
 load_scale_factors(volatile __shared uint32_t *sf_mem, const uint8_t *scale_factors,
                    const int n) {
@@ -244,7 +281,11 @@ static inline void load_lut() {
 
 }
 
-template <GemmConfig C, bool SKIP_A = false>
+// EXPLICIT_MVIN: use per-tile `gemmini_extended_mvin` commands instead of the loop_ws FSM.
+// The loop FSM's mvin with skip_lda=1 (SKIP_A) appears to leave a PHANTOM outstanding completion
+// (H8: gemmini idle + occupancy MMIO stuck non-zero -> every gemmini_fence livelocks and the next
+// matmul can't even enqueue). Explicit mvin commands bypass that skip accounting entirely.
+template <GemmConfig C, bool SKIP_A = false, bool EXPLICIT_MVIN = false>
 static inline void copy_gmem_to_smem_async(
     const uint8_t *A_in, const uint8_t *B_in,
     const uint32_t dim_m, const uint32_t dim_n, const uint32_t dim_k,
@@ -261,7 +302,7 @@ static inline void copy_gmem_to_smem_async(
     const uint32_t a_spad_addr_start = calculate_spad_addr<false>(tile_k);
     const uint32_t b_spad_addr_end = calculate_spad_addr<true>(tile_k);
 
-    if constexpr (GEMMINI_DMA) {
+    if constexpr (GEMMINI_DMA && !EXPLICIT_MVIN) {
         // Configure GMEM address for A and B
         // TODO: stride by tile_i/j
         // TODO: possibly create functions for A/B row-stride
@@ -321,6 +362,8 @@ static inline void copy_gmem_to_smem_async(
 
         // A layout: for each i row, store all k tiles contiguously
         // A tile (i,k) -> a_base + (i * tiles_K + k) * DIM
+        // SKIP_A: A already resident in the spad (e.g. a SIMT requant wrote P there) -> no A mvin.
+        if constexpr (!SKIP_A)
         for (int i = 0; i < C.PE_TILES_I(); i++) {
             for (int k = 0; k < C.PE_TILES_K(); k++) {
                 // TODO: missing TILE_K offset
@@ -699,25 +742,57 @@ __attribute__((noinline)) void mxgemm_single_output_tile(const uint8_t *A_in, co
  *  WITHOUT waiting (no gemmini_fence), so the caller can run other work (e.g. SIMT
  *  softmax/requant) while the DMA is in flight. `mxgemm_compute_tile` then drains the DMA
  *  (leading gemmini_fence) and runs the matmul, leaving C at SPAD_DEST. thread-0 only. */
-template <GemmConfig C, bool SKIP_A = false, bool DO_CONFIG = true>
+// LANE_SCALES: do the SF-SRAM scale loads with warp-0's 16 lanes instead of thread 0 alone (~16x).
+// MUST be called by all threads (lanes 1..15 participate; only lane 0 issues ROCC/config/DMA).
+template <GemmConfig C, bool SKIP_A = false, bool DO_CONFIG = true, bool EXPLICIT_MVIN = false,
+          bool LANE_SCALES = false>
 __attribute__((noinline)) void mxgemm_prefetch_tile(
         const uint8_t *A_in, const uint8_t *B_in,
         const uint8_t *A_scales, const uint8_t *B_scales,
         const uint32_t dim_m, const uint32_t dim_n, const uint32_t dim_k,
         const uint32_t tid_in_threadblock, const uint32_t tile_k = 0) {
     asm volatile ("mxgemm_prefetch_tile_start_%=:" :: );
-    if (tid_in_threadblock != 0) return;
-    if constexpr (DO_CONFIG) configure_mxgemmini<C>(dim_m, dim_n, dim_k);
-    copy_gmem_to_smem_async<C, SKIP_A>(A_in, B_in, dim_m, dim_n, dim_k, 0, 0, tile_k);
-    if constexpr (!SKIP_A) {
-        load_scale_factors(calculate_scale_factor_smem_addr<false>(tile_k),
-                           calculate_scale_factor_gmem_addr<C, false>(A_scales, 0, dim_m, dim_n),
-                           C.SCALE_FACTORS_PER_TILE());
+    if constexpr (LANE_SCALES) {
+        if (tid_in_threadblock >= MU_NUM_THREADS) return;   // warp 0 only (lanes 0..15)
+    } else {
+        if (tid_in_threadblock != 0) return;
     }
-    load_scale_factors(calculate_scale_factor_smem_addr<true>(tile_k),
-                       calculate_scale_factor_gmem_addr<C, true>(B_scales, 0, dim_m, dim_n),
-                       C.SCALE_FACTORS_PER_TILE());
-    load_lut<C>();
+    if (tid_in_threadblock == 0) {
+        if constexpr (DO_CONFIG) configure_mxgemmini<C>(dim_m, dim_n, dim_k);
+        copy_gmem_to_smem_async<C, SKIP_A, EXPLICIT_MVIN>(A_in, B_in, dim_m, dim_n, dim_k, 0, 0, tile_k);
+    }
+    // Order lane-0's ROCC/config stores AHEAD of the lanes' SF-SRAM writes: both traverse the gemmini
+    // tile's flit merge node, and previously they were strictly serial (all from thread 0).
+    if constexpr (LANE_SCALES) mu_fence_smem();
+    PMARK(0);   // after config + DMA issue
+#ifdef FA_NOSCALES
+    if (false)
+#endif
+    if constexpr (LANE_SCALES) {
+        if constexpr (!SKIP_A) {
+            load_scale_factors_lanes(calculate_scale_factor_smem_addr<false>(tile_k),
+                                     calculate_scale_factor_gmem_addr<C, false>(A_scales, 0, dim_m, dim_n),
+                                     C.SCALE_FACTORS_PER_TILE(), tid_in_threadblock);
+        }
+        load_scale_factors_lanes(calculate_scale_factor_smem_addr<true>(tile_k),
+                                 calculate_scale_factor_gmem_addr<C, true>(B_scales, 0, dim_m, dim_n),
+                                 C.SCALE_FACTORS_PER_TILE_B(), tid_in_threadblock);
+    } else {
+#ifdef FA_NOSCALES
+        if (false)
+#endif
+        if constexpr (!SKIP_A) {
+            load_scale_factors(calculate_scale_factor_smem_addr<false>(tile_k),
+                               calculate_scale_factor_gmem_addr<C, false>(A_scales, 0, dim_m, dim_n),
+                               C.SCALE_FACTORS_PER_TILE());
+        }
+        load_scale_factors(calculate_scale_factor_smem_addr<true>(tile_k),
+                           calculate_scale_factor_gmem_addr<C, true>(B_scales, 0, dim_m, dim_n),
+                           C.SCALE_FACTORS_PER_TILE_B());
+    }
+    PMARK(1);   // after A+B scale loads
+    if (tid_in_threadblock == 0) load_lut<C>();
+    PMARK(2);   // after load_lut
     mu_fence_smem();      // order the SIMT scale/LUT stores; DMA stays in flight (no fence)
     asm volatile ("mxgemm_prefetch_tile_end_%=:" :: );
 }
@@ -780,7 +855,70 @@ __attribute__((noinline)) void mxgemm_compute_issue(const uint32_t tid_in_thread
                          /*b_spad_override=*/0xffffffffu, /*c_spad_dest=*/c_spad_dest);
 }
 
+// GMEM-mvout variant: matmul C into the ACCUMULATOR (acc_move_out=false, NO SMEM store), then issue the
+// accumulator->GMEM mvout ASYNC (no trailing fence). Avoids the SMEM mvout 16-subbank atomic-grant race so the
+// mesh can overlap SIMT softmax. Caller drains later via gemmini_fence, then SIMT-copies GMEM->SMEM.
 template <GemmConfig C>
+__attribute__((noinline)) void mxgemm_compute_issue_gmem(const uint32_t tid_in_threadblock,
+                                                         uint8_t *gmem_dest, const uint32_t dim_n) {
+    if (tid_in_threadblock != 0) return;
+    gemmini_fence();      // drain prior move-in DMA
+    gemmini_mxquant_config_mvout(
+        rad_device_to_host_address(reinterpret_cast<uint32_t>(&C_scale_factors[0])),
+        C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(), 0, 0, QUANT_LUT_UPDATE_GRANULARITY);
+    // matmul: result stays in accumulator (acc_move_out=false => skip_stc=1, no SMEM store), overwrite.
+    matmul_tile_async<C>(0, /*acc_move_out=*/false, /*accumulate=*/false,
+                         0xffffffffu, SPAD_DEST, 0xffffffffu, /*force_first=*/1);
+    // issue accumulator->GMEM mvouts (async, NO fence). Mirrors copy_accmem_to_gmem_dma_sync minus the fence.
+    for (int i = 0; i < C.PE_TILES_I(); i++) {
+#pragma unroll 32
+        for (int j = 0; j < C.PE_TILES_J() / 4; j++) {
+            const uint32_t tile_acc_addr = GEMMINI_ACC_ADDR + (i * C.PE_TILES_J() / 4 + j) * DIM;
+            uint8_t *dram_ptr = gmem_dest + (i * DIM * dim_n + j * DIM * 2) * C.OUT_ELEM_SIZE();
+            gemmini_mvout(rad_device_to_host_address(reinterpret_cast<uint32_t>(dram_ptr)), tile_acc_addr);
+        }
+    }
+}
+
+// Compute-only: matmul C into the ACCUMULATOR (acc_move_out=false, skip_stc=1), NO mvout, NO trailing fence.
+// The mesh uses only read-ports + the private accumulator (off-SMEM) -> safe to overlap SIMT softmax.
+// Caller MUST later drain (gemmini_fence) then issue mxgemm_store_acc_to_spad in a SIMT-quiet window.
+template <GemmConfig C>
+__attribute__((noinline)) void mxgemm_compute_issue_acc(const uint32_t tid_in_threadblock) {
+    if (tid_in_threadblock != 0) return;
+    gemmini_fence();      // drain prior move-in DMA
+    gemmini_mxquant_config_mvout(
+        rad_device_to_host_address(reinterpret_cast<uint32_t>(&C_scale_factors[0])),
+        C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(), 0, 0, QUANT_LUT_UPDATE_GRANULARITY);
+    matmul_tile_async<C>(0, /*acc_move_out=*/false, /*accumulate=*/false,
+                         0xffffffffu, SPAD_DEST, 0xffffffffu, /*force_first=*/1);
+}
+
+// Store-only: move the accumulator (result of a prior compute_issue_acc) -> SPAD (c_spad_dest) via a loop_ws
+// with skip_lda=skip_ldb=skip_ldd=skip_ex=1, skip_stc=0 (store C only, no recompute). This is the cheap
+// accmem->SMEM path (512b spad_writer, contends SMEM write-ports) -- issue it ONLY when SIMT is quiesced
+// (post-barrier) so the 16-subbank atomic grant settles with no muon writers => no race/hang. Trailing fence.
+template <GemmConfig C>
+__attribute__((noinline)) void mxgemm_store_acc_to_spad(const uint32_t tid_in_threadblock,
+                                                        const uint32_t c_spad_dest = SPAD_DEST) {
+    if (tid_in_threadblock != 0) return;
+    const uint32_t a_spad = calculate_spad_addr<false>(0);
+    const uint32_t b_spad = calculate_spad_addr<true>(0);
+    gemmini_loop_ws_spad(
+        C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(), 0, 0, 0,
+        a_spad, b_spad, 0, c_spad_dest,
+        false, false, false, false, /*ex_accumulate=*/false,
+        NO_ACTIVATION, 0, 0, false,
+        loop_matmul_skips(/*skip_lda=*/1, /*skip_ldb=*/1, /*skip_ldd=*/1, /*skip_ex=*/1, /*skip_stc=*/0));
+    gemmini_fence();
+}
+
+// FenceMode for the compute-tile drains. NONE: skip the gemmini_fence polls entirely (for the SKIP_A
+// PVF path where the occupancy MMIO is phantom-poisoned per FSDB H8 -> ALL status polls livelock, but
+// io_cmd_ready is healthy so the matmul still ISSUES; the mvin DATA is already resident and the caller
+// guarantees drain via a fence_delay/barrier). READY: poll cmd-ready. BUSY (default): poll busy.
+enum class FenceMode { BUSY, READY, NONE };
+template <GemmConfig C, FenceMode FM = FenceMode::BUSY>
 __attribute__((noinline)) void mxgemm_compute_tile(const uint32_t tid_in_threadblock,
                                                    const uint32_t c_spad_dest = SPAD_DEST,
                                                    const uint32_t a_spad_override = 0xffffffffu,
@@ -789,14 +927,18 @@ __attribute__((noinline)) void mxgemm_compute_tile(const uint32_t tid_in_threadb
     asm volatile ("mxgemm_compute_tile_start_%=:" :: );
     if (tid_in_threadblock != 0) return;
     const uint32_t odd = tile_k & 1u;
-    gemmini_fence();      // drain the prefetch move-in DMA (V already streaming)
+    if constexpr (FM == FenceMode::READY) gemmini_fence_ready();
+    else if constexpr (FM == FenceMode::BUSY) gemmini_fence();
+    // FM==NONE: no leading drain (V-mvin data already resident; the poisoned occupancy MMIO would livelock).
     gemmini_mxquant_config_mvout(
         rad_device_to_host_address(reinterpret_cast<uint32_t>(&C_scale_factors[0])),
         C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
         odd, odd, QUANT_LUT_UPDATE_GRANULARITY);   // A/B double-buffer parity MUST match tile_k
     matmul_tile_async<C>(tile_k, /*acc_move_out (last_k)=*/true, /*accumulate=*/false,
                          b_spad_override, c_spad_dest, a_spad_override, /*force_first=*/1);
-    gemmini_fence();
+    if constexpr (FM == FenceMode::READY) gemmini_fence_ready();
+    else if constexpr (FM == FenceMode::BUSY) gemmini_fence();
+    // FM==NONE: caller must drain the PV mvout (fence_delay/barrier) before reading SPAD_DEST.
     asm volatile ("mxgemm_compute_tile_end_%=:" :: );
 }
 

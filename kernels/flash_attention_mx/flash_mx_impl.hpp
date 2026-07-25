@@ -537,11 +537,21 @@ static __attribute__((noinline)) void copy_P_to_requant(const __shared uint32_t 
                                      __shared uint16_t *requant_smem,
                                      uint32_t tid_in_threadblock) {
     if (tid_in_threadblock >= MU_NUM_THREADS) return;   // warp 0 only
-    constexpr uint32_t NW = (SQ * SK) / 2;              // total words
-    for (uint32_t i = tid_in_threadblock; i < NW; i += MU_NUM_THREADS) {
-        uint32_t w = P_smem32[i];
-        requant_smem[2 * i] = (uint16_t)w;
-        requant_smem[2 * i + 1] = (uint16_t)(w >> 16);
+    // The requantizer smem manager requires EXACTLY 32-byte transactions
+    // (reqSize = numGPUInputLanes*inputBits/8 = 16*16/8 = 32; TransferSizes(32,32), beatBytes=32;
+    //  RadianceSharedMemComponents.scala:60 / GemminiTile.scala:212). A wider coalesced store
+    //  (32 lanes x 4B = 128B, or a 64B cache line) exceeds the 32-byte max -> fragmented into rejected
+    //  PutPartial beats (TLMonitor $finish). So emit ONE 32-byte, 32B-aligned beat per SIMT store:
+    //  8 active lanes x 4B = 32B = the requantizer's 16-bf16 "fire" unit.
+    __shared uint32_t *requant_smem32 = reinterpret_cast<__shared uint32_t *>(requant_smem);
+    constexpr uint32_t WPB = 8;                          // 32B beat / 4B word
+    constexpr uint32_t NBEATS = (SQ * SK * 2) / 32;      // SQ*SK bf16 * 2B / 32B
+    const uint32_t lane = tid_in_threadblock;
+    if (lane < WPB) {
+        for (uint32_t beat = 0; beat < NBEATS; beat++) {
+            const uint32_t idx = beat * WPB + lane;
+            requant_smem32[idx] = P_smem32[idx];
+        }
     }
 }
 
@@ -564,29 +574,59 @@ static __attribute__((noinline)) void requant_P_to_spad_tiled(
         uint32_t threads_per_threadblock) {
     constexpr uint32_t NBLK = SK / 32;
     constexpr uint32_t PE_TILES_K = SK / 16;     // K dimension of A is SK
-    for (uint32_t row = tid_in_threadblock; row < SQ; row += threads_per_threadblock) {
+    // Parallelize over (row x block) items across ALL threads (vs 1 row/thread) -> uses all 96 threads and
+    // cuts serial depth. Each thread does ONE 32-elem block: max + convert + 8 tiled stores.
+    // SUBBANK-CONFLICT FIX (2026-07-24): the SMEM halfword index is row*SK + b*32 + c; SK=256 and b*32
+    // are multiples of 32, so the subbank (= byte[5:2] = index[4:1]) depends ONLY on c/w — which were
+    // lane-UNIFORM => all 16 lanes hit the SAME subbank on every read/store (16-way conflict, and the
+    // 8 lanes sharing a row also collided on the tiled store). Rotating each lane's start offset makes
+    // the 16 lanes hit 16 distinct subbanks for the max pass and 8 for the convert/store pass.
+    const uint32_t lane = tid_in_threadblock & (MU_NUM_THREADS - 1);
+    for (uint32_t item = tid_in_threadblock; item < SQ * NBLK; item += threads_per_threadblock) {
+        const uint32_t row = item / NBLK, b = item % NBLK;
         const __shared uint16_t *Prow = P_smem16 + row * SK;
         const uint32_t ti = row / 16, rr = row % 16;
-        for (uint32_t b = 0; b < NBLK; b++) {
-            // block max over 32 elements
-            _Float16 bmax = as_bf16((uint16_t)0);
-            for (uint32_t c = 0; c < 32; c++) {
-                _Float16 v = as_bf16(Prow[b * 32 + c]);
-                _Float16 a = (v < (_Float16)0) ? (_Float16)(-v) : v;
-                bmax = fmaxf(bmax, a);
+        {
+            // block max over 32 elements (order-independent) -- lane-rotated start: c = (c0 + 2*lane) & 31
+            // => index[4:1] = (c0>>1 + lane) & 15 -> 16 DISTINCT subbanks across the warp.
+            // MEASURED-WORSE ALTERNATIVES (2026-07-24), do not retry blindly:
+            //  * lane-rotating c/w to break the (real) lane-uniform subbank pattern: 53.2k -> 58.3k.
+            //  * register-caching the block's 16 words + 4 independent accumulators: requant >130k
+            //    (pw[16] SPILLS; spills are catastrophic here). Reverted both.
+            // WORD loads (2 bf16 per load) instead of halfword loads: HALVES the SMEM request count.
+            // MEASURED (perf-viz): requant is pure load-LATENCY stall (fp pipes 98.4% idle, SMEM 0.5% of
+            // peak, 0.62 loads/cyc), so time tracks the number of requests, not bytes. No register array
+            // here on purpose -- the 16-word register-cache version SPILLED and was catastrophic (>130k).
+            const __shared uint32_t *Pw =
+                reinterpret_cast<const __shared uint32_t *>(Prow + b * 32);
+            // TWO independent load+reduce chains (2 words live, NOT 16 -> no spill; the 16-word
+            // register-cache version spilled and cost >130k). Gets 2 SMEM requests in flight per thread,
+            // which is what matters: requant is request-LATENCY bound (fp 1.6%, SMEM 0.5% of peak).
+            _Float16 m0 = as_bf16((uint16_t)0), m1 = m0;
+            for (uint32_t i = 0; i < 16; i += 2) {
+                const uint32_t wa = Pw[i], wb = Pw[i + 1];      // independent -> both can be outstanding
+                _Float16 a0 = as_bf16((uint16_t)wa),        a1 = as_bf16((uint16_t)(wa >> 16));
+                _Float16 b0 = as_bf16((uint16_t)wb),        b1 = as_bf16((uint16_t)(wb >> 16));
+                a0 = (a0 < (_Float16)0) ? (_Float16)(-a0) : a0;  a1 = (a1 < (_Float16)0) ? (_Float16)(-a1) : a1;
+                b0 = (b0 < (_Float16)0) ? (_Float16)(-b0) : b0;  b1 = (b1 < (_Float16)0) ? (_Float16)(-b1) : b1;
+                m0 = fmaxf(m0, fmaxf(a0, a1));
+                m1 = fmaxf(m1, fmaxf(b0, b1));
             }
+            _Float16 bmax = fmaxf(m0, m1);
             int se = bf16_floor_log2(__builtin_bit_cast(uint16_t, bmax));  // target 0
             scale_scratch[b * SQ + row] = (uint32_t)(uint8_t)(se + 127);   // E8M0 code (word)
-            // e4m3 of the 32 elements (P / 2^se), packed 4/word into the tiled A-spad
+            // e4m3 of the 32 elements (P / 2^se), packed 4/word into the tiled A-spad.
+            // lane-rotated word order: w = (w0 + lane) & 7 -> spreads both the SMEM reads and the
+            // tiled spad stores (store subbank = (rr*4 + w%4)&15) across the warp.
             for (uint32_t w = 0; w < 8; w++) {                  // 32 cols / 4 per word
                 const uint32_t col0 = b * 32 + w * 4;           // global col of first of 4
-                uint32_t packed = 0;
-                for (uint32_t k = 0; k < 4; k++) {
-                    _Float16 ps = bf16_scale_pow2(as_bf16(Prow[col0 + k]), -se);
-                    // truncate (not RNE) to match the golden's float_quantize_trunc
-                    uint8_t e = bf16_to_e4m3</*RNE=*/false>(__builtin_bit_cast(uint16_t, ps));
-                    packed |= (uint32_t)e << (8 * k);
-                }
+                // 2 WORD loads instead of 4 halfword loads (same halving as the max pass above)
+                const uint32_t wlo = Pw[w * 2], whi = Pw[w * 2 + 1];
+                const uint32_t packed =
+                      ((uint32_t)bf16_to_e4m3_scaled((uint16_t)wlo,         se) << 0)
+                    | ((uint32_t)bf16_to_e4m3_scaled((uint16_t)(wlo >> 16), se) << 8)
+                    | ((uint32_t)bf16_to_e4m3_scaled((uint16_t)whi,         se) << 16)
+                    | ((uint32_t)bf16_to_e4m3_scaled((uint16_t)(whi >> 16), se) << 24);
                 const uint32_t tk = col0 / 16, cc = col0 % 16;  // 4 cols stay in one tile
                 const uint32_t byte_off = (ti * PE_TILES_K + tk) * 256 + rr * 16 + cc;
                 spad_u32[byte_off / 4] = packed;
@@ -603,16 +643,41 @@ template <uint32_t SQ, uint32_t SK>
 static __attribute__((noinline)) void pack_scales_to_sfmem(
         const __shared uint32_t *scale_scratch, __shared uint32_t *sfmem_a32,
         uint32_t tid_in_threadblock, uint32_t threads_per_threadblock) {
-    // NOTE: MUST be single-warp, program-order writes -- the SF-SRAM/requantizer scale
-    // interface corrupts under multi-warp parallel writes (verified: parallel -> 0 output).
+    // single thread, strictly ascending words (FlitMergeNode contract)
     if (tid_in_threadblock != 0) return;
-    constexpr uint32_t NS = (SK / 32) * SQ;             // total E8M0 scale bytes
+    constexpr uint32_t NS = (SK / 32) * SQ;
     for (uint32_t w = 0; w < NS / 4; w++) {
         uint32_t packed = 0;
         for (uint32_t k = 0; k < 4; k++)
             packed |= (scale_scratch[w * 4 + k] & 0xff) << (8 * k);
         sfmem_a32[w] = packed;
     }
+}
+
+// SPLIT (2026-07-25): the packing math (4 SMEM reads + shifts per word) used to run on thread 0 together
+// with the SF-SRAM stores => 147 cyc/word (18.9k), vs 46-64 cyc/word for a plain ascending copy. Do the
+// packing with ALL threads into a SMEM staging buffer, then let thread 0 do a PURE ASCENDING COPY to the
+// SF SRAM (which is the only pattern FlitMergeNode accepts: single-thread, strictly ascending 4B pairs).
+template <uint32_t SQ, uint32_t SK>
+static __attribute__((noinline)) void prepack_scales(
+        const __shared uint32_t *scale_scratch, __shared uint32_t *packed,
+        uint32_t tid_in_threadblock, uint32_t threads_per_threadblock) {
+    constexpr uint32_t NW = ((SK / 32) * SQ) / 4;
+    for (uint32_t w = tid_in_threadblock; w < NW; w += threads_per_threadblock) {
+        uint32_t p = 0;
+        for (uint32_t k = 0; k < 4; k++)
+            p |= (scale_scratch[w * 4 + k] & 0xff) << (8 * k);
+        packed[w] = p;
+    }
+}
+
+template <uint32_t SQ, uint32_t SK>
+static __attribute__((noinline)) void copy_scales_to_sfmem(
+        const __shared uint32_t *packed, volatile __shared uint32_t *sfmem_a32,
+        uint32_t tid_in_threadblock) {
+    if (tid_in_threadblock != 0) return;      // MUST be one thread, strictly ascending (merge contract)
+    constexpr uint32_t NW = ((SK / 32) * SQ) / 4;
+    for (uint32_t w = 0; w < NW; w++) sfmem_a32[w] = packed[w];
 }
 
 // Normalize the PV result: O[row][:] = O_unnorm[row][:] / l[row].
