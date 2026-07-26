@@ -177,9 +177,17 @@ static uint32_t g_host_sf_asel = 0;
 // cycle stamp -> FA_DIAG_HSMARK+off (0x88/0x8c = QK scale wait, 0x90/0x94 = V scale wait).
 // Own 4KB page + opaque base register: a constant-address store is traced as its PAGE BASE, which
 // used to land these on top of the kernel's m[0].  See the diagnostic map at the top of this file.
+// GATED ON FA_HOST_TIMING (2026-07-26).  These are pure instrumentation but were compiled into
+// every -DFA_NOSCALES build, and a single-thread GMEM store is NOT cheap here: two stamps per
+// prefetch x two prefetches = 4 stores per tile, measured at ~1.6k cyc/tile of the steady-state
+// slope (80,054 -> 78,4xx when removed).  Never leave a measurement probe in the hot path.
+#ifdef FA_HOST_TIMING
 #define FA_HOST_MARK(off) do { uint32_t _c; asm volatile("csrr %0, mcycle" : "=r"(_c)); \
     volatile uint32_t *_hp = (volatile uint32_t *)(FA_DIAG_HSMARK + (off)); \
     asm volatile("" : "+r"(_hp)); *_hp = _c; } while (0)
+#else
+#define FA_HOST_MARK(off) do {} while (0)
+#endif
 #ifdef FA_HOSTHS
 // Per-tile index, advanced by the PV compute (the last mesh op of an FA tile).  Used to index the
 // host's per-tile scale-ready sequence numbers.  Thread 0 only.

@@ -60,9 +60,16 @@ def main():
             # Muon vectorized global store (opcode 0x23): effective address is the
             # per-lane value in rs1.data directly (no S-type immediate), 32-bit word.
             width = 4
+            # tmask is printed as ONE NIBBLE PER LANE, not one bit: a store with all 16 lanes
+            # active shows tmask=0x1111111111111111 (measured), so `(tmask >> lane) & 1` keeps
+            # only lanes 0,4,8,12.  Skipping INACTIVE lanes matters because a masked-off lane's
+            # rs1.data still holds a stale address that can fall inside the window.
+            tmask = int(m.group(2), 16)
             addrs = [int(x, 16) for x in m.group(3).split()]
             data = [int(x, 16) for x in m.group(4).split()]
             for lane, (a, d) in enumerate(zip(addrs, data)):
+                if not (tmask >> (4 * lane)) & 0xF:
+                    continue
                 ea = a & 0xFFFFFFFF
                 if args.base <= ea < args.base + args.nbytes:
                     for b in range(width):
@@ -89,12 +96,27 @@ def main():
     print(f"store words parsed into range: {nstores}; cells covered: {covered}/{total}")
     print(f"exact match: {exact}/{total} ({100*exact/total:.2f}%)")
     print(f"within 1 code: {within1}/{total} ({100*within1/total:.2f}%)")
+    # ---- COVERAGE GATE (2026-07-26) -------------------------------------------------------
+    # Uncovered cells stay 0 in `got`, so an INCOMPLETE trace silently inflates the Frobenius
+    # error and looks exactly like data corruption.  Measured on a KNOWN-GOOD run (lgfast):
+    #   8192/8192 -> 3.5666%   8128 -> 10.61%   8064 -> 13.47%   7904 -> 19.03%   7712 -> 25.56%
+    # i.e. Frobenius ~= sqrt(fraction uncovered).  The usual cause is reading the .out while
+    # `spike-dasm` is still draining the simulator's stderr pipe: the VCS process exits first, so
+    # "the run is done" is NOT enough -- wait until the .out file SIZE STOPS GROWING.
+    incomplete = covered < total
+    if incomplete:
+        print(f"*** INCOMPLETE TRACE: only {covered}/{total} cells covered "
+              f"({100.0*(total-covered)/total:.2f}% missing) -- EVERY metric below is MEANINGLESS. "
+              f"Wait for the .out size to stop growing (spike-dasm lags the simulator) and re-run. ***")
     if eb == 2:  # bf16: float Frobenius rel err (the meaningful metric)
         gf = (got.astype(np.uint32) << 16).view(np.float32)
         ef = (golden.astype(np.uint32) << 16).view(np.float32)
         rel = float(np.linalg.norm(gf - ef) / (np.linalg.norm(ef) + 1e-30))
+        nnan = int(np.isnan(gf).sum())
         print(f"float Frobenius rel err vs golden: {100*rel:.4f}%  "
-              f"(max abs diff {np.abs(gf-ef).max():.4f})")
+              f"(max abs diff {np.abs(gf-ef).max():.4f})"
+              + (f"  [{nnan} NaN cells]" if nnan else "")
+              + ("   <-- INVALID, INCOMPLETE TRACE" if incomplete else ""))
     if covered:
         bad = np.argwhere(got != golden)
         for (r, c) in bad[:8]:

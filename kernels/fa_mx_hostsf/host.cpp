@@ -294,13 +294,15 @@ static void cfg_replay(int pv) {
         for (uint32_t s = 0; s < 100000u; s++)
           if ((uint32_t)ctl[4] == 0u) break;              // +0x20 busy
 #ifdef FA_HOSTCFG_NOMVIN
-        // MEASUREMENT-ONLY PROBE (-DFA_HOSTCFG_NOMVIN): replay the CONFIG group but drop the
-        // GMEM->spad MOVE-IN group that follows the fence, so the matmuls run on whatever is
-        // already in the operand spads.  Under FA_STEADY every tile recomputes the SAME tile from
-        // the SAME Q/K/V, so the resident data is bit-identical and the Frobenius check STILL
-        // PASSES -- which makes the slope difference a clean, trustworthy measurement of what the
-        // operand move-in DMA costs, and therefore of the headroom left for a double-buffered
-        // host-issued prefetch.  Never use this for a real result.
+        // TIMING-ONLY PROBE (-DFA_HOSTCFG_NOMVIN): replay the CONFIG group but drop the GMEM->spad
+        // MOVE-IN group that follows the fence, so the matmuls run on whatever is already in the
+        // operand spads.  The OUTPUT IS GARBAGE (Frobenius 116% -- the SIMT requant overwrites the
+        // A spad with P every tile, so Q does not survive); the only thing this build measures is
+        // what the operand move-in costs in the steady-state slope.
+        // RESULT: 80,137 cyc/tile vs 80,054 with the move-in -- i.e. ZERO.  Once the host issues
+        // the mvin at the PVDONE/QKDONE handshake points, its DMA is already fully hidden behind
+        // finalize + softmax + requant + pack, so a spad-double-buffered host prefetch (issue tile
+        // t+1's K/V a whole tile early) has nothing left to win.  That is why it was not built.
         break;
 #endif
         continue;
@@ -373,7 +375,36 @@ int main() {
   //     GPU_PVDONE >= t  =>  tile t-1's PV is drained  =>  weight half 1 is dead
   // Every wait is bounded in host cycles so that a broken read path degrades to "runs anyway with
   // possibly-corrupt output + a nonzero timeout counter in the diagnostics", never a hung sim.
-  // ============================================================================================
+  //
+  // ------------------------------------------------------------------------------------------
+  // *** SECOND, HARDER CONSTRAINT (2026-07-26): THE MERGE NODE, NOT JUST THE SCALE SRAM. ***
+  // Data liveness is not the only thing that serializes host and GPU here.  EVERY write into the
+  // gemmini tile -- the scale SRAMs at +0x88000/+0x8a000 AND the ROCC command port at +0x84000 --
+  // funnels through GemminiTile's single FlitMergeNode, which pair-merges consecutive 4-byte
+  // beats (radiance/memory/FlitMergeNode.scala:36-37, `shouldMerge` requires size==2).  The GPU's
+  // ROCC issue macro is 4-byte `sw.shared`es, so a host 8-byte `sd` (which bypasses the merge)
+  // landing between the two halves of a GPU pair makes the node emit a MALFORMED request.  The
+  // symptom is not silent corruption, it is a dead simulation:
+  //     TLMonitor xbar_3 (RadianceCluster.scala:112, the host->cluster extReqXbar):
+  //     "'D' channel contains improper response size", and the GPU's store never completes.
+  // MEASURED: build `FULL_ATTN2 FA_STEADY FA_NT4 FA_NOSCALES FA_HOSTHS` (this refill loop, GPU
+  // still issuing its own gemmini commands) asserts at exactly time 330,243,000 ps -- twice,
+  // bit-identically, on two separately built images (hsh4, st2) -- after hanging at the end of
+  // tile 1.  Adding FA_HOSTCFG makes it disappear, because then the GPU issues NO ROCC command
+  // at all after tile 0.  That is the real reason the two features belong together.
+  //
+  // So the schedule below is built around GPU ROCC-QUIET WINDOWS, not around data liveness:
+  //     [ PVDONE >= t ................. QK_READY = t+1 ]   GPU is in bar4/finalize/tile-t entry
+  //                                                        and then BLOCKS on QK_READY -> quiet
+  //     [ QKDONE >= t+1 ............... V_READY  = t+1 ]   GPU is in bar2/softmax, its QK
+  //                                                        compute ROCC burst has drained -> quiet
+  // Everything the host pushes must sit inside one of those two windows.  The old schedule
+  // violated both: it started the K refill at QKDONE>=t (which is *during* tile t's own QK issue)
+  // and pushed the V scales right after publishing QK_READY (i.e. straight into the GPU's QK
+  // compute_tile ROCC burst).  Splitting the payload 1,280 B / 1,024 B across the two windows
+  // keeps each burst comfortably inside it: window 1 is ~16k cycles wide (bar4 8.7k + finalize
+  // 7.0k) against ~7.9k of stores, window 2 is ~13k wide (bar2 + softmax) against ~5.1k.
+  // ------------------------------------------------------------------------------------------
   const uint64_t WAIT_LIMIT = 200000ull;   // ~1.7 tile periods; generous, still finite
   uint64_t wait_cycles = 0;
   uint32_t to_qk = 0, to_pv = 0, last_qk = 0, last_pv = 0;
@@ -393,38 +424,17 @@ int main() {
   }
 #endif
   for (uint32_t t = 1; t < (uint32_t)HOST_NTILES; t++) {
-    // --- QKDONE >= t: tile t-1's QK has drained -> WEIGHT half 0 (K scales) is dead ------------
-    // The weight port is host-private, so this 2 x 1,024 B refill can run as early as the drain
-    // allows -- underneath the GPU's softmax.  It is NOT gated on PVDONE on purpose: doing it
-    // here is what keeps the PVDONE-gated critical section down to the 512 B act write.
-    {
-      const uint64_t t0 = rdcycle();
-      for (;;) {
-        const uint32_t a = mbox_get(0, MBOX_GPU_QKDONE), b = mbox_get(1, MBOX_GPU_QKDONE);
-        last_qk = (a < b) ? a : b;
-        if (last_qk >= t) break;
-        if (rdcycle() - t0 > WAIT_LIMIT) { to_qk++; break; }
-      }
-      wait_cycles += rdcycle() - t0;
-    }
-#ifdef FA_HOSTHS_ACTEARLY
-    // DELIBERATELY UNSAFE ORDERING, for measurement only (-DFA_HOSTHS_ACTEARLY): drive the SHARED
-    // activation write port as soon as the QK gemm has drained, i.e. concurrently with the GPU's
-    // pack_scales_to_sfmem for the same tile.  This is what the code did before the ACT-port
-    // pairing hazard was fixed; the point of the build is to show whether the race manifests.
-    write_qk_a_scales();
-#endif
-    write_qk_b_scales();
-
-    // --- PVDONE >= t: tile t-1's PV has drained -------------------------------------------------
-    // Two things become legal at once:
-    //   (a) WEIGHT half 1 (V scales) is dead -> refill it.
-    //   (b) the ACT port is quiet.  tile t-1's pack_scales_to_sfmem happened BEFORE its PV matmul,
-    //       and tile t's pack is a whole softmax+requant away, so this is the only window in which
-    //       the host may drive the shared act write port (see write_qk_a_scales' hazard note).
-    // ACT FIRST, then publish QK_READY, then the V scales: the GPU's next blocking wait is on
-    // QK_READY inside tile t's QK prefetch, so getting that flag up after only ~1.3k cycles of act
-    // stores (instead of after all 2,560 B) is what keeps the handshake off the critical path.
+    // ==== WINDOW 1: [ PVDONE >= t .. QK_READY = t+1 ] ==========================================
+    // PVDONE >= t means tile t-1's PV matmul has drained, which is the GPU's LAST gemmini command
+    // of tile t-1.  From here until the host publishes QK_READY = t+1 the GPU issues no ROCC at
+    // all (it runs bar4 -> finalize_O -> loop -> tile t's prefetch, which blocks on QK_READY), so
+    // the merge node is host-private and BOTH of these are legal:
+    //   * WEIGHT half 0 (K scales): dead, tile t-1's QK drained long ago (PVDONE >= t => QKDONE >= t)
+    //   * ACT half 1 (Q scales): dead, and the shared act port is quiet -- tile t-1's
+    //     pack_scales_to_sfmem ran BEFORE its PV matmul, tile t's is a whole softmax+requant away.
+    // The old code split these across the QKDONE>=t and PVDONE>=t gates to shorten the critical
+    // section; that put the K refill inside tile t's own QK issue and deadlocked the fabric.  The
+    // window is ~16k cycles wide against ~7.9k of stores, so nothing is lost by merging them.
     {
       const uint64_t t0 = rdcycle();
       for (;;) {
@@ -435,20 +445,35 @@ int main() {
       }
       wait_cycles += rdcycle() - t0;
     }
-#ifndef FA_HOSTHS_ACTEARLY
-    write_qk_a_scales();
-#endif
+    write_qk_a_scales();        // ACT half 1  (2 x 256 B)
+    write_qk_b_scales();        // WEIGHT half 0 (2 x 1,024 B)
 #ifdef FA_HOSTCFG
     cfg_replay(0);              // QK config + Q/K move-in: 12 ROCC commands, 36 `sd` per cluster
 #endif
     asm volatile("fence" ::: "memory");
     mbox_set(MBOX_QK_READY, t + 1);
+    // ---- BISECTION PROBE for the fabric deadlock (-DFA_HOSTHS_VEARLY, measurement only) --------
+    // Puts exactly ONE of the three scale bursts back where the old (asserting) schedule had it --
+    // the 2 x 1,024 B V-scale push, issued immediately after QK_READY, i.e. straight into tile t's
+    // gemmini command + SF traffic -- and leaves the other two in their safe window.  If this
+    // brings the assertion back while the fixed schedule is clean, the failure is attributable to
+    // that single burst overlapping GPU traffic, not to "the schedule" in general.
+    // NEVER build a reported result with this define.
+#ifdef FA_HOSTHS_VEARLY
     write_v_scales();
-#ifdef FA_HOSTCFG
-    // --- QKDONE >= t+1: tile t's OWN QK matmul has drained --------------------------------------
-    // Only now may the PV stream be replayed: its move-in overwrites the B spad that tile t's QK
-    // matmul reads K out of, and its ROCC writes must not interleave with the GPU's QK matmul
-    // issue.  The GPU does not need V_READY until after tile t's softmax, so there is slack.
+#endif
+
+    // ==== WINDOW 2: [ QKDONE >= t+1 .. V_READY = t+1 ] =========================================
+    // QKDONE >= t+1 means tile t's OWN QK matmul has drained, i.e. the GPU's QK compute_tile ROCC
+    // burst (CONFIG_SCALE_MEM + 3 x loop_ws) is over and the mesh has stopped reading the K
+    // scales.  The GPU then runs bar2 + softmax (~13k cycles, no gemmini command at all) and only
+    // blocks again on V_READY, so this is the second host-private window.
+    //   * WEIGHT half 1 (V scales): dead since PVDONE >= t.
+    //   * the PV command stream additionally MUST NOT be replayed before this point -- its move-in
+    //     overwrites the B spad that tile t's QK matmul reads K out of.
+    // Waiting here is not optional even without FA_HOSTCFG: writing the V scales right after
+    // publishing QK_READY (what the old code did) drops them straight into the GPU's QK
+    // compute_tile ROCC burst.
     {
       const uint64_t t0 = rdcycle();
       for (;;) {
@@ -459,6 +484,10 @@ int main() {
       }
       wait_cycles += rdcycle() - t0;
     }
+#ifndef FA_HOSTHS_VEARLY
+    write_v_scales();           // WEIGHT half 1 (2 x 1,024 B)
+#endif
+#ifdef FA_HOSTCFG
     cfg_replay(1);              // PV config + V move-in
 #endif
     asm volatile("fence" ::: "memory");

@@ -60,9 +60,16 @@ def main():
             # Muon vectorized global store (opcode 0x23): effective address is the
             # per-lane value in rs1.data directly (no S-type immediate), 32-bit word.
             width = 4
+            # tmask is printed as ONE NIBBLE PER LANE, not one bit: a store with all 16 lanes
+            # active shows tmask=0x1111111111111111 (measured), so `(tmask >> lane) & 1` keeps
+            # only lanes 0,4,8,12.  Skipping INACTIVE lanes matters because a masked-off lane's
+            # rs1.data still holds a stale address that can fall inside the window.
+            tmask = int(m.group(2), 16)
             addrs = [int(x, 16) for x in m.group(3).split()]
             data = [int(x, 16) for x in m.group(4).split()]
             for lane, (a, d) in enumerate(zip(addrs, data)):
+                if not (tmask >> (4 * lane)) & 0xF:
+                    continue
                 ea = a & 0xFFFFFFFF
                 if args.base <= ea < args.base + args.nbytes:
                     for b in range(width):
