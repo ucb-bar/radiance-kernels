@@ -139,7 +139,7 @@ the kernel is not finished until the slower one is.  **Correctness is the per-ti
 | `FULL_ATTN2` — baseline, GPU loads all MX scales | 97,398 | 16.86% | 96,243 | 17.06% | **8/8 correct** |
 | `+ FA_NOSCALES` — host prefills the scale SRAMs | 82,451 | 19.91% | 85,294 | 19.25% | **5/8** — cl1 tiles 1,2,3 at 112.64 / 113.45 / 113.45% |
 | `+ FA_NOSCALES` seed 777 | 82,451 | 19.91% | 86,240 | 19.04% | 5/8 — *identical* failure and Frobenius |
-| `+ FA_NOSCALES FA_EARLYV` **seed 777** | 82,881 | 19.81% | 83,321 | 19.71% | 6/6 correct — slope bit-identical to seed 12345 |
+| `+ FA_NOSCALES FA_EARLYV` **seed 777** | 82,881 | 19.81% | 83,321 | 19.71% | **8/8 correct** — slope bit-identical to seed 12345 |
 | **`+ FA_NOSCALES FA_EARLYV`** | **82,881** | **19.81%** | **83,321** | **19.71%** | **8/8 correct** |
 | **`+ FA_NOSCALES FA_HOSTHS`** — host re-pushes all 4,608 B EVERY tile | **83,517** | **19.66%** | **86,482** | **18.99%** | **8/8 correct** |
 | `+ FA_NOSCALES FA_EXPMVIN` (explicit V mvin only, no hoist) | 82,975 | 19.79% | — | — | 4/4 correct (2 tiles measured) |
@@ -210,10 +210,10 @@ waveform shows.
 | build | cl0 cyc/tile | cl1 cyc/tile | per-tile correctness |
 |---|---|---|---|
 | `FA_NOSCALES` | 70,762 (23.20%) | 71,552 (22.95%) | 6/8 — cl0 tiles 2,3 at **112.6418 / 113.4523%** (the same fingerprint as the frozen snapshot) |
-| `FA_NOSCALES FA_EARLYV` | 71,010 (23.12%) | 69,716 (23.55%) | 5/8 — cl0 tile 2 down to **6.8648%**, 2 images truncated |
+| `FA_NOSCALES FA_EARLYV` | 71,010 (23.12%) | 69,716 (23.55%) | **7/8** — cl0 tile 2 down to **6.8648%** |
 
-So `FA_EARLYV` removes the 112.64% failure mode from the main kernel too (112.64% -> 6.86%) at no
-cost in the slope, but the main kernel has a **residual** error of its own on top of it.  Whoever owns
+So `FA_EARLYV` takes the main kernel from 6/8 to 7/8 and collapses its worst image from 112.64% to
+6.86%, at no cost in the slope -- but a **residual** error of its own remains.  Whoever owns
 that file should apply the explicit PV move-in (`FA_EXPMVIN` is the minimal form) and then chase the
 remaining 6.86% separately -- it is a different bug, not this one.
 
