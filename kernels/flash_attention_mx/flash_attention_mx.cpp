@@ -669,7 +669,13 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //           scaffolding (a fence per row) and two extra cross-warp barriers, and every item pays a
 //           fresh m_in[row] load and address computation instead of hoisting them per row.  Using
 //           more threads did not pay for that.  Kept OFF and documented. ***
-//      x2s / x3s  the same two at FA_NT6, for the converged steady-state timing
+//      x1s  QOVL4 QKACC PKOVL at FA_NT6            -- 5 steady intervals for the REFERENCE-numerics
+//           headline (50,934 from a 2-tile run); this is the run that proves the fix holds past
+//           tile 2, which is where one earlier variant first broke.
+//      x1b  the same at FA_NT2, SEED 777             -- second-seed correctness for the headline.
+//      x2s  QOVL4 QKACC PKOVL SMTPR FZROW SMBMAX at FA_NT6 -- PARTIAL: 61,971 / 46,802, converging.
+//      x3s  the FA_SP_ITEM variant at FA_NT6         -- PARTIAL: 74,056 / 60,750, i.e. it confirms
+//           at NT6 that FA_SP_ITEM is a large loss.
 //      dsc  QOVL3 QKACC PKOVL DUMPSC -- dumps the 128 E8M0 scale words per tile to 0x40051000 +
 //           512*t.  If the dumps are identical across tiles then SCALE_SMEM is fine and the damage
 //           is in the pack into the gemmini SF-SRAM or the mesh's read of it; if they already
