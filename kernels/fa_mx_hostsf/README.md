@@ -90,6 +90,55 @@ all measured on this tree:
   `SF_MEM_A` itself, so every request reaching the merge node is an 8-byte host store that never
   merges and there is no shared state left to corrupt.
 
+## Measured result (RadianceTapeoutSimConfig, frozen snapshot, seed 12345, no `+dramsim`)
+
+`FA_STEADY FA_NT4`, slope = `(T[3]-T[1])/2` so boot + icache warm-up cancel exactly; mesh-busy is
+fixed at 16,420 cyc/tile, so util = 16420/slope.  Both clusters are reported because the kernel is
+not finished until the slower one is, and they differ by 1-3%.  Correctness is the **per-tile**
+check over all 2N tile-images.
+
+| build | cl0 cyc/tile | cl0 util | cl1 cyc/tile | cl1 util | per-tile correctness |
+|-------|-------------|----------|-------------|----------|----------------------|
+| `FULL_ATTN2` — baseline, GPU loads all MX scales | 97,398 | 16.86% | 96,243 | 17.06% | **6/6 correct** |
+| `+ FA_NOSCALES` — host prefills the scale SRAMs | 82,451 | 19.91% | 85,294 | 19.25% | **4/6 — 2 WRONG** |
+| `+ FA_NOSCALES FA_EARLYV` | 82,881 | 19.81% | 83,321 | 19.71% | **6/6 correct** |
+| `+ FA_HOSTHS FA_HOSTCFG` — per-tile refill + host-issued cfg/mvin | 79,115 | 20.75% | 81,359 | 20.18% | 5/8, 1 WRONG, 2 truncated — and see the deadlock above |
+
+So the honest, verified headline is the third row: **the Rocket host taking over MX scale loading is
+worth 97,398 -> 82,881 cyc/tile, i.e. mesh utilisation 16.86% -> 19.81%** (worse-cluster: 96,243 ->
+83,321, 17.06% -> 19.71%), with every tile-image bit-correct.
+
+Two corrections to the earlier claim of 20.51% for the `FA_HOSTHS FA_HOSTCFG` row:
+
+1. `FA_NOSCALES` alone is **not correct at steady state** without `FA_EARLYV`.  Cluster 1's tiles
+   1 and 2 come out at Frobenius 112.6418% / 113.4523% — plausible magnitudes, no NaNs, all rows and
+   columns affected, i.e. a wrong scale/operand set rather than corruption.  The value is
+   bit-identical on seed 777 and reappears in the main kernel (`kernels/flash_attention_mx`, cluster
+   0 tile 2, same 112.6418%), so it is a deterministic structural bug, not flakiness.  `FA_EARLYV`
+   — which issues the PV operand move-in with explicit `gemmini_extended_mvin` commands instead of
+   the loop-FSM path (the H8 phantom-completion bug), and hoists it above `bar2` — removes it at no
+   cost in the slope.
+2. The per-tile refill (`FA_HOSTHS`) additionally deadlocks the cluster fabric, as above.
+
+Phase decomposition of the host-offloaded steady state (`FA_CFGPROF`, tile 2, cluster 0; CPROF's own
+stores add ~5k/tile so read these as an attribution, not a budget):
+
+    QK prefetch (host issues cfg+mvin, GPU only waits)        1,707
+    QK matmul   lead-fence 137 | cfg 1,102 | issue 314 | mesh 8,860   10,647
+    bar2 + softmax                                           17,211
+    PV prefetch                                                 763
+    requant + pack + bar3                                    20,718
+    PV matmul   lead-fence 1,520 | cfg 1,494 | issue 2,224 | mesh 8,626  13,864
+    bar4 + finalize_O                                        20,615
+
+The two mesh trail-fences are 17,486 of the 16,420 nominal mesh-busy, i.e. essentially all of the
+mesh time is already exposed.  What is left is SIMT work (softmax + requant ~24k), barriers
+(~17k) and `finalize_O`.  The GPU-side gemmini command issue that a further host offload could take
+is only 137+1,102+314+1,520+1,494+2,224 = 6,791 cyc/tile, and most of the PV part of that is
+back-pressure on `gemminiIO.ready` (the port stalls until the queue drains) rather than store
+latency — moving the issuer does not remove back-pressure, because the GPU would still block on the
+reply.  That is why the matmul-issue offload was measured-and-rejected rather than built.
+
 ## Build matrix
 
 | define | meaning |

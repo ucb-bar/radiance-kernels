@@ -679,7 +679,18 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         &V_in[0][0], &V_in[0][0], &V_scales[0][0], &V_scales[0][0],
         FA_SQ, FA_D, FA_SK, tid);
 #else
-    mxgemm_prefetch_tile<PVF, /*SKIP_A=*/true, /*DO_CONFIG=*/true, /*EXPLICIT_MVIN=*/false,
+    // -DFA_EXPMVIN (added by the host-offload campaign): keep the PV prefetch exactly WHERE it is
+    // (after softmax, unlike FA_EARLYV which also hoists it above bar2) but issue V's move-in with
+    // explicit gemmini_extended_mvin commands instead of the loop-FSM path.  FA_EARLYV changes both
+    // things at once; this isolates the move-in mechanism, which is what the H8 note above says is
+    // broken for SKIP_A (the loop FSM's mvin with skip_lda=1 leaves a phantom outstanding
+    // completion).  Inert when the define is absent.
+    mxgemm_prefetch_tile<PVF, /*SKIP_A=*/true, /*DO_CONFIG=*/true,
+#ifdef FA_EXPMVIN
+                         /*EXPLICIT_MVIN=*/true,
+#else
+                         /*EXPLICIT_MVIN=*/false,
+#endif
                          /*LANE_SCALES=*/false>(
         &V_in[0][0], &V_in[0][0], &V_scales[0][0], &V_scales[0][0],
         FA_SQ, FA_D, FA_SK, tid);
