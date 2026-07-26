@@ -761,7 +761,10 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //           a few MB on / instead of hundreds on /scratch, there is no spike-dasm stderr-drain race,
 //           and the seed is explicit.  +max-cycles counts HALF cycles -- the script doubles it.
 //   WAIT    the run must report DONE **and** the .out size must stop growing before parsing.
-//   VERIFY  python3 fa_pertile.py /tmp/yruns/<TAG>.out       <- PER TILE.  Not whole-file.
+//   VERIFY  bash fa_final_check.sh <TAG>...   <- waits for DONE + a stable trace, then reports the
+//           steady-state tile interval AND the per-CLUSTER per-tile verdict via fa_verify_tiles.py.
+//           This is the only scoring path to trust.  Do NOT use fa_pertile.py: it mixes the two
+//           clusters and has been caught reporting a FALSE PASS on a genuinely broken run.
 //   TIME    python3 /tmp/fa_pm.py /tmp/yruns/<TAG>.out --per 7   <- per-stage + tile deltas
 //   CHECK BEFORE RUNNING (both ~20 s, both have caught real bugs here):
 //           bash fa_asm.sh <TAG> "FULL_ATTN2 <DEFINES>"
