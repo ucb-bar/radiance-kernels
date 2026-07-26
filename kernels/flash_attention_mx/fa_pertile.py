@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
-"""Verify EACH TILE'S O separately, by bucketing the O stores between MARK stamps.
+"""SUPERSEDED -- USE kernels/fa_mx_hostsf/fa_verify_tiles.py INSTEAD.
+
+*** THIS TOOL IS UNSOUND ON 2-CLUSTER TRACES, WHICH IS EVERY TRACE ON THIS CONFIG. ***
+It buckets O stores by the most recent MARK index and never separates clid.  Both clusters write
+MARKs and both write the SAME O addresses, interleaved in one trace, so cluster 1's MARK advances
+the cursor while cluster 0 is mid-finalize and every bucket mixes clusters and generations.  On the
+unmodified baseline it reports 52-85% Frobenius for output that is provably correct.
+fa_verify_tiles.py groups by cluster FIRST and then starts a new image on an address repeat, which
+is self-validating: it yields exactly 4096 words per image and the images account for exactly the
+store words the whole-file verify parses.  That accounting cannot close if the grouping is wrong.
+Re-scoring this kernel's verdicts with it changed two things and confirmed the rest:
+  * the corruption is confined to CLUSTER 0 (cluster 1 is correct on every tile), not to "the warps
+    on core 1" as the mark-bucketed data suggested;
+  * its magnitude is 107-111% (garbage), not the 31-61% the mixed buckets showed.
+Kept only so the earlier numbers in the git history can be traced to their source.
+
+Verify EACH TILE'S O separately, by bucketing the O stores between MARK stamps.
 
 WHY THIS EXISTS.  Every tile of an FA_SP run recomputes the SAME tile from the SAME Q/K/V and
 writes O to the SAME GMEM buffer, so a whole-file verify only ever scores the LAST generation that
@@ -9,6 +25,8 @@ stores by the preceding MARK index scores each tile's finalize on its own.
 usage: y_pertile.py trace.out [golden.npy]
 """
 import re, sys, numpy as np, os
+sys.stderr.write("*** fa_pertile.py IS UNSOUND ON 2-CLUSTER TRACES -- use "
+                 "kernels/fa_mx_hostsf/fa_verify_tiles.py.  See the docstring. ***\n")
 ISSUE = re.compile(r"\[ISSUE\].*?inst=([0-9a-fA-F]+).*?tmask=([0-9a-fA-F]+)"
                    r".*?rs1\.data=\[([0-9a-f ]+)\].*?rs2\.data=\[([0-9a-f ]+)\]")
 BASE, NB = 0x40040000, 0x4000

@@ -497,10 +497,13 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //         QOVL4 QKACC PKOVL        67,304  50,934    50,934  32.24%  both tiles 3.5666%  CLEAN
 //         ... + SMTPR FZROW SMBMAX 62,306  46,016    46,016  35.68%  both tiles 4.2516%  CLEAN
 //     *** THE HEADLINE, after the fix:
-//       REFERENCE NUMERICS, verified          50,934 cyc/tile = 32.24% mesh, both tiles 3.5666%
+//       REFERENCE NUMERICS, verified          50,934 cyc/tile = 32.24% mesh
+//           4 of 4 tile-images at exactly 3.5666% (re-scored per cluster with fa_verify_tiles.py)
 //           (FA_SP + QOVL + QOVL4 + LEANCFG + QKACC + PKOVL)   <== the number to quote
-//       FASTEST verified                      46,016 cyc/tile = 35.68% mesh, both tiles 4.2516%
-//           (... + SMTPR + FZROW + SMBMAX; 4.2516% is the thread-per-row softmax's l rounding)
+//       FASTER, self-consistent but OFF-REFERENCE  46,016 cyc/tile = 35.68% mesh
+//           4 of 4 tile-images at 4.2516%: uncorrupted, but 4.2516% != 3.5666%, so this is a real
+//           numerics change (the thread-per-row softmax's l rounding), not a verified-equal result
+//           (... + SMTPR + FZROW + SMBMAX)
 //       the pre-existing published figure      46,478 / 35.33%  -- NOT correct after tile 0
 //       the sequential kernel it started from  118,673 single-shot = 13.84%
 //     So the sprint's 20% target is cleared by 1.6x at the reference numerics and 1.8x at the
@@ -548,7 +551,25 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //     is kept; only the stage it hides under changes.
 //     LESSON (the same one as the INCOMPLETE-TRACE trap, from the other side): a per-tile result
 //     must be verified PER TILE.  "8192/8192 cells covered" only says the buffer is full, not that
-//     ONE tile filled it.  Use y_pertile.py, never a whole-file Frobenius, on a steady-state run.
+//     ONE tile filled it.
+//     *** AND THE SECOND HALF OF THAT LESSON, WHICH COST A ROUND OF WRONG DETAIL: VERIFY PER
+//     CLUSTER TOO.  USE kernels/fa_mx_hostsf/fa_verify_tiles.py, NOT fa_pertile.py. ***  This config
+//     has TWO clusters, both write MARKs, and both write the SAME O addresses interleaved into one
+//     trace -- so bucketing by the most recent MARK (what fa_pertile.py does) mixes clusters and
+//     generations, and on the unmodified baseline it reports 52-85% for output that is provably
+//     correct.  fa_verify_tiles.py groups by cluster first and starts a new image on an address
+//     repeat, which is self-validating (exactly 4096 words per image, and the images account for
+//     exactly the store words the whole-file verify sees).  Re-scoring everything here with it
+//     CONFIRMED the substance and corrected two details:
+//       * the corruption is confined to CLUSTER 0 -- cluster 1 is correct on every tile -- not to
+//         "the late rows of the warps on core 1", which is what the mixed buckets suggested;
+//       * its magnitude is 107-111% (garbage), not 31-61%.
+//     Re-scored verdicts (tile-images; 3.5666% == correct):
+//       published QOVL3 QKACC PKOVL   5 of 8 correct: cluster 0 tiles 1,2,3 are 107-111% WRONG
+//       QOVL3 alone                   4 of 4 correct
+//       QOVL4 QKACC PKOVL             4 of 4 correct at exactly 3.5666%   <== the fix, confirmed
+//       ... + SMTPR FZROW SMBMAX      4 of 4 SELF-CONSISTENT at 4.2516%: uncorrupted, but not the
+//                                     reference value either -- a real numerics difference
 //
 // (b) *** WHY FA_SP_FUSE HAS NEVER RUN: THE RENAMER, AND IT IS A KERNEL-WIDE BUDGET. ***
 //     Every FUSE build $finishes at Rename.scala:123 "total register usage exceeded maximum
@@ -2290,6 +2311,20 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 #endif
     FAP_BAR(5);
     MARK();   // s3: softmax / row max done
+#ifdef FA_SP_DUMPP
+    // DIAGNOSTIC (FA_SP_DUMPP): per-row XOR checksum of the bf16 P the softmax just wrote in place
+    // over S.  Paired with FA_SP_DUMPLM this pins down WHERE the cooperative softmax and the
+    // thread-per-row softmax (FA_SP_SMTPR) diverge numerically -- the measured whole-matrix
+    // Frobenius steps 3.5666% -> 4.2xxx% between them, and the three candidate causes are m, P and
+    // l.  m and l come out of FA_SP_DUMPLM; this is P.  Both softmaxes are supposed to compute
+    // exp(bf16(S*scale) - m) elementwise with the same m, so a P checksum that differs between the
+    // two configurations means the exps themselves differ and the claim "same math, different
+    // parallelisation" is false.
+    fa_dump_rowsum<FA_SQ, FA_SK>(reinterpret_cast<const __shared uint32_t *>(SM_S),
+                                 (volatile uint32_t *)(0x40055000u + t * 256u), tid, thr);
+    mu_fence_smem();
+    FAP_BAR(12);
+#endif
 #ifdef FA_SP_FUSE
     // ---- S3: [all] FUSE pass 2, MX blocks 0..3: exp + requant -> P8 + scales + l-partials
     fa_expreq<FA_SQ, FA_SK, FA_SK / 64>(
