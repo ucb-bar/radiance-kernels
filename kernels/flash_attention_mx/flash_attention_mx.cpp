@@ -887,6 +887,48 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //                   16-way conflict CANNOT BE FIXED at 6 warps -- it is a register-budget
 //                   casualty, not a missing optimisation.  Also +107 instructions.
 //
+// ---- added 2026-07-26 (third pass) ---------------------------------------------------------
+//   FA_SP_NOMAX     *** DELETE THE SOFTMAX'S ROW-MAX PASS ALTOGETHER (m := 0). ***  The row max
+//                   exists ONLY to keep exp(u-m) inside the range of the P scratch, and that
+//                   scratch is bf16 -- which has FP32's 8-BIT EXPONENT.  bf16 trades MANTISSA for
+//                   nothing; its range is ~1e+-38.  So the range argument that makes the running max
+//                   mandatory in an fp16 flash-attention kernel simply does not apply to this
+//                   kernel.  Measured on this input: S*scale in [-3.53,+3.47], so exp(S*scale) in
+//                   [0.029, 32.1] and l <= 478 -- five of thirty-eight available decades.  m also
+//                   cancels EXACTLY out of O = (P@V)/l, and the per-32-element E8M0 block scale
+//                   renormalises every block independently afterwards, so the fp8 mantissa is
+//                   untouched (the block codes move from ~127 to ~132, well inside fa_clamp_K8's
+//                   0..255).  Nothing downstream reads m.  Needs FA_SP_SMTPR (it edits
+//                   fa_softmax_tpr).  Also costs 2 REGISTERS LESS than the version with pass 1.
+//                   THE ONE REAL RISK, and FA_SP_FIXMAX exists to separate it: this makes every
+//                   mu_fexp argument POSITIVE, and until now every mu_fexp call in this kernel has
+//                   had a NON-POSITIVE argument (exp(x-rowmax), exp(m_old-m_new)).  If the hardware
+//                   exp is only accurate for x <= 0 then NOMAX fails for a reason unrelated to the
+//                   row max.
+//   FA_SP_FIXMAX    with FA_SP_NOMAX: use a CONSTANT m = 4.0 instead of 0, which bounds
+//                   max(S*scale) = 3.47 on this input.  Pass 1 is still gone, but every mu_fexp
+//                   argument stays <= 0.  This is a CONTROL, not a shippable flag -- a constant m
+//                   is an assumption about the data, whereas m = 0 is not.
+//   FA_SP_CVTROT2   the CHEAP half-rotation of fa_requant_cvt's subbank conflict that the CVTROT
+//                   note above proposes as "one idea not yet tried": rotate only the HALF index h by
+//                   (lane & 1), so q stays a compile-time constant and only one term of the store
+//                   address becomes runtime.  8-way instead of 16-way conflict.  Costs 54 registers
+//                   -- one above the known-good 53 and one below the known-fatal 55 -- so running it
+//                   also brackets the renamer threshold exactly.
+//   FA_SP_DUMPS     DIAGNOSTIC: per-tile XOR checksum of every row of S, taken between the
+//                   accumulator store and the softmax.  S(t) is loop-invariant, so any row that
+//                   moves indicts the QK matmul / accumulator store and exonerates everything after.
+//   FA_SP_DUMPP     DIAGNOSTIC: the same checksum of the bf16 P the softmax just wrote in place.
+//                   Pairs with FA_SP_DUMPLM to localise the cooperative-vs-thread-per-row accuracy
+//                   gap to m, P or l.
+//   FA_SP_DUMPL     DIAGNOSTIC: per tile, the 64 l words, the 64 m words, and a per-row checksum of
+//                   O_unnorm as PV left it -- i.e. everything finalize consumes.
+//   FA_SP_DUMPLM    the l/m half of FA_SP_DUMPL only; 3 registers cheaper, so it fits at occupancy 3
+//                   (which matters: the cooperative softmax's reduction tree changes shape with the
+//                   warp count, so the comparison has to be made at the SAME occupancy).
+//   READ THE DUMPS WITH /tmp/fa_dumpchk.py, WHICH SPLITS BY CLUSTER.  Both clusters write the same
+//   GMEM page, so a merged read of a dump is exactly as wrong as a merged read of O -- see (A).
+//
 // THE REGISTER THRESHOLD, EMPIRICALLY BRACKETED (occupancy 3 = 6 warps = 3 warps/core):
 //     53  RUNS      -- PKOVL, SMTPR, +SMBMAX, +SUBMAX, +FZU4, +QOVL4  (every shipped config)
 //     55  $finishes -- PKOVL+REFETCH, and FA_SP_CVTROT
