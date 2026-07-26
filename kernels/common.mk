@@ -27,7 +27,32 @@ MU_CFLAGS += -O3 -std=c++20
 MU_CFLAGS += -mcmodel=medany -fno-rtti -fno-exceptions -fdata-sections -ffunction-sections
 MU_CFLAGS += -mllvm -inline-threshold=262144
 MU_CFLAGS += -I$(RADIANCE_INCLUDE_PATH) -I$(GEMMINI_SW_PATH)
+# Shared MX mesh library (one copy for the gemm/gemv/ws kernels; flash kernels keep their
+# own same-dir variant, which takes precedence for `#include "mxgemm_lib.hpp"`).
+MU_CFLAGS += -I$(RADIANCE_LIB_PATH)/mxgemm
 MU_CFLAGS += -DRADIANCE -DRADIANCE_DEVICE -DNDEBUG -DLLVM_VORTEX
+# Force-include the abs() disambiguation shim ahead of gemmini.h (see the header) so the
+# MX kernels compile against an unmodified gemmini submodule.
+MU_CFLAGS += -include $(RADIANCE_INCLUDE_PATH)/gemmini_abs_shim.h
+
+# Extra device-side flags from the caller (e.g. an RTL verify harness passes -DDRAIN_ITERS=200000 so
+# the harness can let stores drain before verifying on RTL). This was referenced by the
+# gate scripts but never consumed here, silently making the flag a no-op.
+MU_CFLAGS += $(EXTRA_MU_CFLAGS)
+
+# The muon LLVM ships libc++ headers but no C library headers. Kernels that pull in
+# <math.h>/<stdlib.h> (e.g. anything including gemmini.h -> the mxgemmini kernels)
+# therefore fail to compile: libc++'s <math.h>/<stdlib.h> wrappers #include_next the
+# C headers and find nothing (FP_NORMAL, ldiv_t, ... undeclared).
+#
+# Point MU_LIBC_INCLUDE at a newlib include dir to supply them. It MUST be added with
+# -idirafter (not -I/-isystem) so it is searched *after* libc++, otherwise libc++
+# rejects the C <stdint.h> being found ahead of its own.
+# Override on the command line or in the environment for other machines.
+MU_LIBC_INCLUDE ?= $(realpath $(dir $(RISCV64_TOOLCHAIN_PATH))/riscv-tools/$(RISCV64_PREFIX)/include)
+ifneq ($(MU_LIBC_INCLUDE),)
+MU_CFLAGS += -idirafter $(MU_LIBC_INCLUDE)
+endif
 
 MU_LDFLAGS += -nodefaultlibs -nostartfiles -Wl,-Bstatic,-T,$(RADIANCE_LIB_PATH)/linker/mu_link.ld,-z,norelro -fuse-ld=lld
 MU_LDFLAGS += $(RADIANCE_LIB_PATH)/libmuonrt.a $(RADIANCE_LIB_PATH)/tohost.S
