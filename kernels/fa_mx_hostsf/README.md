@@ -110,6 +110,10 @@ all measured on this tree:
   `tlSlaveXbar` at points that interleave with the GPU's own 4-byte SF writes, and no schedule I
   tried survives it.  So the host can own the scale SRAMs, or the command port, but not both —
   unless the GPU is taken off the SF port entirely (`FA_HOSTPACK`, in flight).
+* `FA_HOSTPACK` (take the GPU off the SF port entirely) **delays but does not remove** the
+  `FA_HOSTCFG` deadlock: it gets through ~3 tiles instead of ~1 and then asserts at 490,027,000 ps.
+  Combined with the fact that `FA_HOSTHS` alone is clean, that pins the trigger on the host driving
+  the **command port**, not the scale SRAM.
 * An earlier campaign reported a clean 84,549 cyc/tile for `FA_HOSTHS` with the *old* schedule.  That
   build carried four extra instrumentation stores per tile; removing the *probe* uncovered the race
   in the code being probed.
@@ -135,6 +139,7 @@ the kernel is not finished until the slower one is.  **Correctness is the per-ti
 | `FULL_ATTN2` — baseline, GPU loads all MX scales | 97,398 | 16.86% | 96,243 | 17.06% | **8/8 correct** |
 | `+ FA_NOSCALES` — host prefills the scale SRAMs | 82,451 | 19.91% | 85,294 | 19.25% | **5/8** — cl1 tiles 1,2,3 at 112.64 / 113.45 / 113.45% |
 | `+ FA_NOSCALES` seed 777 | 82,451 | 19.91% | 86,240 | 19.04% | 5/8 — *identical* failure and Frobenius |
+| `+ FA_NOSCALES FA_EARLYV` **seed 777** | 82,881 | 19.81% | 83,321 | 19.71% | 6/6 correct — slope bit-identical to seed 12345 |
 | **`+ FA_NOSCALES FA_EARLYV`** | **82,881** | **19.81%** | **83,321** | **19.71%** | **8/8 correct** |
 | **`+ FA_NOSCALES FA_HOSTHS`** — host re-pushes all 4,608 B EVERY tile | **83,517** | **19.66%** | **86,482** | **18.99%** | **8/8 correct** |
 | `+ FA_NOSCALES FA_EXPMVIN` (explicit V mvin only, no hoist) | 82,975 | 19.79% | — | — | 4/4 correct (2 tiles measured) |
@@ -197,6 +202,20 @@ Deterministic and seed-independent in every variant tried:
 Every `FA_NOSCALES`-only build (host writes the SF SRAMs once at boot, before the GPU's first
 `pack_scales_to_sfmem`) has been clean in ~20 runs.  See the merge-node section above for what the
 waveform shows.
+
+### Effect on the main (pipelined) kernel
+
+`kernels/flash_attention_mx` at md5 `8de04db0`, built `FULL_ATTN2 FA_STEADY FA_NT4 FA_NOSCALES`:
+
+| build | cl0 cyc/tile | cl1 cyc/tile | per-tile correctness |
+|---|---|---|---|
+| `FA_NOSCALES` | 70,762 (23.20%) | 71,552 (22.95%) | 6/8 — cl0 tiles 2,3 at **112.6418 / 113.4523%** (the same fingerprint as the frozen snapshot) |
+| `FA_NOSCALES FA_EARLYV` | 71,010 (23.12%) | 69,716 (23.55%) | 5/8 — cl0 tile 2 down to **6.8648%**, 2 images truncated |
+
+So `FA_EARLYV` removes the 112.64% failure mode from the main kernel too (112.64% -> 6.86%) at no
+cost in the slope, but the main kernel has a **residual** error of its own on top of it.  Whoever owns
+that file should apply the explicit PV move-in (`FA_EXPMVIN` is the minimal form) and then chase the
+remaining 6.86% separately -- it is a different bug, not this one.
 
 ### Phase decomposition of the offloaded steady state
 
