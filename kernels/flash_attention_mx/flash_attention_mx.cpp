@@ -570,16 +570,28 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //                                                             107-111% WRONG, cluster 1 all correct
 //       QOVL3 alone                         61,912    26.5%   4 of 4 correct
 //       QOVL3 PKOVL   (no QKACC)            56,229    29.2%   4 of 4 correct
-//       QOVL3 QKACC   (no PKOVL)            (zD2)             pending
+//       QOVL3 QKACC   (no PKOVL)            53,275    30.8%   3 of 4: cluster 0 tile 1 is 85.2%
+//                                                             WRONG  <== *** THE CULPRIT ***
 //       QOVL4 QKACC PKOVL                   50,934    32.24%  4 of 4 at exactly 3.5666%  <== THE FIX
 //       ... + SMTPR FZROW SMBMAX            46,016    35.68%  4 of 4 SELF-CONSISTENT at 4.2516%:
 //                                                             uncorrupted, but not the reference
 //                                                             value -- a real numerics difference
-//     So QOVL3 alone is clean, PKOVL alone is clean, and the published build that puts QOVL3, QKACC
-//     and PKOVL together is not: the trigger needs the PV-stage prefetch AND the extra concurrency,
-//     which is exactly why bisecting one flag at a time pointed the wrong way twice.  Note also that
-//     each individual rung is SLOWER than the broken combination -- being correct costs cycles here,
-//     and FA_SP_QOVL4 is what buys most of them back (50,934 vs 61,912) while staying correct.
+//     *** RESOLVED: THE CULPRIT IS FA_SP_QKACC (together with the QOVL3 prefetch placement), AND
+//     FA_SP_PKOVL IS INNOCENT. ***  QOVL3 alone is clean; QOVL3 + PKOVL is clean; QOVL3 + QKACC
+//     BREAKS (cluster 0 tile 1, 85.2%); QOVL3 + QKACC + PKOVL breaks harder (3 of 8 images);
+//     QOVL4 + QKACC + PKOVL is clean.  So it is a TWO-WAY interaction between the Q(t+1) prefetch
+//     living in the PV stage and FA_SP_QKACC, and that is mechanistically the right shape: QKACC is
+//     the flag that makes the mesh run CONCURRENTLY with finalize and that moves when the PV
+//     accumulator->spad move-out happens relative to the prefetch.  FA_SP_QOVL4, which relocates the
+//     prefetch out of the PV stage, removes the interaction -- 4 of 4 images at exactly 3.5666%.
+//     IT IS A TIMING WINDOW, and here is the cleanest demonstration: adding FA_SP_DUMPSC to the
+//     BROKEN configuration -- a pure diagnostic that only adds a barrier and 32 stores per tile --
+//     makes it verify 4 of 4.  So any instrumentation heavy enough to observe this hazard perturbs
+//     it away, which is why it survived so long and why the fix had to be structural rather than
+//     found by probing.
+//     Note the cost of correctness: every individually-clean rung is SLOWER than the broken
+//     combination, and FA_SP_QOVL4 is what buys the cycles back (50,934 vs 61,912) while staying
+//     correct.
 //
 // (b) *** WHY FA_SP_FUSE HAS NEVER RUN: THE RENAMER, AND IT IS A KERNEL-WIDE BUDGET. ***
 //     Every FUSE build $finishes at Rename.scala:123 "total register usage exceeded maximum
@@ -707,7 +719,9 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //      x2s  QOVL4 QKACC PKOVL SMTPR FZROW SMBMAX at FA_NT6 -- PARTIAL: 61,971 / 46,802, converging.
 //      x3s  the FA_SP_ITEM variant at FA_NT6         -- PARTIAL: 74,056 / 60,750, i.e. it confirms
 //           at NT6 that FA_SP_ITEM is a large loss.
-//      dsc  QOVL3 QKACC PKOVL DUMPSC -- dumps the 128 E8M0 scale words per tile to 0x40051000 +
+//      dsc  QOVL3 QKACC PKOVL DUMPSC -- *** RESULT: 4 of 4 tile-images CORRECT, i.e. the diagnostic
+//           PERTURBS THE HAZARD AWAY.  It cannot be used to localise this bug; it is evidence that
+//           the bug is a timing window. ***  Dumps the 128 E8M0 scale words per tile to 0x40051000 +
 //           512*t.  If the dumps are identical across tiles then SCALE_SMEM is fine and the damage
 //           is in the pack into the gemmini SF-SRAM or the mesh's read of it; if they already
 //           differ, the requant (or something racing it) is at fault.  This is the diagnostic that
