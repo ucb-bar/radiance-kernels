@@ -496,8 +496,25 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //     AND WITH THE FIX (FA_SP_QOVL4 instead of FA_SP_QOVL3):
 //         QOVL4 QKACC PKOVL        67,304  50,934    50,934  32.24%  both tiles 3.5666%  CLEAN
 //         ... + SMTPR FZROW SMBMAX 62,306  46,016    46,016  35.68%  both tiles 4.2516%  CLEAN
+// (a3) *** METHODOLOGY CORRECTION -- THE TILE INTERVALS ARE NOT MONOTONE, SO "THE STEADY STATE" IS
+//      NOT THE SMALLEST ONE.  Every cycles-per-tile figure in this file that was read off a 2- or
+//      4-tile run is a TRANSIENT, optimistic by 1.2-1.6 utilisation points. ***
+//      The 6-tile runs show the intervals fall and then RISE again:
+//        published QOVL3 QKACC PKOVL   67,707  48,234  46,478  46,941  48,149
+//        QOVL4 ... SMTPR FZROW SMBMAX  61,971  46,802  48,329  48,128
+//      So 46,478 -- quoted as this kernel's steady state at 35.33% -- is a LOCAL MINIMUM at tile 2,
+//      and that same configuration settles near 48,149 = 34.10%.  Read the same way the SMBMAX
+//      variant settles near 48,128 = 34.12%, not the 46,016 = 35.68% its 2-tile run showed, so THE
+//      IMPROVEMENT CLAIMED FOR IT IS INSIDE THIS WOBBLE AND IS NOT ESTABLISHED.  The
+//      reference-numerics 50,934 = 32.24% is likewise a tile-1 interval and provisional until the
+//      FA_NT6 run of that build converges.
+//      RULE: FA_NT6 is the minimum useful tile count for a TIMING claim; NT2/NT4 are for correctness
+//      only.  Compare at the same interval index, or at the last interval of a 6-tile run.
+//      The per-tile-image CORRECTNESS verdicts are UNAFFECTED -- they do not depend on interval
+//      indices, so FA_SP_QKACC is still the culprit and FA_SP_QOVL4 still fixes it.
+//
 //     *** THE HEADLINE, after the fix:
-//       REFERENCE NUMERICS, verified          50,934 cyc/tile = 32.24% mesh
+//       REFERENCE NUMERICS, verified          50,934 cyc/tile = 32.24% mesh   *** TRANSIENT, see (a3) ***
 //           4 of 4 tile-images at exactly 3.5666% (re-scored per cluster with fa_verify_tiles.py)
 //           (FA_SP + QOVL + QOVL4 + LEANCFG + QKACC + PKOVL)   <== the number to quote
 //       FASTER, self-consistent but OFF-REFERENCE  46,016 cyc/tile = 35.68% mesh
