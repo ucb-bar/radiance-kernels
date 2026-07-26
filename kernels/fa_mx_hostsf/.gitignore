@@ -1,0 +1,5 @@
+golden_*.npy
+include/
+*.elf
+*.o
+__pycache__/
