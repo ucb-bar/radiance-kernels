@@ -697,10 +697,10 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //        kernel saves: the SAME PKOVL config goes 46,478 -> 56,455, and the best occ-2 variant
 //        (24.46%) is worse than the plain occ-3 baseline.  FUSE and 1P are therefore DEAD as
 //        performance ideas on this machine, and the reason is the renamer, not the fusion.
-//     4. SMTPR trades accuracy for speed: 3.5666% -> 4.2342%, entirely in l's bf16 rounding (its
-//        per-lane 64-deep chains vs the cooperative version's shallower tree).  SMBMAX's block
-//        structure lets l be summed as a two-level tree instead, which is why SMBMAX is both faster
-//        AND slightly more accurate (4.2140%) than SMTPR alone.
+//     4. SMTPR trades accuracy for speed: 3.5666% -> 4.2342%.  *** THE "IT IS ALL l's bf16
+//        ROUNDING" EXPLANATION THAT USED TO BE WRITTEN HERE IS WRONG, AND THE ARITHMETIC SAYS SO
+//        QUANTITATIVELY -- see (e3) below.  The gap is real, it belongs to FA_SP_SMTPR and NOT to
+//        FA_SP_SMBMAX, and its mechanism is NOT YET IDENTIFIED. ***
 //
 // (d2) RUNS LEFT IN FLIGHT when this was written, and exactly how to read them.  Each is a 2-tile
 //      run; the ONLY question for each is whether tile 1's per-tile Frobenius matches tile 0's.
@@ -751,6 +751,49 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //           is in the pack into the gemmini SF-SRAM or the mesh's read of it; if they already
 //           differ, the requant (or something racing it) is at fault.  This is the diagnostic that
 //           localises the corruption to a specific producer, and it is worth running first.
+//
+// (e3) *** THE 3.5666% -> 4.2xxx% SOFTMAX ACCURACY GAP: WHAT IT IS NOT. ***
+//     Measured on ONE otherwise-identical pipeline (QOVL4 QKACC PKOVL, per-cluster per-tile,
+//     tile-0 images):
+//         cooperative online_softmax_block          3.5666%   == the sequential kernel's own value
+//         + FA_SP_SMTPR FA_SP_FZROW                 4.2342%
+//         + FA_SP_SMBMAX                            4.2516%
+//     So FA_SP_SMBMAX moves the error by +0.017 points -- it is NUMERICALLY NEUTRAL, and taking the
+//     requant's block max out of the softmax's registers instead of re-reading the stored bf16 P is
+//     as accurate as the two-pass form, exactly as intended.  The whole 0.68-point step belongs to
+//     the thread-per-row softmax.
+//     l's SUMMATION ORDER CANNOT ACCOUNT FOR IT, and this is arithmetic, not opinion.  Emulating
+//     bf16 round-to-nearest-even in numpy on the real golden S and reducing exactly as each kernel
+//     does gives, for l's relative error and for the Frobenius error l ALONE can inject into
+//     O = O_unnorm / l (a relative error d in l scales that whole row of O by 1/(1+d), so the
+//     contribution is the row-norm-weighted rms of d/(1+d)):
+//         cooperative: 16-lane chains of 16 + 16-leaf tree   rms 0.0031  ->  0.3115%
+//         thread-per-row: 4 chains of 64                     rms 0.0047  ->  0.4703%
+//         thread-per-row: 2-level block tree (SMBMAX)        rms 0.0028  ->  0.2786%
+//     Closing 3.5666% -> 4.2342% needs sqrt(4.2342^2 - 3.5666^2) = 2.28% of extra error, and NO
+//     reduction order supplies a tenth of that.  The measured ordering is backwards for the theory
+//     as well: the 2-level tree is the MOST accurate l of the three and produces the WORST O.
+//     m IS PROVABLY IDENTICAL between the two softmaxes.  The cooperative one takes max_i of the
+//     SCALED values; the thread-per-row one takes the max of the RAW row and scales once.  bf16
+//     multiply and bf16 round-to-nearest are both monotone non-decreasing, so
+//     max_i RNE(S_i * scale) == RNE(max_i S_i * scale) -- the two expressions are equal bit for bit.
+//     P SHOULD ALSO BE IDENTICAL: both compute mu_fexp(RNE(RNE(S*scale) - m)) elementwise, both
+//     write it in place at the same word index, and both cover the row exactly once (the lane
+//     rotations are permutations: the union over the loop of (i+q+lane) mod SKW is all of SKW).
+//     AND finalize_O and fa_finalize_row are the same arithmetic -- one bf16 reciprocal per row,
+//     then a multiply -- differing only in whether l is a uint16 array or one 32-bit word per row.
+//     So on paper the two configurations must agree, and they do not.  STATUS: LOCALISED TO THE
+//     THREAD-PER-ROW SOFTMAX, MECHANISM UNKNOWN.  The two diagnostics that close it are in the file
+//     and cost one 2-tile run each: FA_SP_DUMPP (per-row XOR checksum of the bf16 P the softmax
+//     wrote) and FA_SP_DUMPLM (the l and m arrays), run on the same base at the same occupancy with
+//     and without FA_SP_SMTPR, and read with /tmp/fa_dumpchk.py (which splits by cluster).  If the
+//     P checksums differ the exps differ and "same math, different parallelisation" is false; if
+//     they match, the fault is in l after all and the numpy model above is missing something about
+//     how this hardware rounds.
+//     WHY IT MATTERS FOR WHAT SHIPS: until this is closed, the reference-numerics configuration and
+//     the thread-per-row configuration are two separate results, and only the first can be called
+//     correct.  4.2516% is 19% more relative error than the MX-FP8 floor this kernel is supposed to
+//     sit on, which is small but is NOT nothing.
 //
 // (e) WHAT IS LEFT, in descending value.  The stage costs to beat (steady tile, SMTPR+SMBMAX):
 //        accumulator->S 998 | softmax ~12,4xx | (pass A gone) | requant convert + SF pack ~10,5xx
