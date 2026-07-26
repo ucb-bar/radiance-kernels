@@ -1138,7 +1138,21 @@ static __attribute__((noinline)) void fa_softmax_tpr(
         // moves the arguments the OTHER WAY -- m is 1.7..3.5 here, so dropping it makes every
         // argument LESS negative -- so the hardware-accuracy mechanism that sank SUBMAX predicts
         // this direction should be neutral or better.  That is the prediction being tested.
+        // FA_SP_FIXMAX picks a CONSTANT m instead of 0.  Its only purpose is to separate the two
+        // things FA_SP_NOMAX changes at once: (i) pass 1 disappears, and (ii) every mu_fexp argument
+        // becomes POSITIVE (up to +3.47 on this input) where the kernel has, until now, only ever
+        // called mu_fexp with a NON-POSITIVE argument -- both softmax call sites are exp(x - rowmax)
+        // and exp(m_old - m_new).  If mu_fexp is only accurate (or only defined) for x <= 0 then
+        // NOMAX will be wrong for a reason that has nothing to do with the row max being
+        // unnecessary.  m = 4.0 bounds max(S*scale) = 3.47 here, so FIXMAX keeps every argument
+        // <= 0 AND still deletes pass 1.  NOMAX correct  => the row max is simply not needed on this
+        // hardware.  NOMAX wrong but FIXMAX correct  => the row max is not needed either, but
+        // mu_fexp's usable domain is x <= 0, which is a hardware fact worth having.
+#ifdef FA_SP_FIXMAX
+        const _Float16 m = as_bf16((uint16_t)0x4080u);   // 4.0
+#else
         const _Float16 m = (_Float16)0;
+#endif
 #else
         _Float16 x0 = as_bf16(NEG_INF_BF16_BITS), x1 = x0, x2 = x0, x3 = x0;
 #ifdef FA_SP_SUBMAX
