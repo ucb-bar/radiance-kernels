@@ -493,11 +493,16 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //         + QOVL3                  76,050  61,912    61,912  26.5%   t0 3.5666% t1 3.5666%  CLEAN
 //         + QKACC                  (IN FLIGHT: tag zD2, see "RUNS LEFT IN FLIGHT" below)
 //         + PKOVL                  67,707  48,234    46,478  35.3%   t0 3.5666%, t1+ BROKEN
-//     *** SO THE HONEST HEADLINE IS TWO NUMBERS, NOT ONE: the fastest configuration whose steady
-//     state is VERIFIED CORRECT on every tile it ran is 61,912 cyc/tile = 26.5% mesh utilisation,
-//     and the 46,478 / 35.3% configuration does not compute a correct O after tile 0.  QKACC and
-//     PKOVL together are worth 15.4k cycles per tile and at least one of them is what breaks it. ***
-//     (Both still clear the 20% target, which the pre-existing sequential kernel did not.)
+//     *** THE HONEST HEADLINE, UPDATED once QOVL4 + SMBMAX was measured:
+//       best VERIFIED on every tile it ran   46,016 cyc/tile = 35.68% mesh   (tag x2: QOVL4 QKACC
+//           PKOVL SMTPR FZROW SMBMAX, tiles 0 and 1 both 4.2516%) -- FASTER than the original
+//           46,478 configuration and correct, though 2 tiles is evidence not proof (see x2s);
+//       best verified with the REFERENCE numerics (3.5666%)  61,912 cyc/tile = 26.5% mesh
+//           (QOVL3, both tiles) -- this is the conservative number;
+//       the published 46,478 / 35.3% configuration does NOT compute a correct O after tile 0.
+//     QKACC and PKOVL together are worth 15.4k cycles/tile and at least one of them is what breaks
+//     the reference-numerics build; adding SMTPR+SMBMAX on top of QOVL4 apparently avoids the
+//     window. ***  (Every number here clears the 20% target; the sequential kernel is 13.8%.)
 //     *** SO FA_SP_QOVL3 IS NOT THE CAUSE.  The Q-prefetch-under-the-PV-move-out theory below is
 //     REFUTED: the QOVL3 rung verifies on both tiles.  The cause is FA_SP_QKACC or FA_SP_PKOVL,
 //     which the two runs above discriminate. ***  Kept here because the reasoning was the basis for
@@ -636,7 +641,13 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //           So FA_SP_QOVL4 is very slightly FASTER than FA_SP_QOVL3, not slower -- moving the
 //           prefetch out of the PV stage costs nothing.  Whether it also fixes tile 1 is the open
 //           question; QOVL3's own rung is clean, so most likely it does not.
-//      x2   QOVL4 QKACC PKOVL SMTPR FZROW SMBMAX -- PARTIAL: tile-0 delta 62,306, tile 0 4.2516%.
+//      x2   QOVL4 QKACC PKOVL SMTPR FZROW SMBMAX -- *** BEST VERIFIED RESULT: deltas 62,306 /
+//           46,016, and tile 0 AND tile 1 BOTH score 4.2516%.  46,016 cyc/tile = 35.68% mesh, i.e.
+//           FASTER than the original (broken) 46,478 configuration AND correct on every tile it
+//           ran.  Confirmed independently by two separate watchers.  Caveat that matters: the
+//           corruption is timing-dependent and in one earlier variant it first appeared at TILE 2,
+//           so two clean tiles is strong evidence but not proof -- x2s is the same build at FA_NT6
+//           (five steady intervals) and is the run that settles it. ***
 //      x3   QOVL4 QKACC PKOVL ITEM  FZROW  -- *** MEASURED A CLEAR LOSS: tile-0 delta 75,521 vs
 //           62,306 for the thread-per-row version (x2), i.e. +13,215.  So FA_SP_ITEM is REFUTED as
 //           a performance idea, and the "a third of the machine is idle" argument for it is wrong
@@ -1722,6 +1733,20 @@ static __attribute__((noinline)) void fa_dump_state(const __shared uint32_t *l32
         out[2 * SQ + r] = x;
     }
 }
+// FA_SP_DUMPLM: l and m only (no O checksum).  Register-lean enough to fit the occupancy-3 budget,
+// which matters because the question it exists to answer -- "is the 3.5666% -> 4.2xxx% accuracy gap
+// between the cooperative and the thread-per-row softmax in l?" -- has to be asked at the SAME
+// occupancy in both configurations, or the cooperative softmax's reduction tree changes shape and
+// the comparison is void.  NOTE THE TWO l/m LAYOUTS: online_softmax_block writes uint16 per row
+// (so word r holds rows 2r and 2r+1), fa_softmax_tpr / fa_softmax_item write one 32-bit word per
+// row.  The dump is raw words either way; the reader unpacks according to the configuration.
+template <uint32_t SQ>
+static __attribute__((noinline)) void fa_dump_lm(const __shared uint32_t *l32,
+                                                 const __shared uint32_t *m32,
+                                                 volatile uint32_t *out,
+                                                 uint32_t tid, uint32_t thr) {
+    for (uint32_t r = tid; r < SQ; r += thr) { out[r] = l32[r]; out[SQ + r] = m32[r]; }
+}
 
 // --------------------------------------------------------------------------------------------
 // FA_SP_PKOVL -- split requant so the (strictly serial) SF-SRAM pack hides underneath it.
@@ -2421,6 +2446,13 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
                                reinterpret_cast<const __shared uint32_t *>(M_SMEM),
                                reinterpret_cast<const __shared uint32_t *>(SM_S),
                                (volatile uint32_t *)(0x40054000u + t * 1024u), tid, thr);
+    mu_fence_smem();
+    FAP_BAR(13);
+#elif defined(FA_SP_DUMPLM)
+    // the l/m half of FA_SP_DUMPL only -- 3 registers cheaper, so it fits at occupancy 3.
+    fa_dump_lm<FA_SQ>(reinterpret_cast<const __shared uint32_t *>(LS_SMEM),
+                      reinterpret_cast<const __shared uint32_t *>(M_SMEM),
+                      (volatile uint32_t *)(0x40054000u + t * 1024u), tid, thr);
     mu_fence_smem();
     FAP_BAR(13);
 #endif
