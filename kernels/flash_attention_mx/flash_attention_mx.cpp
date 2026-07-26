@@ -564,12 +564,22 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //       * the corruption is confined to CLUSTER 0 -- cluster 1 is correct on every tile -- not to
 //         "the late rows of the warps on core 1", which is what the mixed buckets suggested;
 //       * its magnitude is 107-111% (garbage), not 31-61%.
-//     Re-scored verdicts (tile-images; 3.5666% == correct):
-//       published QOVL3 QKACC PKOVL   5 of 8 correct: cluster 0 tiles 1,2,3 are 107-111% WRONG
-//       QOVL3 alone                   4 of 4 correct
-//       QOVL4 QKACC PKOVL             4 of 4 correct at exactly 3.5666%   <== the fix, confirmed
-//       ... + SMTPR FZROW SMBMAX      4 of 4 SELF-CONSISTENT at 4.2516%: uncorrupted, but not the
-//                                     reference value either -- a real numerics difference
+//     Re-scored verdicts (tile-images; 3.5666% == correct).  Every one of these is per cluster:
+//       config (all + FA_SP QOVL LEANCFG)   steady    util    tile-images
+//       published QOVL3 QKACC PKOVL         46,478    35.3%   5 of 8: cluster 0 tiles 1,2,3 are
+//                                                             107-111% WRONG, cluster 1 all correct
+//       QOVL3 alone                         61,912    26.5%   4 of 4 correct
+//       QOVL3 PKOVL   (no QKACC)            56,229    29.2%   4 of 4 correct
+//       QOVL3 QKACC   (no PKOVL)            (zD2)             pending
+//       QOVL4 QKACC PKOVL                   50,934    32.24%  4 of 4 at exactly 3.5666%  <== THE FIX
+//       ... + SMTPR FZROW SMBMAX            46,016    35.68%  4 of 4 SELF-CONSISTENT at 4.2516%:
+//                                                             uncorrupted, but not the reference
+//                                                             value -- a real numerics difference
+//     So QOVL3 alone is clean, PKOVL alone is clean, and the published build that puts QOVL3, QKACC
+//     and PKOVL together is not: the trigger needs the PV-stage prefetch AND the extra concurrency,
+//     which is exactly why bisecting one flag at a time pointed the wrong way twice.  Note also that
+//     each individual rung is SLOWER than the broken combination -- being correct costs cycles here,
+//     and FA_SP_QOVL4 is what buys most of them back (50,934 vs 61,912) while staying correct.
 //
 // (b) *** WHY FA_SP_FUSE HAS NEVER RUN: THE RENAMER, AND IT IS A KERNEL-WIDE BUDGET. ***
 //     Every FUSE build $finishes at Rename.scala:123 "total register usage exceeded maximum
@@ -1082,6 +1092,29 @@ static __attribute__((noinline)) void fa_softmax_tpr(
         // The output is NOT bit-identical to the full-max version (P is scaled by a non-power-of-2
         // constant, so the fp8 mantissas round differently) -- it is the SAME computation to
         // within one requant rounding, which is why the Frobenius error must be re-measured.
+#ifdef FA_SP_NOMAX
+        // *** FA_SP_NOMAX -- DELETE PASS 1 ENTIRELY.  m := 0. ***
+        // The row max exists ONLY to keep exp(u-m) inside the floating-point range of the P
+        // scratch.  That scratch is bf16, and bf16 has FP32's 8-BIT EXPONENT (range ~1e+-38) -- it
+        // gives up mantissa bits, not range.  So the range argument that makes the max mandatory in
+        // an fp16 flash-attention kernel does not apply here at all.  Measured on this input:
+        //     S*scale in [-3.53, +3.47]   =>   exp(S*scale) in [0.029, 32.1]
+        //     l without the max <= 478    =>   1/l >= 2.1e-3
+        // i.e. five orders of magnitude used out of thirty-eight.  m also cancels EXACTLY between
+        // the numerator and the denominator of the softmax (O = (P@V)/l with P = exp(u-m) and
+        // l = sum exp(u-m)), and the per-32-element E8M0 block scale that the requant computes
+        // afterwards renormalises every block independently, so the fp8 mantissa is unaffected by
+        // how big P is.  The per-block E8M0 code moves from ~127 to ~132 -- well inside the 0..255
+        // that fa_clamp_K8 allows -- and nothing downstream reads m at all (fa_finalize_row and
+        // fa_requant_cvt do not; only the FA_SP_DUMPLM diagnostic does).
+        // WHY THIS IS NOT FA_SP_SUBMAX.  SUBMAX kept the max but made it a 4:1 subsample plus a
+        // +24 margin, which pushed every exp argument ~24 FURTHER NEGATIVE and cost real accuracy
+        // (4.2140% -> 7.7888%) because mu_fexp is not uniformly accurate in its argument.  NOMAX
+        // moves the arguments the OTHER WAY -- m is 1.7..3.5 here, so dropping it makes every
+        // argument LESS negative -- so the hardware-accuracy mechanism that sank SUBMAX predicts
+        // this direction should be neutral or better.  That is the prediction being tested.
+        const _Float16 m = (_Float16)0;
+#else
         _Float16 x0 = as_bf16(NEG_INF_BF16_BITS), x1 = x0, x2 = x0, x3 = x0;
 #ifdef FA_SP_SUBMAX
         // FA_SP_SUBMAX_NOMARGIN drops the +24 to separate the two effects of this flag -- the
@@ -1115,6 +1148,7 @@ static __attribute__((noinline)) void fa_softmax_tpr(
 #else
         const _Float16 m = (_Float16)(fmaxf(fmaxf(x0, x1), fmaxf(x2, x3)) * scale);
 #endif
+#endif  // FA_SP_NOMAX
         // ---- pass 2: P = exp(S*scale - m), written IN PLACE; row sum in bf16 (4 chains) ----
         // *** NO FP32 ANYWHERE.  The verified reference kernel emits ZERO fcvt.s.h / fadd.s /
         // fmax.s in the whole object -- it is pure bf16 (fmax.h / fadd.h / fmul.h / fdiv.h).  The
