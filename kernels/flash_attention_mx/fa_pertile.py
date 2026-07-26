@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Verify EACH TILE'S O separately, by bucketing the O stores between MARK stamps.
+
+WHY THIS EXISTS.  Every tile of an FA_SP run recomputes the SAME tile from the SAME Q/K/V and
+writes O to the SAME GMEM buffer, so a whole-file verify only ever scores the LAST generation that
+happened to land -- and a trace read early scores an EARLY generation.  Both directions have
+produced misleading "3.5666% OK" and "61% broken" readings on the same binary.  Bucketing the O
+stores by the preceding MARK index scores each tile's finalize on its own.
+usage: y_pertile.py trace.out [golden.npy]
+"""
+import re, sys, numpy as np, os
+ISSUE = re.compile(r"\[ISSUE\].*?inst=([0-9a-fA-F]+).*?tmask=([0-9a-fA-F]+)"
+                   r".*?rs1\.data=\[([0-9a-f ]+)\].*?rs2\.data=\[([0-9a-f ]+)\]")
+BASE, NB = 0x40040000, 0x4000
+kd = '/scratch/yrh/ai-workspace/kernel-gen/radiance-kernels/kernels/flash_attention_mx'
+gold = np.load(os.path.join(kd, sys.argv[2] if len(sys.argv) > 2 else 'golden_O_u16.npy')
+               ).astype(np.uint16).reshape(64, 128)
+ef = (gold.astype(np.uint32) << 16).view(np.float32)
+cur, buckets = -1, {}
+for line in open(sys.argv[1], errors='ignore'):
+    if '[ISSUE]' not in line: continue
+    i = line.find('rs1.data=[')
+    if i < 0: continue
+    try: a0 = int(line[i+10:i+18], 16)
+    except ValueError: continue
+    if 0x40050000 <= a0 < 0x40050200:              # a MARK store: advances the stage cursor
+        cur = (a0 - 0x40050000) // 4; continue
+    if 'inst=' not in line: continue
+    m = ISSUE.search(line)
+    if not m or (int(m.group(1), 16) & 0x7F) != 0x23: continue
+    A = [int(x, 16) for x in m.group(3).split()]; D = [int(x, 16) for x in m.group(4).split()]
+    if any(BASE <= x < BASE+NB for x in A): buckets.setdefault(cur, []).append(list(zip(A, D)))
+def score(sub):
+    mem = {}
+    for lz in sub:
+        for a, d in lz:
+            if BASE <= a < BASE+NB:
+                for b in range(4): mem[a+b] = (d >> (8*b)) & 0xFF
+    got = np.zeros(8192, dtype=np.uint16); cov = 0
+    for i in range(8192):
+        ad = BASE + 2*i
+        if ad in mem and ad+1 in mem: got[i] = mem[ad] | (mem[ad+1] << 8); cov += 1
+    gf = (got.astype(np.uint32).reshape(64, 128) << 16).view(np.float32)
+    return cov, 100*float(np.linalg.norm(gf-ef)/np.linalg.norm(ef))
+full = [k for k in sorted(buckets) if score(buckets[k])[0] == 8192]
+print(f"  {os.path.basename(sys.argv[1])}: complete O generations at marks {full}")
+for k in sorted(buckets):
+    c, r = score(buckets[k])
+    tag = "  <== tile %d finalize" % ((k-6)//7) if (k-6) % 7 == 0 and c == 8192 else ""
+    if c == 8192 or len(buckets[k]) > 100:
+        print(f"     after m[{k:3d}]  lines={len(buckets[k]):5d}  covered {c}/8192  Frobenius {r:8.4f}%{tag}")
