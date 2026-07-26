@@ -637,7 +637,16 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //           prefetch out of the PV stage costs nothing.  Whether it also fixes tile 1 is the open
 //           question; QOVL3's own rung is clean, so most likely it does not.
 //      x2   QOVL4 QKACC PKOVL SMTPR FZROW SMBMAX -- PARTIAL: tile-0 delta 62,306, tile 0 4.2516%.
-//      x3   QOVL4 QKACC PKOVL ITEM  FZROW         -- the item-parallel candidate
+//      x3   QOVL4 QKACC PKOVL ITEM  FZROW  -- *** MEASURED A CLEAR LOSS: tile-0 delta 75,521 vs
+//           62,306 for the thread-per-row version (x2), i.e. +13,215.  So FA_SP_ITEM is REFUTED as
+//           a performance idea, and the "a third of the machine is idle" argument for it is wrong
+//           in practice.  Why: thread-per-row does its row max and its exp pass as TWO SWEEPS OF
+//           ONE FUNCTION over a row the thread owns, whereas the item-parallel form has to split
+//           them into a cooperative fa_rowmax_s over all of S, a barrier, the item pass, another
+//           barrier, and fa_rowsum -- the same SMEM traffic, but with cross-lane reduction
+//           scaffolding (a fence per row) and two extra cross-warp barriers, and every item pays a
+//           fresh m_in[row] load and address computation instead of hoisting them per row.  Using
+//           more threads did not pay for that.  Kept OFF and documented. ***
 //      x2s / x3s  the same two at FA_NT6, for the converged steady-state timing
 //      dsc  QOVL3 QKACC PKOVL DUMPSC -- dumps the 128 E8M0 scale words per tile to 0x40051000 +
 //           512*t.  If the dumps are identical across tiles then SCALE_SMEM is fine and the damage
@@ -755,8 +764,8 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //                   accurate in its argument, so "subtract a bigger max, the block scale will undo
 //                   it" is FALSE.  FA_SP_SUBMAX_NOMARGIN keeps the 4:1 subsample and drops the
 //                   margin, which separates the two effects.
-//   FA_SP_ITEM      *** ITEM-PARALLEL exp pass -- the thread-per-row softmax leaves a THIRD of the
-//                   machine idle. ***  FA_SP_SMTPR gives one row to one thread, and there are 64
+//   FA_SP_ITEM      ITEM-PARALLEL exp pass.  MEASURED A LOSS (+13,215 cyc on tile 0) -- see (d2).
+//                   The idea was that the thread-per-row softmax leaves a THIRD of the machine idle;  FA_SP_SMTPR gives one row to one thread, and there are 64
 //                   rows but 96 threads, so warps 4 and 5 do nothing at all during the largest SIMT
 //                   stage of the kernel.  FA_SP_ITEM splits the work by (row, 32-element MX block)
 //                   instead -- 512 independent items over 96 threads -- as three phases behind one
@@ -1682,6 +1691,39 @@ static __attribute__((noinline)) void fa_finalize_flat(
 }
 
 // --------------------------------------------------------------------------------------------
+// DIAGNOSTIC HELPERS for FA_SP_DUMPS / FA_SP_DUMPL (see their use sites in the tile loop).
+// Both are all-threads, one output word per row, so they add ~64 SMEM loads per thread and do not
+// materially move the stage timings they are inserted between -- which matters, because the bug
+// they exist to localise is a timing window.
+// --------------------------------------------------------------------------------------------
+template <uint32_t SQ, uint32_t SK>
+static __attribute__((noinline)) void fa_dump_rowsum(const __shared uint32_t *A32,
+                                                     volatile uint32_t *out,
+                                                     uint32_t tid, uint32_t thr) {
+    constexpr uint32_t W = SK / 2;
+    for (uint32_t r = tid; r < SQ; r += thr) {
+        uint32_t x = 0;
+        for (uint32_t w = 0; w < W; w++) x ^= A32[r * W + w] + w;   // +w so a rotation is visible
+        out[r] = x;
+    }
+}
+template <uint32_t SQ, uint32_t D>
+static __attribute__((noinline)) void fa_dump_state(const __shared uint32_t *l32,
+                                                    const __shared uint32_t *m32,
+                                                    const __shared uint32_t *O32,
+                                                    volatile uint32_t *out,
+                                                    uint32_t tid, uint32_t thr) {
+    constexpr uint32_t DW = D / 2;
+    for (uint32_t r = tid; r < SQ; r += thr) {
+        out[r] = l32[r];
+        out[SQ + r] = m32[r];
+        uint32_t x = 0;
+        for (uint32_t w = 0; w < DW; w++) x ^= O32[r * DW + w] + w;
+        out[2 * SQ + r] = x;
+    }
+}
+
+// --------------------------------------------------------------------------------------------
 // FA_SP_PKOVL -- split requant so the (strictly serial) SF-SRAM pack hides underneath it.
 //
 // The E8M0 pack is the one phase that CANNOT be parallelised: GemminiTile.scala:188 puts a
@@ -2177,6 +2219,18 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     FAP_BAR(4);
 #endif
     MARK();   // s2: QK done
+#ifdef FA_SP_DUMPS
+    // DIAGNOSTIC (FA_SP_DUMPS): per-tile XOR checksum of every ROW of S, taken the instant S(t) is
+    // resident and before the softmax overwrites it in place.  Q, K, V and their MX scales are
+    // LOOP-INVARIANT in FA_SP, so S(t) MUST be bit-identical for every t; any row whose checksum
+    // moves between tiles indicts the QK matmul or (with FA_SP_QKACC) the accumulator->spad store,
+    // and rules the whole softmax/requant/PV/finalize chain OUT.  All threads, 64 rows, one word
+    // per row -> ~64 SMEM loads per thread, i.e. cheap enough not to move the stage timings much.
+    fa_dump_rowsum<FA_SQ, FA_SK>(reinterpret_cast<const __shared uint32_t *>(SM_S),
+                                 (volatile uint32_t *)(0x40053000u + t * 256u), tid, thr);
+    mu_fence_smem();
+    FAP_BAR(12);
+#endif
     // ---- S2: [SIMT] softmax (or FUSE pass 1 = row max)  ||  [agent] Q(t+1) prefetch ----
 #if defined(FA_SP_QOVL) && !defined(FA_SP_QOVL3) && !defined(FA_SP_QOVL4)
     if (warp == 0) {
@@ -2345,6 +2399,31 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     } else { asm volatile("nop"); }
     FAP_BAR(8);
     MARK();   // s6: PV done
+#ifdef FA_SP_DUMPL
+    // DIAGNOSTIC (FA_SP_DUMPL): dump, per tile, EVERYTHING finalize is about to consume --
+    //   [  0.. 63] the 64 raw words of LS_SMEM  (l; 32-bit-per-row under SMTPR/ITEM, packed
+    //              uint16 pairs under the cooperative online_softmax_block)
+    //   [ 64..127] the 64 raw words of M_SMEM   (m, same two layouts)
+    //   [128..191] a per-ROW XOR checksum of O_unnorm as it sits in SP_C after the PV matmul
+    // This is the discriminator the corruption analysis needs.  The observed damage is "a few LATE
+    // rows of two particular warps come out uniformly too SMALL", and a uniform per-row factor can
+    // only come from l (O = O_unnorm/l) or from O_unnorm itself -- so:
+    //   * l moves between tiles for exactly the bad rows        -> the SOFTMAX (or something racing
+    //                                                              its l/m stores) is at fault;
+    //   * l identical but the O_unnorm checksum moves           -> P8 / the E8M0 scales / the PV
+    //                                                              matmul is at fault;
+    //   * both identical across every tile                      -> the damage is inside FINALIZE
+    //                                                              itself (its SP_C reads or its
+    //                                                              GMEM stores), not upstream.
+    // Every value dumped is loop-invariant in exact arithmetic, so "identical across tiles" is the
+    // expected reading for a correct pipeline and any difference is a positive localisation.
+    fa_dump_state<FA_SQ, FA_D>(reinterpret_cast<const __shared uint32_t *>(LS_SMEM),
+                               reinterpret_cast<const __shared uint32_t *>(M_SMEM),
+                               reinterpret_cast<const __shared uint32_t *>(SM_S),
+                               (volatile uint32_t *)(0x40054000u + t * 1024u), tid, thr);
+    mu_fence_smem();
+    FAP_BAR(13);
+#endif
 #ifdef FA_SP_QKACC
     // ---- S6: [agent] QK(t+1) COMPUTE-ONLY -> ACC  ||  [warps1-5] finalize(t) -> GMEM ----
     // The mesh touches only its own spad read ports and the private accumulator, so it issues
