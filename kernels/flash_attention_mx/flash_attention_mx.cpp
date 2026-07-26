@@ -485,20 +485,41 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //         block (t = u11 - K8 < 8), and a row with several dead blocks is exactly "O too small by
 //         an arbitrary factor" -- so a corrupted per-(row,block) SCALE is the best-fitting cause,
 //         and the P data words themselves are probably fine.
-//     TWO CANDIDATE MECHANISMS, both of which put a writer inside stage S5 (the PV matmul):
+//     BISECTED OVER THE FEATURE LADDER (each row a 2-tile run, per-tile Frobenius, and the tile
+//     deltas so the cost of being correct is visible):
+//         configuration            deltas (t0, t1)   steady  util    per-tile Frobenius
+//         FA_SP alone              80,072  66,830    66,830  24.6%   t0 nan, t1 3.5666%
+//         + QOVL LEANCFG           77,370  65,047    65,047  25.2%   t0 3.5666% t1 3.5666%  CLEAN
+//         + QOVL3                  76,050  61,912    61,912  26.5%   t0 3.5666% t1 3.5666%  CLEAN
+//         + QKACC                  (IN FLIGHT: tag zD2, see "RUNS LEFT IN FLIGHT" below)
+//         + PKOVL                  67,707  48,234    46,478  35.3%   t0 3.5666%, t1+ BROKEN
+//     *** SO THE HONEST HEADLINE IS TWO NUMBERS, NOT ONE: the fastest configuration whose steady
+//     state is VERIFIED CORRECT on every tile it ran is 61,912 cyc/tile = 26.5% mesh utilisation,
+//     and the 46,478 / 35.3% configuration does not compute a correct O after tile 0.  QKACC and
+//     PKOVL together are worth 15.4k cycles per tile and at least one of them is what breaks it. ***
+//     (Both still clear the 20% target, which the pre-existing sequential kernel did not.)
+//     *** SO FA_SP_QOVL3 IS NOT THE CAUSE.  The Q-prefetch-under-the-PV-move-out theory below is
+//     REFUTED: the QOVL3 rung verifies on both tiles.  The cause is FA_SP_QKACC or FA_SP_PKOVL,
+//     which the two runs above discriminate. ***  Kept here because the reasoning was the basis for
+//     FA_SP_QOVL4, and because it is a good example of a mechanism that is entirely plausible on
+//     this hardware (Hazard 2 is real) and still not what is happening:
 //       (i)  Q(t+1)'s move-in DMA vs the PV matmul's accumulator->spad move-out, which needs an
 //            ATOMIC ALL-16-SUBBANK GRANT (Hazard 2).  O lands in SP_C = spad rows 3072..5120, which
 //            spans SMEM banks 1 AND 2; Q's DMA writes SP_Q = rows 5632..6144, ALSO in bank 2.
 //       (ii) Q(t+1)'s 64 SF-SRAM scale words (SF_A half 1) vs the mesh READING the packed P scales
-//            (SF_A half 0) for the same matmul.  Every write into the gemmini tile funnels through
-//            ONE FlitMergeNode that pair-merges consecutive 4-byte beats, so an interleaved writer
-//            can break the pairing -- and a broken pairing lands scale words in the wrong place,
-//            which is precisely the "corrupted per-(row,block) scale" signature above.
-//     FA_SP_QOVL4 removes BOTH: it moves the whole prefetch (DMA and scale words) out of stage S5
-//     into stage S6, where the mesh runs QK COMPUTE-ONLY into the accumulator -- no SMEM move-out,
-//     and nothing reading SF_A half 1 yet -- while the in-order ROCC queue still guarantees Q is
-//     resident before the QK that reads it.  Tile 0 is immune in the original either way because its
-//     Q is moved in by the PROLOGUE, with no matmul in flight.
+//            (SF_A half 0) for the same matmul, through the gemmini's single pair-merging
+//            FlitMergeNode.
+//     FA_SP_QOVL4 removes both anyway (it moves the whole prefetch into stage S6, where the mesh
+//     runs QK compute-only and performs no move-out, and the in-order ROCC queue still orders Q
+//     before the QK that reads it), so it is a safe placement -- it is just not the fix.
+//     THE TWO REMAINING SUSPECTS, and why each fits the "late rows of core 1's warps" signature:
+//       FA_SP_QKACC -- it is the flag that makes finalize(t) run CONCURRENTLY with mesh work, on
+//         warps 1-5 only, and the accumulator->spad store that follows it (stage S1 of tile t+1)
+//         writes S(t+1) over exactly the SP_C region finalize is reading.  A warp still finishing
+//         finalize when that store lands reads S(t+1) instead of O(t) -- and the rows it has left
+//         are its LAST rows, which is the observed pattern.
+//       FA_SP_PKOVL -- it is the flag that puts warp 0 in the SF-SRAM pack while warps 1-5 write P8
+//         in SMEM, i.e. a gemmini-tile writer running concurrently with SIMT SMEM traffic.
 //     IT IS A TIMING WINDOW, NOT A HARD ORDERING VIOLATION, and the evidence for that is that the
 //     tile at which corruption starts MOVES WITH THE STAGE TIMINGS: the cooperative-softmax build
 //     breaks at tile 1, the thread-per-row build survives tiles 0-1 and breaks at tile 2, and
@@ -600,6 +621,25 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //        per-lane 64-deep chains vs the cooperative version's shallower tree).  SMBMAX's block
 //        structure lets l be summed as a two-level tree instead, which is why SMBMAX is both faster
 //        AND slightly more accurate (4.2140%) than SMTPR alone.
+//
+// (d2) RUNS LEFT IN FLIGHT when this was written, and exactly how to read them.  Each is a 2-tile
+//      run; the ONLY question for each is whether tile 1's per-tile Frobenius matches tile 0's.
+//        python3 fa_pertile.py /tmp/yruns/<TAG>.out      # both tiles equal  => that flag is clean
+//      TAG  configuration (all on FULL_ATTN2 FA_SP FA_SP_QOVL FA_SP_LEANCFG, + what is listed)
+//      zD2  QOVL3 QKACC          -- isolates FA_SP_QKACC .  If tile 1 breaks, QKACC is the culprit
+//      zE2  QOVL3 PKOVL          -- isolates FA_SP_PKOVL .  If tile 1 breaks, PKOVL is the culprit
+//      x7   QOVL3 QKACC PKOVL SLOWPAD -- the broken config with VOLATILE barrier pads.  If this is
+//           clean, the hazard is a barrier-release timing window, not a structural ordering bug,
+//           and the cheap fix is a longer pad rather than a redesign.
+//      x1   QOVL4 QKACC PKOVL          -- does the (safer) QOVL4 placement help anyway?
+//      x2   QOVL4 QKACC PKOVL SMTPR FZROW SMBMAX  -- the fastest candidate, correctness check
+//      x3   QOVL4 QKACC PKOVL ITEM  FZROW         -- the item-parallel candidate
+//      x2s / x3s  the same two at FA_NT6, for the converged steady-state timing
+//      dsc  QOVL3 QKACC PKOVL DUMPSC -- dumps the 128 E8M0 scale words per tile to 0x40051000 +
+//           512*t.  If the dumps are identical across tiles then SCALE_SMEM is fine and the damage
+//           is in the pack into the gemmini SF-SRAM or the mesh's read of it; if they already
+//           differ, the requant (or something racing it) is at fault.  This is the diagnostic that
+//           localises the corruption to a specific producer, and it is worth running first.
 //
 // (e) WHAT IS LEFT, in descending value.  The stage costs to beat (steady tile, SMTPR+SMBMAX):
 //        accumulator->S 998 | softmax ~12,4xx | (pass A gone) | requant convert + SF pack ~10,5xx
@@ -2092,6 +2132,19 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     // ---- S1: [agent] drain QK(t) (already computed into the ACC under finalize(t-1)) and
     // ---- move the accumulator out to S(t)@SM_S.  SIMT is quiesced here (post-barrier), which
     // ---- is what the accmem->spad writer needs for its atomic 16-subbank grant.
+#ifdef FA_SP_ACCSYNC
+    // FA_SP_ACCSYNC: a SECOND fence+barrier before the accumulator->spad store.
+    // The store writes S(t) over SP_C, which is exactly the region finalize(t-1) was READING in the
+    // previous stage.  FAP_BAR(9) already separates them, but the corrupted rows are precisely the
+    // LAST rows of particular warps, which is what "a warp's SP_C reads had not all retired when the
+    // store landed" looks like -- one barrier orders the ISSUE of those reads, not necessarily their
+    // completion under a deep SMEM queue.  This makes the separation explicit so the hypothesis can
+    // be tested for the price of ~3 cycles.
+    mu_fence_smem();
+    FAP_PAD();
+    mu_barrier(15, wpb);
+    FAP_PAD();
+#endif
     if (warp == 0) {
         fa_gf(tid);                                   // mesh drained -> ACC holds S(t)
         fa_store_acc<QKF>(SP_C, tid);
@@ -2208,6 +2261,26 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     mu_fence_smem();
     FAP_BAR(7);
     MARK();   // s5: pack done
+#endif
+#ifdef FA_SP_DUMPSC
+    // DIAGNOSTIC (FA_SP_DUMPSC): dump the 128 per-(row,block) E8M0 scale words to a GMEM page, one
+    // 512-byte slot per tile, right before the PV matmul reads them.  The steady-state corruption
+    // looks like a corrupted per-(row,block) scale, and this says WHERE it is corrupted: if these
+    // dumps are identical across tiles then SCALE_SMEM is fine and the damage is in the pack into
+    // the gemmini's SF-SRAM (or in the mesh's read of it); if they already differ, the requant --
+    // or whatever raced with it -- is the culprit.  Lands at 0x40051000, which the trace filter
+    // already keeps and which no other diagnostic uses.
+    if (tid == 0) {
+        volatile uint32_t *dsc = (volatile uint32_t *)(0x40051000u + t * 512u);
+        const __shared uint32_t *src = reinterpret_cast<const __shared uint32_t *>(SCALE_SMEM);
+        for (uint32_t i = 0; i < (FA_SQ * (FA_SK / 32)) / 4u; i++) {
+            uint32_t w = 0;
+            for (uint32_t k = 0; k < 4; k++) w |= (src[i * 4 + k] & 0xffu) << (8u * k);
+            dsc[i] = w;
+        }
+    }
+    mu_fence_smem();
+    FAP_BAR(14);
 #endif
     // ---- S5: [agent] PV matmul: O = P@V -> C dest (mesh 8,210) -------------------------
     if (warp == 0) {
