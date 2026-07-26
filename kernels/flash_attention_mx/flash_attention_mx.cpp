@@ -491,23 +491,34 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //         FA_SP alone              80,072  66,830    66,830  24.6%   t0 nan, t1 3.5666%
 //         + QOVL LEANCFG           77,370  65,047    65,047  25.2%   t0 3.5666% t1 3.5666%  CLEAN
 //         + QOVL3                  76,050  61,912    61,912  26.5%   t0 3.5666% t1 3.5666%  CLEAN
-//         + QKACC                  (IN FLIGHT: tag zD2, see "RUNS LEFT IN FLIGHT" below)
+//         + QKACC                  (in flight: tag zD2 -- no longer load-bearing, see below)
 //         + PKOVL                  67,707  48,234    46,478  35.3%   t0 3.5666%, t1+ BROKEN
-//     *** THE HONEST HEADLINE, UPDATED once QOVL4 + SMBMAX was measured:
-//       best VERIFIED on every tile it ran   46,016 cyc/tile = 35.68% mesh   (tag x2: QOVL4 QKACC
-//           PKOVL SMTPR FZROW SMBMAX, tiles 0 and 1 both 4.2516%) -- FASTER than the original
-//           46,478 configuration and correct, though 2 tiles is evidence not proof (see x2s);
-//       best verified with the REFERENCE numerics (3.5666%)  61,912 cyc/tile = 26.5% mesh
-//           (QOVL3, both tiles) -- this is the conservative number;
-//       the published 46,478 / 35.3% configuration does NOT compute a correct O after tile 0.
-//     QKACC and PKOVL together are worth 15.4k cycles/tile and at least one of them is what breaks
-//     the reference-numerics build; adding SMTPR+SMBMAX on top of QOVL4 apparently avoids the
-//     window. ***  (Every number here clears the 20% target; the sequential kernel is 13.8%.)
-//     *** SO FA_SP_QOVL3 IS NOT THE CAUSE.  The Q-prefetch-under-the-PV-move-out theory below is
-//     REFUTED: the QOVL3 rung verifies on both tiles.  The cause is FA_SP_QKACC or FA_SP_PKOVL,
-//     which the two runs above discriminate. ***  Kept here because the reasoning was the basis for
-//     FA_SP_QOVL4, and because it is a good example of a mechanism that is entirely plausible on
-//     this hardware (Hazard 2 is real) and still not what is happening:
+//     AND WITH THE FIX (FA_SP_QOVL4 instead of FA_SP_QOVL3):
+//         QOVL4 QKACC PKOVL        67,304  50,934    50,934  32.24%  both tiles 3.5666%  CLEAN
+//         ... + SMTPR FZROW SMBMAX 62,306  46,016    46,016  35.68%  both tiles 4.2516%  CLEAN
+//     *** THE HEADLINE, after the fix:
+//       REFERENCE NUMERICS, verified          50,934 cyc/tile = 32.24% mesh, both tiles 3.5666%
+//           (FA_SP + QOVL + QOVL4 + LEANCFG + QKACC + PKOVL)   <== the number to quote
+//       FASTEST verified                      46,016 cyc/tile = 35.68% mesh, both tiles 4.2516%
+//           (... + SMTPR + FZROW + SMBMAX; 4.2516% is the thread-per-row softmax's l rounding)
+//       the pre-existing published figure      46,478 / 35.33%  -- NOT correct after tile 0
+//       the sequential kernel it started from  118,673 single-shot = 13.84%
+//     So the sprint's 20% target is cleared by 1.6x at the reference numerics and 1.8x at the
+//     faster numerics, with per-tile verification in both cases.  Caveat kept in view: this
+//     corruption is TIMING-dependent and one earlier variant only broke at TILE 2, so two clean
+//     tiles is strong evidence, not proof -- x1s/x2s at FA_NT6 are the runs that settle it. ***
+//     *** RESOLVED, AND IT IS AN INTERACTION -- neither "QOVL3 is the cause" nor "QOVL3 is not the
+//     cause" was right.  The three measurements that pin it down:
+//         QOVL3                      (no QKACC, no PKOVL)   both tiles 3.5666%   CLEAN
+//         QOVL3 + QKACC + PKOVL                             t0 ok, t1+ BROKEN
+//         QOVL4 + QKACC + PKOVL                             both tiles 3.5666%   CLEAN
+//     So the Q(t+1) prefetch sitting inside the PV stage IS the mechanism, but it is only EXPOSED
+//     once QKACC and PKOVL add their concurrency (QKACC makes finalize run alongside mesh work on
+//     warps 1-5; PKOVL puts warp 0 in the SF-SRAM pack alongside the SIMT convert).  QOVL3 on its
+//     own never hits the window.  That is why bisecting one flag at a time was misleading in both
+//     directions, and it is why FA_SP_QOVL4 -- which moves the prefetch to the stage where the mesh
+//     performs no SMEM move-out at all -- FIXES IT: 50,934 cyc/tile with both tiles at the reference
+//     3.5666%. ***  The two candidate mechanisms, either of which fits: 
 //       (i)  Q(t+1)'s move-in DMA vs the PV matmul's accumulator->spad move-out, which needs an
 //            ATOMIC ALL-16-SUBBANK GRANT (Hazard 2).  O lands in SP_C = spad rows 3072..5120, which
 //            spans SMEM banks 1 AND 2; Q's DMA writes SP_Q = rows 5632..6144, ALSO in bank 2.
