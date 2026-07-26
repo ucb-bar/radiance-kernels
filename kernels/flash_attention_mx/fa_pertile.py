@@ -13,6 +13,11 @@ Re-scoring this kernel's verdicts with it changed two things and confirmed the r
   * the corruption is confined to CLUSTER 0 (cluster 1 is correct on every tile), not to "the warps
     on core 1" as the mark-bucketed data suggested;
   * its magnitude is 107-111% (garbage), not the 31-61% the mixed buckets showed.
+AND IT FAILS IN THE DANGEROUS DIRECTION TOO -- it does not merely add noise, it can report a
+FALSE PASS.  On the identical trace (tag zD2, FA_SP_QOVL3 + FA_SP_QKACC, complete and stable) this
+tool reports "3.5666% | 3.5666%", i.e. both tiles perfect, while fa_verify_tiles.py reports
+cluster 0 tile 1 at 85.1674% WRONG (3 of 4 images).  The mixing hides a broken cluster behind a
+correct one.  Never accept a CLEAN verdict from this tool.
 Kept only so the earlier numbers in the git history can be traced to their source.
 
 Verify EACH TILE'S O separately, by bucketing the O stores between MARK stamps.

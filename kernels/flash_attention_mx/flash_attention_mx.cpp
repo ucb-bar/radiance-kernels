@@ -564,6 +564,10 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //       * the corruption is confined to CLUSTER 0 -- cluster 1 is correct on every tile -- not to
 //         "the late rows of the warps on core 1", which is what the mixed buckets suggested;
 //       * its magnitude is 107-111% (garbage), not 31-61%.
+//     AND IT CAN REPORT A FALSE PASS, which is the failure direction that actually costs you: on the
+//     identical complete trace for QOVL3+QKACC, fa_pertile.py says "3.5666% | 3.5666%" (both tiles
+//     perfect) while fa_verify_tiles.py says cluster 0 tile 1 is 85.1674% WRONG.  A correct cluster
+//     masks a broken one.  NEVER accept a clean verdict from the mark-bucketing tool.
 //     Re-scored verdicts (tile-images; 3.5666% == correct).  Every one of these is per cluster:
 //       config (all + FA_SP QOVL LEANCFG)   steady    util    tile-images
 //       published QOVL3 QKACC PKOVL         46,478    35.3%   5 of 8: cluster 0 tiles 1,2,3 are
