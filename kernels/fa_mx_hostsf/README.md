@@ -52,6 +52,27 @@ This distinction is not academic — re-scoring earlier runs that had all report
 | hsg4 | 3.5666%      | **6/8** — worst 5.50% |
 | hsi4 | 3.5666%      | **6/8** — cluster 1 tiles 1 and 3 at 3.88% / 3.98% |
 
+### Why not `kernels/flash_attention_mx/fa_pertile.py`
+
+That tool buckets O stores by the most recent MARK index and **does not separate the two clusters**
+(`grep clid fa_pertile.py` finds nothing).  Both clusters write MARKs and both write the same O
+addresses, interleaved in one trace, so cluster 1's MARK store advances the bucket cursor while
+cluster 0 is still mid-`finalize_O`.  Every bucket therefore mixes clusters and generations.
+
+Run on `st0` — the **unmodified baseline**, whose whole-file verify is 8192/8192 at 3.5666% and whose
+per-tile verify here is 8/8 images at exactly 4096/4096 words each — it reports:
+
+    after m[10] covered 6176/8192 Frobenius 51.91%     after m[12] covered 2272/8192  85.28%
+    after m[21] covered 5344/8192           59.37%     after m[23] covered 3456/8192  76.12%
+    after m[32] covered 5536/8192           57.63%     after m[34] covered 3520/8192  75.47%
+    after m[43] covered 5760/8192           55.53%     after m[44] covered 2880/8192  80.45%
+
+i.e. it calls a known-good baseline 52-85% wrong.  `fa_verify_tiles.py` is self-validating instead:
+grouping by cluster and then by address-repeat yields **exactly** 4096 words per image, and the 8
+images account for exactly the 32,768 store words the whole-file verify sees.  If the grouping were
+wrong that accounting could not close.  Any "steady-state correctness bug" diagnosed with the
+mark-bucketing tool should be re-scored before it is believed.
+
 ## The scale-SRAM hazard that bounds this whole approach
 
 The gemmini scale SRAM only accepts 8-byte writes (`GemminiTile.scala:286` asserts `size == 3`),
