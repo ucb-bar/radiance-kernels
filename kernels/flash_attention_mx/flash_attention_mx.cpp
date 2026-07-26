@@ -724,8 +724,12 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //      x3s  the FA_SP_ITEM variant at FA_NT6         -- PARTIAL: 74,056 / 60,750, i.e. it confirms
 //           at NT6 that FA_SP_ITEM is a large loss.
 //      dsc  QOVL3 QKACC PKOVL DUMPSC -- *** RESULT: 4 of 4 tile-images CORRECT, i.e. the diagnostic
-//           PERTURBS THE HAZARD AWAY.  It cannot be used to localise this bug; it is evidence that
-//           the bug is a timing window. ***  Dumps the 128 E8M0 scale words per tile to 0x40051000 +
+//           PERTURBS THE HAZARD AWAY.  It cannot be used to localise this bug; it is instead the
+//           evidence that the bug is a timing window.  The dump itself is SOUND -- on that clean run
+//           tile 0's and tile 1's 128 scale words are bit-identical (128/128, zero differing words),
+//           which is exactly what must be true when every tile recomputes the same tile.  So the
+//           probe works and would be conclusive; it just cannot coexist with the hazard. ***
+//           Dumps the 128 E8M0 scale words per tile to 0x40051000 +
 //           512*t.  If the dumps are identical across tiles then SCALE_SMEM is fine and the damage
 //           is in the pack into the gemmini SF-SRAM or the mesh's read of it; if they already
 //           differ, the requant (or something racing it) is at fault.  This is the diagnostic that
