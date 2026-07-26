@@ -632,7 +632,11 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //           clean, the hazard is a barrier-release timing window, not a structural ordering bug,
 //           and the cheap fix is a longer pad rather than a redesign.
 //      x1   QOVL4 QKACC PKOVL          -- does the (safer) QOVL4 placement help anyway?
-//      x2   QOVL4 QKACC PKOVL SMTPR FZROW SMBMAX  -- the fastest candidate, correctness check
+//           PARTIAL RESULT: tile-0 delta 67,304 vs QOVL3's 67,707, and tile 0 verifies at 3.5666%.
+//           So FA_SP_QOVL4 is very slightly FASTER than FA_SP_QOVL3, not slower -- moving the
+//           prefetch out of the PV stage costs nothing.  Whether it also fixes tile 1 is the open
+//           question; QOVL3's own rung is clean, so most likely it does not.
+//      x2   QOVL4 QKACC PKOVL SMTPR FZROW SMBMAX -- PARTIAL: tile-0 delta 62,306, tile 0 4.2516%.
 //      x3   QOVL4 QKACC PKOVL ITEM  FZROW         -- the item-parallel candidate
 //      x2s / x3s  the same two at FA_NT6, for the converged steady-state timing
 //      dsc  QOVL3 QKACC PKOVL DUMPSC -- dumps the 128 E8M0 scale words per tile to 0x40051000 +
@@ -1077,7 +1081,16 @@ static __attribute__((noinline)) void fa_softmax_tpr(
         // the word index within the 16-word block keeps all 16 subbanks busy and still covers the
         // block exactly.  Block order does not matter (each block's scale is independent).
         //
-        // NUMERICS BONUS, and it is not a bonus, it is a fix.  Blocking the sweep also lets `l` be
+        // NUMERICS: MEASURED, AND MY PREDICTION WAS WRONG -- the two-level tree did NOT help.
+        // Blocking the sweep lets `l` be summed as a two-level tree instead of four 64-deep chains
+        // (max accumulation depth ~18 instead of ~66), and since bf16 has an 8-bit mantissa I
+        // expected that to recover some of the accuracy the thread-per-row softmax gives up.  It
+        // did not: tile-0 Frobenius is 4.2516% WITH the tree and 4.2140% with the flat row sum, i.e.
+        // very slightly WORSE.  Both are the same MX-FP8 quantisation floor to within noise, so the
+        // tree is kept (it is free, and shallower accumulation is the defensible default), but the
+        // claim that depth was the dominant error term here is NOT supported -- the 3.5666% vs
+        // 4.2xxx% gap between the cooperative and thread-per-row softmax is something else.
+        // Blocking the sweep also lets `l` be
         // summed as a TWO-LEVEL TREE instead of four 64-deep chains: 32 values per block over 4
         // chains (depth 8) + a 2-deep combine, then 8 block sums (depth 8) -- max depth ~18 instead
         // of ~66.  bf16 has an 8-bit mantissa, so accumulation depth is the dominant error term for
