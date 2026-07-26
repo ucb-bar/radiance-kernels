@@ -172,6 +172,12 @@ static uint32_t g_host_sf_asel = 0;
 // safe in both directions).  Values are "number of tiles completed", i.e. 1-based.
 #define FA_MBOX_GPU_QKDONE 0x20u
 #define FA_MBOX_GPU_PVDONE 0x30u
+// -DFA_HOSTPACK: the host, not the GPU, packs the runtime P scales into SF_MEM_A, so that the GPU
+// is not an SF requestor at all and the host's 8-byte stores never share FlitMergeNode's pairing
+// state with a 4-byte GPU store.  See the long comment in host.cpp.  The GPU must additionally be
+// built -DFA_NOPACK (which compiles out pack_scales_to_sfmem at its call site in the kernel body).
+#define FA_MBOX_GPU_PACKREQ 0x50u  // GPU -> host: #tiles whose requant is done
+#define FA_MBOX_HOST_PACKED 0x60u  // host -> GPU: #tiles whose P scales are resident in SF_MEM_A
 // Diagnostics the host publishes for the GPU to echo out (see FA_HOST_TIMING echo below).
 #define FA_MBOX_DIAG       0x80u   // 0x80..0xbf
 // cycle stamp -> FA_DIAG_HSMARK+off (0x88/0x8c = QK scale wait, 0x90/0x94 = V scale wait).
@@ -197,6 +203,9 @@ static uint32_t g_fa_spin_qk = 0, g_fa_spin_v = 0;   // accumulated stall waitin
 
 #if defined(FA_HOSTCFG) && !defined(FA_HOSTHS)
 #error "FA_HOSTCFG needs FA_HOSTHS: the replay is gated on the per-tile QKDONE/PVDONE handshake"
+#endif
+#if defined(FA_HOSTPACK) && !defined(FA_HOSTHS)
+#error "FA_HOSTPACK needs FA_HOSTHS (per-tile mailbox handshake) -- and the kernel body must be built -DFA_NOPACK"
 #endif
 #ifdef FA_HOSTCFG
 // ============================================================================================
@@ -935,7 +944,11 @@ __attribute__((noinline)) void mxgemm_prefetch_tile(
         // ...and the QK (!SKIP_A) ACTIVATION scales into activation buffer 1, leaving activation
         // buffer 0 to the GPU's runtime P scales (pack_scales_to_sfmem -> GEMMINI_SF_MEM_A).
         // Without this the two collide across FA_STEADY iterations (see g_host_sf_asel comment).
+#ifdef FA_HOST_ASEL0
+        asel = 0u;                      // DIAGNOSTIC: see FA_HOST_ASEL0 in host.cpp
+#else
         asel = SKIP_A ? 0u : 1u;
+#endif
         g_host_sf_wsel = wsel;
         g_host_sf_asel = asel;
         // NOTE: the GPU must NOT clear the mailbox flags here. It was tried and it deadlocks:
@@ -1187,6 +1200,46 @@ __attribute__((noinline)) void mxgemm_compute_tile(const uint32_t tid_in_threadb
     asel = g_host_sf_asel;
 #endif
     CPROF(wsel ? 0x20 : 0x28);   // compute entry
+#if defined(FA_HOSTPACK) && defined(FA_HOSTHS)
+    // ---- hand the runtime P scales to the host (-DFA_HOSTPACK) --------------------------------
+    // Reached at the top of the PV gemm (wsel == 1), i.e. after requant has filled SCALE_SMEM and
+    // instead of the GPU's own pack_scales_to_sfmem (compiled out by -DFA_NOPACK).  Strictly serial
+    // by design: the GPU publishes the request and blocks, so it is provably not touching the
+    // gemmini tile while the host drives the scale SRAM.  Bounded so a mis-built image fails
+    // visibly rather than hanging the simulation.
+    if (wsel == 1u) {
+        volatile __shared uint32_t *mbox =
+            reinterpret_cast<volatile __shared uint32_t *>(FA_HOST_MBOX);
+        mbox[FA_MBOX_GPU_PACKREQ / 4] = g_fa_tile + 1u;
+        mu_fence_smem();
+        const uint32_t need = g_fa_tile + 1u;
+        for (uint32_t spin = 0; spin < 400000u; spin++) {
+            if (mbox[FA_MBOX_HOST_PACKED / 4] >= need) break;
+        }
+    }
+#endif
+#if defined(FA_NS_SETTLE) || defined(FA_NS_PAD)
+    // ---- FENCE-TOO-EARLY GUARD (-DFA_NS_SETTLE / -DFA_NS_PAD) ---------------------------------
+    // gemmini_fence() is `while (load32_shared(GEMMINI_BUSY_ADDR) != 0) nop;`
+    // (lib/include/mxgemmini_mmio.h:74-78) -- it drains only what is ALREADY visible as busy.  The
+    // operand move-in was pushed into the command port a handful of cycles earlier, so if `busy`
+    // has not risen yet the first poll reads 0 and the fence returns having drained NOTHING; the
+    // mesh then multiplies a partially loaded operand tile.  A cold tile hides this (the
+    // icache-cold prefetch is slow enough that busy is up by fence time), which is why it shows up
+    // only in the STEADY state -- and only once -DFA_NOSCALES removes the 12.6k-cycle
+    // load_scale_factors that used to sit between the move-in issue and this fence.
+    //   FA_NS_SETTLE: bounded wait for busy to ASSERT, then the normal drain (~16 MMIO polls).
+    //   FA_NS_PAD:    a blunt fixed spin instead, purely to confirm the diagnosis.
+    {
+#ifdef FA_NS_PAD
+        for (uint32_t i = 0; i < 3000u; i++) asm volatile("nop");
+#else
+        for (uint32_t i = 0; i < 16u; i++) {
+            if (load32_shared(GEMMINI_BUSY_ADDR) != 0) break;
+        }
+#endif
+    }
+#endif
     if constexpr (FM == FenceMode::READY) gemmini_fence_ready();
     else if constexpr (FM == FenceMode::BUSY) gemmini_fence();
     CPROF(wsel ? 0x21 : 0x29);   // after LEADING drain (waits for the move-in DMA)

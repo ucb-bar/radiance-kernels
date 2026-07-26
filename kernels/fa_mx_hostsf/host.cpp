@@ -103,6 +103,8 @@
 #define MBOX_V_READY      0x10
 #define MBOX_GPU_QKDONE   0x20   // GPU -> host: #tiles whose QK matmul has drained
 #define MBOX_GPU_PVDONE   0x30   // GPU -> host: #tiles whose PV matmul has drained
+#define MBOX_GPU_PACKREQ  0x50   // GPU -> host: #tiles whose requant is done (-DFA_HOSTPACK)
+#define MBOX_HOST_PACKED  0x60   // host -> GPU: #tiles whose P scales are in SF_MEM_A
 #define MBOX_STAMPS       0x80   // diagnostic block, echoed to MARK_GMEM+0x300 by the GPU
 #define FA_HOST_MAGIC     0x5CA1E5u
 
@@ -194,10 +196,21 @@ static inline uint64_t rdcycle(void) {
 // so the safe window is [tile t-1's PV matmul drained .. tile t's PACK], which the GPU signals by
 // publishing MBOX_GPU_PVDONE >= t.  That window contains softmax+requant (~40k cycles of slack);
 // the act write itself is 2 x 256 B = 64 `sd` ~= 1.3k cycles.  See the refill loop in main().
+// -DFA_HOST_ASEL0 (DIAGNOSTIC): put the Q scales in activation half **0** and have QK read half 0
+// (mxgemm_core.hpp matches on the same define), i.e. the pre-split arrangement where the GPU's
+// pack_scales_to_sfmem overwrites them with the softmax P scales every tile.  Under FA_STEADY every
+// tile is identical, so "tile t's QK multiplied Q by tile t-1's P scales" is a FIXED wrong answer --
+// which makes its Frobenius value a fingerprint.  Build this to find out whether a mystery
+// steady-state failure is that specific bug or something else.  Never build a result with it.
+#ifdef FA_HOST_ASEL0
+#define QK_A_HALF_OFFSET 0ull
+#else
+#define QK_A_HALF_OFFSET SF_BUFFER_OFFSET
+#endif
 static inline void write_qk_a_scales(void) {   // ACT port  -- hazard above, PVDONE-gated
   for (int cl = 0; cl < NUM_CLUSTERS; cl++)
     // QK activation (Q) scales -> activation half 1; the GPU owns half 0 for the P scales.
-    sf_write(SF_MEM_A(cl) + SF_BUFFER_OFFSET, &QK_A_scales_row[0][0], QK_A_SCALE_BYTES);
+    sf_write(SF_MEM_A(cl) + QK_A_HALF_OFFSET, &QK_A_scales_row[0][0], QK_A_SCALE_BYTES);
 }
 static inline void write_qk_b_scales(void) {   // WEIGHT port -- host-private under FA_NOSCALES
   for (int cl = 0; cl < NUM_CLUSTERS; cl++)
@@ -213,8 +226,53 @@ static inline void write_v_scales(void) {
 // Read a GPU->host progress word out of cluster SMEM.  8-byte load to mirror the write path (the
 // cluster SMEM slave is word-strided behind a min-8B fragmenter; a 4B host access is the one that
 // was measured to be silently dropped on the write side).
+//
+// *** WHAT THE FSDB ACTUALLY SHOWS (2026-07-26) -- read this before changing the access width. ***
+// Waveform of the failing run (`FA_NOSCALES FA_HOSTHS FA_HOSTCFG`, assertion at 179,473,000 ps,
+// captured with hs_fsdb.sh), on the monitored host->cluster edge
+// element_reset_domain_element.xbar_3.auto_anon_in_*:
+//   * a_bits_size is 3 for every request on this edge -- the host is the only master here.
+//   * the host's 8-byte Gets of cluster SMEM are answered CORRECTLY (opcode 1 AccessAckData,
+//     d_bits_size 3) 165+ times in a row while it polls the mailbox every ~184 cycles.
+//   * then ONE response comes back opcode 1 with d_bits_size = 2 (four bytes) and the monitor
+//     kills the run.  It arrives already-wrong on auto_anon_out_0_d_bits_size, i.e. it is produced
+//     downstream on the clcbus leg, not by the xbar.
+//   * the GPU had already wedged 93k cycles earlier (last MARK 85,859, and the FSDB stops growing
+//     there -- the design is genuinely frozen, not merely slow).
+// So the width of the host's reads is NOT the bug: the same 8-byte Get works hundreds of times.
+// The bug is that the GPU wedges first, with a 4-byte SF write pair stuck in FlitMergeNode
+// (GemminiTile.scala:186-189).  A stuck non-last merge beat leaves the node's early-acknowledge
+// path (`in.d.valid := out.d.valid || (shouldMerge && in.a.valid && !isLastReq)`, with
+// `in.d.bits.size := log2Ceil(from)` == 2, FlitMergeNode.scala:88-100) permanently asserted, and
+// that size-2 beat is what lands on the host's outstanding 8-byte read.  The assertion is the
+// SYMPTOM; the deadlock of the GPU's scale-SRAM write against host traffic on the shared port is
+// the cause.  Narrowing the host's reads to 4 bytes only makes A size match the bogus D size, so
+// the run HANGS instead of failing loudly -- strictly worse.  Hence 8-byte reads stay the default
+// (-DFA_HOST_RD4 exists only to demonstrate that masking).  The real fix is -DFA_HOSTPACK: take
+// the GPU off the scale-SRAM port entirely.
+//
+// *** THE `fence` IS ALSO LOAD-BEARING. ***  Rocket retires stores into its store buffer
+// and does NOT wait for the TL response, but it blocks on an uncached load.  So without this fence
+// a host `sd` into the cluster can still be in flight when the next host `ld` into the cluster is
+// issued, and the two share the host->cluster control path
+//     extReqXbar -> TLSourceShrinker(controlInFlights) -> TLFragmenter(8, 128, alwaysMin) -> clcbus
+// (RadianceCluster.scala:109-112) whose source-id remapping and beat accounting are what decide
+// the size the response is reported with.  Overlap them and a response comes back with the wrong
+// size, which kills the run at the extReqXbar monitor:
+//     "'D' channel contains improper response size" (RadianceCluster.scala:112) + a hung store.
+// EVIDENCE: every configuration that reads the mailbox at all (FA_HOSTHS, FA_HOSTCFG) has hit that
+// assertion in some build -- `FA_NOSCALES FA_HOSTHS` deterministically at 330,243,000 ps on two
+// images x two seeds, and `+FA_HOSTCFG` at 179,473,000 ps -- while every read-free build
+// (FA_NOSCALES alone, which only ever stores) has never once hit it in ~20 runs.  A store-to-load
+// fence is the difference between those two groups, and it costs a couple of cycles on a path that
+// is already 20 cycles per access.
 static inline uint32_t mbox_get(unsigned cl, unsigned off) {
+  asm volatile("fence" ::: "memory");
+#ifdef FA_HOST_RD4
+  return *(volatile uint32_t *)(HOST_MBOX(cl) + off);   // masks the assertion into a hang -- see above
+#else
   return (uint32_t)*(volatile uint64_t *)(HOST_MBOX(cl) + off);
+#endif
 }
 
 // Diagnostics the GPU echoes to MARK_GMEM+0x300 (mxgemm_core.hpp, -DFA_HOST_TIMING).
@@ -250,6 +308,70 @@ static void host_mmio_probe(void) {
   g_diag[13] = (uint32_t)sum;
 }
 
+#ifdef FA_HOSTPACK
+// ============================================================================================
+// HOST-PACKED RUNTIME P SCALES  (-DFA_HOSTPACK; needs FA_HOSTHS, and the GPU must be built
+// -DFA_NOPACK so pack_scales_to_sfmem is compiled out)
+// ============================================================================================
+// This is NOT primarily a performance item -- it is what makes a PER-TILE host scale refill
+// structurally legal on this RTL.  The scale SRAM sits behind FlitMergeNode(from=4, to=8)
+// (GemminiTile.scala:186-189) because the write manager only accepts size==3 requests
+// (GemminiTile.scala:286) while an RV32 Muon lane can only emit 4-byte stores (store64_shared in
+// lib/include/mu_intrinsics.h:27-32 is literally two 4-byte stores).  So the merge node pairs the
+// GPU's 4-byte writes, and its pairing state -- the beat counter, the merged-request register, and
+// the per-source `wasMerged` bit that decides the size a response is reported with
+// (FlitMergeNode.scala:33-100) -- is GLOBAL to the port and shared with the host, whose 8-byte
+// stores take the non-merging path.  Mixing the two requestors is what kills runs (see the
+// FA_HOSTHS schedule comment).  Remove the GPU as an SF requestor entirely and every request into
+// that node is an 8-byte host store that never merges, so there is no shared state left to corrupt.
+//
+// The pack itself is trivial: requant leaves 512 E8M0 scales in SCALE_SMEM as one scale per 32-bit
+// word (flash_mx_impl.hpp:1074-1082), and SF_MEM_A wants them as 128 contiguous words, 4 scales per
+// word, low byte first.  Both clusters run the same tile redundantly, so ONE cluster's SCALE_SMEM
+// is read and the result is written to both.
+//   read  : 256 8-byte loads  of cluster-0 SMEM   (~20.2 cyc each, measured -> ~5.2k)
+//   write : 2 x 64 8-byte stores into SF_MEM_A     (~15 cyc each     -> ~1.9k)
+// against the GPU's measured 8,234 cyc for pack+bar3, so it is roughly break-even on the critical
+// path -- the point is legality, not speed.  Report it as such.
+// SCALE_SMEM_HOST is defined above with the MMIO probe.
+#define P_SCALE_WORDS       128                              // (FA_SK/32)*FA_SQ / 4 = 512/4
+
+static void host_pack_p_scales(void) {
+  static uint32_t buf[P_SCALE_WORDS];
+  asm volatile("fence" ::: "memory");     // no host store in flight before these loads
+  // 512 scale words in (one E8M0 byte in the low byte of each), 128 packed words out, 4 per word.
+  // 8-byte loads: two source words per load, which halves the number of host accesses.
+  const volatile uint64_t *src = (const volatile uint64_t *)SCALE_SMEM_HOST(0);
+  for (unsigned w = 0; w < P_SCALE_WORDS; w++) {
+    const uint64_t a = src[2u * w + 0u];      // scale words 4w+0 (low half), 4w+1 (high half)
+    const uint64_t b = src[2u * w + 1u];      // scale words 4w+2, 4w+3
+    buf[w] = ((uint32_t)(a & 0xffu))
+           | ((uint32_t)((a >> 32) & 0xffu) << 8)
+           | ((uint32_t)(b & 0xffu) << 16)
+           | ((uint32_t)((b >> 32) & 0xffu) << 24);
+  }
+  for (int cl = 0; cl < NUM_CLUSTERS; cl++)
+    sf_write(SF_MEM_A(cl), buf, 4u * P_SCALE_WORDS);   // ACT half 0 -- exactly where pack wrote
+}
+
+// Wait for the GPU to say "tile `seq-1`'s requant is done, SCALE_SMEM is valid", pack, and answer.
+// The GPU publishes the request at the top of its PV mxgemm_compute_tile and blocks on the reply,
+// so this is strictly serial with the GPU by construction -- there is nothing to overlap.
+static void host_service_pack(uint32_t seq, uint64_t wait_limit, uint64_t *wait_cycles,
+                             uint32_t *timeouts) {
+  const uint64_t t0 = rdcycle();
+  for (;;) {
+    const uint32_t a = mbox_get(0, MBOX_GPU_PACKREQ), b = mbox_get(1, MBOX_GPU_PACKREQ);
+    if (((a < b) ? a : b) >= seq) break;
+    if (rdcycle() - t0 > wait_limit) { (*timeouts)++; break; }
+  }
+  *wait_cycles += rdcycle() - t0;
+  host_pack_p_scales();
+  asm volatile("fence" ::: "memory");
+  mbox_set(MBOX_HOST_PACKED, seq);
+}
+#endif // FA_HOSTPACK
+
 #ifdef FA_HOSTCFG
 // ---- HOST-ISSUED GEMMINI CONFIG + MOVE-IN (capture / replay) ---------------------------------
 // See the long FA_HOSTCFG comment in mxgemm_core.hpp for the why and the mutual exclusion rules.
@@ -266,6 +388,7 @@ static uint32_t g_rec_n[2] = {0, 0};
 // id).  Read with 8-byte loads: a 4-byte host access into the cluster is the one that was measured
 // to be silently dropped.
 static void cfg_capture(void) {
+  asm volatile("fence" ::: "memory");   // no host store may be in flight -- see mbox_get's note
   for (int pv = 0; pv < 2; pv++) {
     const uint64_t base = HOST_CFGREC(0, pv);
     uint32_t n = (uint32_t)*(volatile uint64_t *)base;      // rec[0] = command count
@@ -423,6 +546,12 @@ int main() {
     g_diag[15] = (g_rec_n[0] << 8) | g_rec_n[1];   // expect 0x0c0c (12 commands each)
   }
 #endif
+#ifdef FA_HOSTPACK
+  // TILE 0's P scales.  With the GPU built -DFA_NOPACK there is no GPU-side packer at all, so tile
+  // 0 needs servicing too -- and it happens BEFORE the refill loop's first iteration, because the
+  // loop's window-1 gate (PVDONE >= 1) is only reached after tile 0's PV, which needs these scales.
+  host_service_pack(1, WAIT_LIMIT, &wait_cycles, &to_pv);
+#endif
   for (uint32_t t = 1; t < (uint32_t)HOST_NTILES; t++) {
     // ==== WINDOW 1: [ PVDONE >= t .. QK_READY = t+1 ] ==========================================
     // PVDONE >= t means tile t-1's PV matmul has drained, which is the GPU's LAST gemmini command
@@ -492,6 +621,12 @@ int main() {
 #endif
     asm volatile("fence" ::: "memory");
     mbox_set(MBOX_V_READY, t + 1);
+#ifdef FA_HOSTPACK
+    // ==== WINDOW 3: [ PACKREQ >= t+1 .. PACKED = t+1 ] =========================================
+    // The GPU asks for tile t's P scales at the top of its PV compute_tile and blocks on the reply,
+    // so it is provably idle here (and, being built -DFA_NOPACK, it never writes SF at all).
+    host_service_pack(t + 1, WAIT_LIMIT, &wait_cycles, &to_pv);
+#endif
   }
   {
     const uint64_t t_end = rdcycle();

@@ -709,6 +709,12 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     // >>> GENERAL RULE for this machine: a barrier is ~10k cycles, so parallelizing any serial phase that is
     // itself <~10k (or that needs one more barrier) is a NET LOSS. This is why most SIMT-parallelization
     // attempts here lost. <<<
+    // -DFA_NOPACK (HAZARD TEST ONLY, added by the host-offload campaign): skip the GPU's ONLY
+    // write into the gemmini scale SRAM.  The output is garbage (PV runs on stale A scales); the
+    // question the build answers is whether the host's per-tile 8-byte SF refill still trips
+    // FlitMergeNode / the extReqXbar D-size monitor once no 4-byte GPU SF write exists to share
+    // the merge node's state with.  Inert when the define is absent.
+#ifndef FA_NOPACK
     pack_scales_to_sfmem<FA_SQ, FA_SK>(
         reinterpret_cast<const __shared uint32_t*>(SCALE_SMEM),
         reinterpret_cast<__shared uint32_t*>(GEMMINI_SF_MEM_A
@@ -716,6 +722,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
                                              + GEMMINI_SF_MEM_BUFFER_OFFSET
 #endif
                                              ), tid, thr);
+#endif
     mu_fence_smem(); BAR_PAD3(); mu_barrier(3, wpb); BAR_PAD3(); MARK();  // 6: pack+bar3
 #ifdef FA_DUMP2
     // dump SCALE_SMEM (normal SMEM, SIMT-readable -- unlike SF_MEM_A) = requant se's, 512 words (1 scale/word).
