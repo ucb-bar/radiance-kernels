@@ -89,10 +89,38 @@ constexpr bool SIMT_GMEM_MOVE_OUT = true;
 // TODO: max size hardcoded
 static uint32_t C_scale_factors[128 * 128 / 32] __attribute__((aligned(32))) = {0};
 
+#ifdef FA_NOSCALES
+// ---- HOST-ASSISTED SCALE PREFILL (see host.cpp) --------------------------------------------
+// With -DFA_NOSCALES the GPU does NOT load the MX scale factors at all: the rv64 Rocket host
+// writes them straight into the gemmini scale SRAM with 8-byte stores (which bypass
+// FlitMergeNode's 4B pair-merge FSM).  SF_MEM_B is needed TWICE per FA pass -- K scales for
+// QK^T, then V scales for PV -- and both are prefilled up front, so they live in DIFFERENT
+// halves of the weight-scale double buffer (K -> buffer 0, V -> buffer 1 at byte offset
+// GEMMINI_SF_MEM_BUFFER_OFFSET).  The mesh picks the half via CONFIG_SCALE_MEM's scale_w_sel
+// bit (rs1[61], ScaleFactorMem.scala:196/230-237), so it must be 1 for the PV matmul.
+// The prefetch knows which gemm it is (SKIP_A == "A comes from the requantizer" == PV) and
+// hands that to the compute through this variable; both run on the SAME thread (tid 0).
+static uint32_t g_host_sf_wsel = 0;
+
+// Host<->GPU mailbox, in an unused 256B window of cluster SMEM (device 0x17F00: the kernel's SMEM
+// map ends at REDBUF_SMEM=0x15000 and the gemmini B-spad starts at 0x18000).  SMEM is the only
+// channel that is both cheap for the Muon and visible to a Rocket store at cluster_base+offset
+// (GMEM would sit behind the non-coherent L1; the print-buffer TLRAM at +0x80000 was tried and
+// host stores there never became visible).  Host side MUST use 8-byte stores.  Match host.cpp.
+#define FA_HOST_MBOX      0x17F00u
+#define FA_MBOX_QK_READY  0x00u
+#define FA_MBOX_V_READY   0x10u
+#define FA_HOST_MAGIC     0x5CA1E5u
+// cycle stamp -> MARK_GMEM+off (0x88/0x8c = QK scale wait, 0x90/0x94 = V scale wait)
+#define FA_HOST_MARK(off) do { uint32_t _c; asm volatile("csrr %0, mcycle" : "=r"(_c)); \
+    *((volatile uint32_t *)(0x40050000u + (off))) = _c; } while (0)
+#endif
+
 template <GemmConfig C>
 static inline void configure_mxgemmini(const uint32_t dim_m,
                                        const uint32_t dim_n,
-                                       const uint32_t dim_k) {
+                                       const uint32_t dim_k,
+                                       const uint32_t scale_w_sel = 0) {
     // NOTE: non-square tiles (TILE_M != TILE_N) are supported -- the loop bounds are set
     // per-dimension from PE_TILES_I/J/K below, and the A/B spad quarters are sized
     // independently. Required for streaming FA (QK: N=Bk!=M=Sq; PV: N=d!=M=Sq).
@@ -137,8 +165,8 @@ static inline void configure_mxgemmini(const uint32_t dim_m,
     gemmini_mxquant_config_mvout(
         rad_device_to_host_address(reinterpret_cast<uint32_t>(&C_scale_factors[0])),
         C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
-        0, // A double-buffer toggle
-        0, // B double-buffer toggle
+        0,           // A (act) scale double-buffer select
+        scale_w_sel, // B (weight) scale double-buffer select (1 = host-prefilled V scales)
         QUANT_LUT_UPDATE_GRANULARITY);
 
     // Configure loop bounds for the loop FSM
@@ -758,7 +786,17 @@ __attribute__((noinline)) void mxgemm_prefetch_tile(
         if (tid_in_threadblock != 0) return;
     }
     if (tid_in_threadblock == 0) {
-        if constexpr (DO_CONFIG) configure_mxgemmini<C>(dim_m, dim_n, dim_k);
+        uint32_t wsel = 0;
+#ifdef FA_NOSCALES
+        // host prefilled the PV (SKIP_A) weight scales into weight-scale buffer 1
+        wsel = SKIP_A ? 1u : 0u;
+        g_host_sf_wsel = wsel;
+        // NOTE: the GPU must NOT clear the mailbox flags here. It was tried and it deadlocks:
+        // Rocket reaches main() at ~2.3k and finishes the QK scale subset well before the GPU
+        // gets here (~15k), so a GPU-side clear wipes a signal the host had already raised.
+        // The host clears the flags itself as the first thing it does in main().
+#endif
+        if constexpr (DO_CONFIG) configure_mxgemmini<C>(dim_m, dim_n, dim_k, wsel);
         copy_gmem_to_smem_async<C, SKIP_A, EXPLICIT_MVIN>(A_in, B_in, dim_m, dim_n, dim_k, 0, 0, tile_k);
     }
     // Order lane-0's ROCC/config stores AHEAD of the lanes' SF-SRAM writes: both traverse the gemmini
@@ -790,6 +828,25 @@ __attribute__((noinline)) void mxgemm_prefetch_tile(
                            calculate_scale_factor_gmem_addr<C, true>(B_scales, 0, dim_m, dim_n),
                            C.SCALE_FACTORS_PER_TILE_B());
     }
+#ifdef FA_NOSCALES
+    // ---- Wait for the host's scale write to land -------------------------------------------
+    // Placed HERE (after config + DMA issue, where load_scale_factors used to be) on purpose:
+    // the Q/K mvin DMA is already in flight, so this spin overlaps the drain that
+    // mxgemm_compute_tile's leading gemmini_fence would have paid anyway -- the QK matmul starts
+    // at max(host_ready, dma_done) instead of host_ready + dma_done.
+    // The spin is bounded so a mis-built (host-side prefill disabled) image fails visibly
+    // instead of hanging the simulation.
+    if (tid_in_threadblock == 0) {
+        volatile __shared uint32_t *mbox =
+            reinterpret_cast<volatile __shared uint32_t *>(FA_HOST_MBOX);
+        const uint32_t slot = (SKIP_A ? FA_MBOX_V_READY : FA_MBOX_QK_READY) / 4;
+        FA_HOST_MARK(SKIP_A ? 0x90 : 0x88);          // spin start
+        for (uint32_t spin = 0; spin < 200000u; spin++) {
+            if (mbox[slot] == FA_HOST_MAGIC) break;
+        }
+        FA_HOST_MARK(SKIP_A ? 0x94 : 0x8c);          // spin end
+    }
+#endif
     PMARK(1);   // after A+B scale loads
     if (tid_in_threadblock == 0) load_lut<C>();
     PMARK(2);   // after load_lut
@@ -927,18 +984,36 @@ __attribute__((noinline)) void mxgemm_compute_tile(const uint32_t tid_in_threadb
     asm volatile ("mxgemm_compute_tile_start_%=:" :: );
     if (tid_in_threadblock != 0) return;
     const uint32_t odd = tile_k & 1u;
+    uint32_t wsel = odd;
+#ifdef FA_NOSCALES
+    // Host-prefilled scales: the weight-scale half is chosen by which gemm this is (QK -> 0,
+    // PV -> 1), not by tile_k parity. Set by the matching mxgemm_prefetch_tile on this thread.
+    wsel = g_host_sf_wsel;
+#endif
     if constexpr (FM == FenceMode::READY) gemmini_fence_ready();
     else if constexpr (FM == FenceMode::BUSY) gemmini_fence();
     // FM==NONE: no leading drain (V-mvin data already resident; the poisoned occupancy MMIO would livelock).
     gemmini_mxquant_config_mvout(
         rad_device_to_host_address(reinterpret_cast<uint32_t>(&C_scale_factors[0])),
         C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
-        odd, odd, QUANT_LUT_UPDATE_GRANULARITY);   // A/B double-buffer parity MUST match tile_k
+        odd, wsel, QUANT_LUT_UPDATE_GRANULARITY);   // A/B double-buffer parity MUST match tile_k
     matmul_tile_async<C>(tile_k, /*acc_move_out (last_k)=*/true, /*accumulate=*/false,
                          b_spad_override, c_spad_dest, a_spad_override, /*force_first=*/1);
     if constexpr (FM == FenceMode::READY) gemmini_fence_ready();
     else if constexpr (FM == FenceMode::BUSY) gemmini_fence();
     // FM==NONE: caller must drain the PV mvout (fence_delay/barrier) before reading SPAD_DEST.
+#if defined(FA_NOSCALES) && defined(FA_HOST_TIMING)
+    // Instrumentation only: echo the host's (enter_main, scale-prefill-done) rdcycle stamps out
+    // of the SMEM mailbox host.cpp wrote, as marks m[32]/m[33], so the host-side prefill window
+    // can be compared against the GPU's mcycle timeline. Done on the PV gemm (wsel==1) so the
+    // host is guaranteed to have published them.
+    if (wsel) {
+        const volatile __shared uint32_t *ts =
+            reinterpret_cast<const volatile __shared uint32_t *>(0x17F80);
+        ((volatile uint32_t *)0x40050080)[0] = ts[0];
+        ((volatile uint32_t *)0x40050080)[1] = ts[1];
+    }
+#endif
     asm volatile ("mxgemm_compute_tile_end_%=:" :: );
 }
 

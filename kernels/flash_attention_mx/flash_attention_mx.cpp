@@ -80,7 +80,72 @@ static constexpr uint32_t REDBUF_SMEM = 0x15000; // per-warp tree-reduce scratch
 static constexpr uint32_t MARK_GMEM = 0x40050000;
 // retiring ALU pad to break >=3 back-to-back stalling ops (barrier/fence): the barrier RELEASE is a
 // single-cycle unbuffered Valid pulse (Synchronizer.sv:87); a retiring commit between stalls restores slack.
-#define BAR_PAD() do { volatile int _p=0; asm volatile("addi %0,%0,1" : "+r"(_p)); asm volatile("addi %0,%0,1" : "+r"(_p)); asm volatile("addi %0,%0,1" : "+r"(_p)); asm volatile("addi %0,%0,1" : "+r"(_p)); } while(0)
+// BUG FIX (2026-07-25, FSDB-confirmed on flash_util2.fsdb): `_p` used to be declared `volatile int`, which
+// forces a STACK slot -- and the stack lives in GMEM/DRAM. Each `"+r"(_p)` asm therefore compiled to a
+// DRAM load + DRAM store around the addi, so the intended "4 retiring ALU ops" were really ~9-12 DRAM
+// round-trips per BAR_PAD, x16 lanes x6 warps. Measured: the 10,443-cyc "bar2" phase was
+// BAR_PAD#1 = 2,721 cyc | actual barrier handshake = 3 cyc (0.03%) | BAR_PAD#2 + MARK = 7,719 cyc, with
+// lsu.io_globalQueuesEmpty low for 913/668/553/543 cyc across BAR_PAD#1's four addi's. Dropping `volatile`
+// keeps _p in a register (still `asm volatile` so the addis are not optimized away) and restores the
+// original intent. For the record: mu_barrier itself is 3 cyc and fence.s is 2 cyc -- barriers are FREE.
+//
+// *** WARNING -- THE FAST PAD IS NOT FREE. READ BEFORE CHANGING THE DEFAULT BELOW. ***
+// Making ALL pads fast is worth -18.3% (188,533 -> 153,957 cyc single tile) but CORRUPTS THE OUTPUT
+// of the first tile. Measured 2026-07-25, FULL_ATTN2, Frobenius vs golden_O_u16 (the CORRECT golden
+// for this non-streaming path -- see the golden note on the FULL_ATTN2 block; 3.5666% == correct):
+//
+//   config                     total cyc   Frobenius   verdict
+//   slow pad everywhere         188,533     3.5666%    correct (== the c3156c6 baseline)
+//   all pads fast, FA_STEADY    153,957     6.1886%    CORRUPT
+//   all pads fast, plain        154,225    18.1197%    CORRUPT (same code as above + no loop!)
+//   FA_SLOWPAD2 (site 2 only)   173,657     3.5666%    correct
+//   FA_SLOWPAD3 (site 3 only)   170,217     3.5666%    correct
+//   FA_SLOWPAD4 (site 4 only)   168,646     3.5666%    correct  <-- cheapest correct, the DEFAULT
+//
+// Two facts pin down what this is. (1) A slow pad at ANY ONE of the three sites is sufficient, so it
+// is not a single missing drain at a single point -- it is a marginal timing/layout-sensitive hazard
+// that ~10k cycles of delay anywhere in the tile happens to close. (2) The two "all fast" rows are the
+// same pads with only the FA_STEADY loop differing, yet give 6.19% vs 18.12% -- severity tracks
+// unrelated code layout. Consistent with fence.s waiting ONLY on the Muon per-warp shared LSU queues:
+// it does NOT wait on the Gemmini mvout, the V-mvin DMA, or the SF-SRAM scale writes.
+// (3) In a 4-tile FA_STEADY run with ALL pads fast the FINAL tile's O is exactly correct (3.5666%),
+// so the corruption is a COLD-START effect on tile 0 only; steady-state tiles are clean. That is why
+// the steady-state slope below is still a valid measurement of a correct tile.
+//
+// THE PAD IS A TIMING MASK, NOT A FIX. The real fix is an explicit drain at the responsible point;
+// that needs an FSDB root-cause. Until then site 4 stays slow so the DEFAULT BUILD IS CORRECT.
+// FA_FASTPAD_ALL   = all three sites fast (fastest, CORRUPTS TILE 0 -- measurement use only).
+// FA_SLOWPAD_ALL   = all three slow (the original verified 188,994-cyc behaviour).
+// FA_SLOWPAD<n>    = force site n slow on top of whatever the default is.
+#define BAR_PAD_FAST() do { int _p=0; asm volatile("addi %0,%0,1" : "+r"(_p)); asm volatile("addi %0,%0,1" : "+r"(_p)); asm volatile("addi %0,%0,1" : "+r"(_p)); asm volatile("addi %0,%0,1" : "+r"(_p)); } while(0)
+#define BAR_PAD_SLOW() do { volatile int _p=0; asm volatile("addi %0,%0,1" : "+r"(_p)); asm volatile("addi %0,%0,1" : "+r"(_p)); asm volatile("addi %0,%0,1" : "+r"(_p)); asm volatile("addi %0,%0,1" : "+r"(_p)); } while(0)
+// The GENERIC BAR_PAD() stays SLOW: it is used by FULL_ATTN, FULL_ATTN3, FA_HWREQ and the WARPSPEC*
+// paths, none of which have been re-validated against the fast pad. Only the FULL_ATTN2 sites below
+// opt in, and only where a correct O was actually measured. FA_FASTPAD_ALL makes everything fast.
+#if defined(FA_FASTPAD_ALL)
+#define BAR_PAD() BAR_PAD_FAST()
+#else
+#define BAR_PAD() BAR_PAD_SLOW()
+#endif
+// Per-barrier-site pads on the FULL_ATTN2 path: site 2 = post-QK / pre-softmax, site 3 = post-pack /
+// pre-PV, site 4 = post-PV / pre-finalize. Sites 2 and 3 default FAST; site 4 defaults SLOW because
+// that is the cheapest configuration measured to produce a CORRECT O (see the table above).
+// VALIDATED 2026-07-25 at this default: FULL_ATTN2 single tile = 132,016 cyc, Frobenius 3.5666%.
+#if defined(FA_SLOWPAD2) || defined(FA_SLOWPAD_ALL)
+#define BAR_PAD2() BAR_PAD_SLOW()
+#else
+#define BAR_PAD2() BAR_PAD_FAST()
+#endif
+#if defined(FA_SLOWPAD3) || defined(FA_SLOWPAD_ALL)
+#define BAR_PAD3() BAR_PAD_SLOW()
+#else
+#define BAR_PAD3() BAR_PAD_FAST()
+#endif
+#if defined(FA_SLOWPAD4) || defined(FA_SLOWPAD_ALL) || !defined(FA_FASTPAD_ALL)
+#define BAR_PAD4() BAR_PAD_SLOW()
+#else
+#define BAR_PAD4() BAR_PAD_FAST()
+#endif
 #define MARK() do { if (tid == 0) { uint32_t _c; asm volatile("csrr %0, mcycle" : "=r"(_c)); \
                                     ((volatile uint32_t *)MARK_GMEM)[mki++] = _c; } } while (0)
 
@@ -271,12 +336,57 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     MARK();  // 6: finalize done
     }
 #elif defined(FULL_ATTN2)
+    // *** WHICH GOLDEN (2026-07-25): verify FULL_ATTN2 against golden_O_u16.npy, NOT
+    // golden_O_flash_u16.npy. fa_lanes_check.sh and most of the notes use the _flash_ one, which is
+    // WRONG for this path: fa_gen_goldens.py builds golden_O_flash from mx_attention_flash() with
+    // block_n=64, i.e. the STREAMING online-softmax reference, whereas FULL_ATTN2 is the
+    // NON-streaming path (one QK over all Sk, one softmax, one PV) whose reference is the dense
+    // mx_attention_dense() -> golden_O_u16.npy. The SAME correct output scores 3.5666% against
+    // golden_O_u16 and 4.5954% against golden_O_flash, so "4.5954%" in the older notes means
+    // "correct, measured against the wrong golden". Use 3.5666% / golden_O_u16.npy as the criterion.
     // ===== Full attention, SEPARATED softmax + requant to kill the width-256 subbank conflict.
     // online_softmax_block writes bf16 P row-major (NO tiled fp8 store -> no conflict); then
     // requant_P_to_spad_tiled (row-parallel: subbank=((row&3)*4+w) -> spreads across 4 subbanks,
     // 4-way conflict vs the fused per-lane version's 16-way) converts bf16 P -> fp8 tiled. =====
     {
     constexpr uint32_t PBF = 0xC000;  // bf16 P_full[64][256]=32KB scratch (OACC region, free pre-PV)
+#ifdef FA_STEADY
+    // ================= STEADY-STATE UTILIZATION HARNESS (#ifdef FA_STEADY, OFF by default) =========
+    // A single isolated tile charges the whole one-time cost (boot/entry, gemmini_flush, icache cold
+    // miss, first-touch config) against ONE tile's 16,420 mesh-busy cycles, which UNDERSTATES the
+    // utilization a real LLM attention block would see. Here the whole
+    //     QK -> bar -> softmax -> PVFcfg -> requant -> pack -> PV -> finalize
+    // sequence is run FA_NTILES times over the SAME input data (Q/K/V and their scales are re-read
+    // from GMEM every iteration exactly as a real per-Q-block loop would re-read them). Only the LAST
+    // iteration's O is meaningful for correctness -- every iteration recomputes the identical result,
+    // so the standard fa_verify_out check still passes. The metric is the SLOPE:
+    //     steady_per_tile = (T(4) - T(2)) / 2      (one-time boot/config cancels exactly)
+    //     steady_util     = 16420 / steady_per_tile
+    // A MARK is emitted at the top of every iteration so the per-iteration and per-phase deltas are
+    // directly readable out of the MARK_GMEM stamp array.
+    //
+    // NTILES is selected by FA_NT<n> (the build harness only supports valueless -D's).
+#  if   defined(FA_NT1)
+#    define FA_NTILES 1
+#  elif defined(FA_NT2)
+#    define FA_NTILES 2
+#  elif defined(FA_NT3)
+#    define FA_NTILES 3
+#  elif defined(FA_NT4)
+#    define FA_NTILES 4
+#  elif defined(FA_NT6)
+#    define FA_NTILES 6
+#  elif defined(FA_NT8)
+#    define FA_NTILES 8
+#  elif !defined(FA_NTILES)
+#    define FA_NTILES 4
+#  endif
+    // Per-iteration state that must be re-established: NONE. online_softmax_block is called with
+    // first=1 so m/l are re-initialized; S/PBF/O_acc/spad-A/spad-B/SF_MEM are all fully rewritten
+    // before they are read. So the loop body is exactly the single-shot body, unmodified.
+    for (uint32_t fa_tile = 0; fa_tile < (uint32_t)FA_NTILES; fa_tile++) {
+    MARK();  // T: top of steady-state iteration (per-iteration cost = this stamp -> next iteration's)
+#endif
     // QK_full
     mxgemm_prefetch_tile<QKF, /*SKIP_A=*/false, /*DO_CONFIG=*/true, /*EXPLICIT_MVIN=*/false,
                          /*LANE_SCALES=*/false>(
@@ -292,7 +402,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     mxgemm_prefetch_tile<PVF, /*SKIP_A=*/true, /*DO_CONFIG=*/true, /*EXPLICIT_MVIN=*/true>(
         &V_in[0][0], &V_in[0][0], &V_scales[0][0], &V_scales[0][0], FA_SQ, FA_D, FA_SK, tid);
 #endif
-    mu_fence_smem(); BAR_PAD(); mu_barrier(2, wpb); BAR_PAD(); MARK();  // 3: bar2
+    mu_fence_smem(); BAR_PAD2(); mu_barrier(2, wpb); BAR_PAD2(); MARK();  // 3: bar2
     // softmax_full -> bf16 P @ PBF (row-major), l -> LS_SMEM
     online_softmax_block<FA_SQ, FA_SK>(
         reinterpret_cast<const __shared uint32_t*>(S_SMEM),
@@ -339,7 +449,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     pack_scales_to_sfmem<FA_SQ, FA_SK>(
         reinterpret_cast<const __shared uint32_t*>(SCALE_SMEM),
         reinterpret_cast<__shared uint32_t*>(GEMMINI_SF_MEM_A), tid, thr);
-    mu_fence_smem(); BAR_PAD(); mu_barrier(3, wpb); BAR_PAD(); MARK();  // 6: pack+bar3
+    mu_fence_smem(); BAR_PAD3(); mu_barrier(3, wpb); BAR_PAD3(); MARK();  // 6: pack+bar3
 #ifdef FA_DUMP2
     // dump SCALE_SMEM (normal SMEM, SIMT-readable -- unlike SF_MEM_A) = requant se's, 512 words (1 scale/word).
     // multi-thread (parses via fa_verify_out) -> PS_GMEM. Also fp8 P spad0[4096w] -> S_GMEM.
@@ -352,7 +462,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     // PV_full compute: A=P@spad0 (SIMT requant), B=V (explicit mvin), scales from SF_MEM. Normal BUSY fences.
     MARK();  // 7
     mxgemm_compute_tile<PVF>(tid);
-    mu_fence_smem(); BAR_PAD(); mu_barrier(4, wpb); BAR_PAD(); MARK();  // 8: PV done
+    mu_fence_smem(); BAR_PAD4(); mu_barrier(4, wpb); BAR_PAD4(); MARK();  // 8: PV done
     // finalize directly from SPAD_DEST (O_unnorm). SINGLE finalize (common finalize guarded off for FULL_ATTN2)
     // => no double-write, no OACC copy (saved ~16k). 
     finalize_O<FA_SQ, FA_D>(
@@ -360,6 +470,9 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         reinterpret_cast<const __shared uint16_t*>(LS_SMEM),
         reinterpret_cast<uint32_t*>(O_GMEM), tid, thr);
     MARK();  // 9: finalize
+#ifdef FA_STEADY
+    }   // end steady-state tile loop
+#endif
     }
 #elif defined(WARPSPEC)
     // ===== Software-pipelined overlap: QK_{j+1} (async) runs on the mesh while the SIMT
