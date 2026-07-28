@@ -4411,6 +4411,27 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         // (~10k cycles) to move 8 KB -- and it makes correctness independent of how long S4 takes,
         // which is the property every performance lever in this file needs.
         //
+        // *** MEASURED, AND REFUTED: FA_SP_QDRAIN IS NOT THE FIX AND THIS DIAGNOSIS IS WRONG. ***
+        // FA_NT6, seed 12345, on exactly the configuration the analysis above was built from:
+        //     FA_SP_QSPLIT + CVTX + PREPK                 45,974 cyc/tile   4 WRONG of 11
+        //     + FA_SP_QDRAIN                              46,028 cyc/tile   2 WRONG of 8
+        //     + FA_SP_QDRAIN + FA_SP_QEARLY               46,479 cyc/tile   8 of 9, none wrong
+        // The drain is ~free (+54 cycles) and it does NOT fix the corruption, so the Q-DMA-versus-
+        // PV-move-out bank collision reasoned about above is NOT the mechanism, however well it fit
+        // the three symptoms.  And FA_SP_QEARLY's clean run must NOT be read as a fix either: with
+        // the drain refuted there is no mechanism left for it to close, it costs +451 cycles, and
+        // "a bit-exact reschedule that happens to come out clean" is exactly the trap this file
+        // documents twice over (FA_SP_QOVL4+SM1F+SM1FL, and FA_SP_PAX moving the onset tile).
+        // THE ACTUAL MECHANISM IS FA_SP_WCNT's, and it explains the S-localisation directly where
+        // mine only explained the timing-sensitivity: gemmini_fence() polls io.busy, which rises
+        // SEVERAL CYCLES AFTER the command store, so the fence after fa_store_acc<QKF>() in stage
+        // S1 can FALL THROUGH and the softmax then reads a MID-ACCUMULATION accumulator.  MMIO 0x28
+        // (runningLoops) rises in the same cycle as the LOOP_WS write, and FA_SP_WCNT uses it.
+        // Measured at 45,582 cyc/tile = 36.02%, 12 of 12, and free.  *** BUILD EVERY FA_SP
+        // CONFIGURATION WITH FA_SP_WCNT; FA_SP_QDRAIN and FA_SP_QEARLY ARE KEPT ONLY AS THE RECORD
+        // OF A REFUTED HYPOTHESIS AND SHOULD STAY OFF. ***
+        // Retained below for the record, because the reasoning is a good example of a mechanism that
+        // predicted every observed symptom and was still wrong:
         // THERE ARE THREE INDEPENDENT WAYS TO KILL THIS HAZARD, AND THEY COMPOSE:
         //   FA_SP_QDRAIN  (here)  wait for the DMA before the PV that shares its bank -- removes the
         //                         OVERLAP IN TIME.
