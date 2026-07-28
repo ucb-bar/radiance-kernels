@@ -20,7 +20,9 @@ MU_CXX = $(LLVM_MUON)/bin/clang++
 MU_OBJDUMP  = $(LLVM_MUON)/bin/llvm-objdump
 MU_OBJCOPY  = $(LLVM_MUON)/bin/llvm-objcopy
 
-MU_CFLAGS += --sysroot=$(LLVM_MUON)
+# MU_CFLAGS += --sysroot=$(LLVM_MUON)
+MU_CFLAGS += --sysroot=$(RISCV_SYSROOT)
+MU_CFLAGS += --gcc-toolchain=$(RISCV_TOOLCHAIN_PATH) -nodefaultlibs
 MU_CFLAGS += -Xclang -target-feature -Xclang +vortex
 MU_CFLAGS += -march=rv32im_zfinx_zhinx -mabi=ilp32
 MU_CFLAGS += -O3 -std=c++20

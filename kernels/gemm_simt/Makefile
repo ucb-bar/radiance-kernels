@@ -60,6 +60,40 @@ $(eval $(call add_cta_bmbn_variant,8,2,8,64,64))
 $(eval $(call add_cta_bmbn_variant,16,2,1,32,32))
 $(eval $(call add_cta_bmbn_variant,16,2,2,32,64))
 $(eval $(call add_cta_bmbn_variant,16,2,4,64,64))
+
+# Fill the remaining occupancy variants (w1/2/4/8) for every existing tm/tn config.
+# Occupancy w = (BM/TM)*(BN/TN) / (MU_NUM_CORES*MU_NUM_THREADS = 32); BM,BN chosen
+# to hit each w (also divisible by 2w for the A/B tile loads). No new tm/tn added.
+$(eval $(call add_cta_bmbn_variant,1,4,1,8,16))
+$(eval $(call add_cta_bmbn_variant,1,4,2,16,16))
+$(eval $(call add_cta_bmbn_variant,1,4,8,32,32))
+$(eval $(call add_cta_bmbn_variant,1,8,1,16,16))
+$(eval $(call add_cta_bmbn_variant,1,8,4,32,32))
+$(eval $(call add_cta_bmbn_variant,1,8,8,32,64))
+$(eval $(call add_cta_bmbn_variant,2,4,1,16,16))
+$(eval $(call add_cta_bmbn_variant,2,4,4,32,32))
+$(eval $(call add_cta_bmbn_variant,2,4,8,32,64))
+$(eval $(call add_cta_bmbn_variant,1,16,2,16,64))
+$(eval $(call add_cta_bmbn_variant,1,16,4,32,64))
+$(eval $(call add_cta_bmbn_variant,1,16,8,32,128))
+$(eval $(call add_cta_bmbn_variant,2,8,2,32,32))
+$(eval $(call add_cta_bmbn_variant,2,8,4,32,64))
+$(eval $(call add_cta_bmbn_variant,2,8,8,32,128))
+$(eval $(call add_cta_bmbn_variant,4,4,2,32,32))
+$(eval $(call add_cta_bmbn_variant,4,4,4,32,64))
+$(eval $(call add_cta_bmbn_variant,4,4,8,64,64))
+$(eval $(call add_cta_bmbn_variant,16,2,8,64,128))
+
+# tm*tn=32 balanced thread tiles (tm8_tn4, tm4_tn8) across full occupancy, with the
+# same BM*BN per w as tm16_tn2 (32x32, 32x64, 64x64, 64x128) for a clean comparison.
+$(eval $(call add_cta_bmbn_variant,8,4,1,32,32))
+$(eval $(call add_cta_bmbn_variant,8,4,2,32,64))
+$(eval $(call add_cta_bmbn_variant,8,4,4,64,64))
+$(eval $(call add_cta_bmbn_variant,8,4,8,64,128))
+$(eval $(call add_cta_bmbn_variant,4,8,1,32,32))
+$(eval $(call add_cta_bmbn_variant,4,8,2,32,64))
+$(eval $(call add_cta_bmbn_variant,4,8,4,64,64))
+$(eval $(call add_cta_bmbn_variant,4,8,8,64,128))
 endif
 
 include ../common.mk
