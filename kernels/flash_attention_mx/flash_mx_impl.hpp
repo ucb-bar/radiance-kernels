@@ -318,6 +318,182 @@ static inline uint32_t e4m3_pack4_swar(uint32_t wlo, uint32_t whi, uint32_t D2,
     return acc;
 }
 
+// ============================================================================================
+// FA_SM_2P / FA_SM_2PRAW / FA_SM_2PBM  (+ FA_SP_CVTXS, FA_SP_PAX in flash_attention_mx.cpp)
+// A FOURTH-PASS STEADY-STATE SWEEP ON TOP OF FA_SP_QSPLIT.  All of these are BIT-EXACT by
+// construction, so every one of them must still score exactly 3.5666% against golden_O_u16.npy;
+// that is what lets them be part of a verified headline, unlike the whole SMTPR/SMBMAX/SUBMAX/
+// NOMAX family which buys speed by moving the numerics to 4.2-7.8%.
+//
+// *** THE ONE-LINE LESSON OF THIS PASS: THE REGISTER BUDGET IS A SINGLE GLOBAL RESOURCE, AND
+// SPENDING IT WELL IN ONE FUNCTION IS WHAT MAKES ANOTHER FUNCTION AFFORDABLE. ***  FA_SP_CVTSWAR
+// (the 25-instruction SWAR fp8 packer, worth -56 instr/item on the second-largest SIMT stage) has
+// been sitting in this tree DEAD since the third pass because it cost 58 registers against a
+// 53-register cliff.  It is not the packer that changed: FA_SM_2P deletes the softmax's slo[8]/
+// shi[8] arrays and FA_SM_2PRAW deletes its 16 per-row fmul.h, which together take the whole-kernel
+// union 53 -> 46 -- and the packer then fits at 51.  Two levers that look independent are coupled
+// through Rename.scala, in both directions: FA_SM_2PBM and FA_SP_CVTXS each fit alone (50 / 51) but
+// TOGETHER need 55, because the allocator does not reuse names across the two all-warps functions.
+//
+// *** AND THE RESULT THAT MATTERS MOST IN THIS PASS IS A CORRECTNESS RESULT, NOT A SPEED ONE:
+// FA_SP_QSPLIT's "12 of 12" IS A PROPERTY OF ITS SCHEDULE, NOT OF ITS FIX. ***  Measured at
+// FA_NT6, seed 12345, scored per cluster per tile with fa_verify_tiles.py against golden_O_u16:
+//     FA_SP_QSPLIT + FA_SP_CVTX + FA_SP_PREPK   45,807 cyc/tile  35.85%   cluster 1 tile 1 is
+//                                                                        *** WRONG, 106.66% ***
+// Both added flags are BIT-EXACT BY CONSTRUCTION -- CVTX only XOR-permutes which of eight output
+// words an unrolled iteration writes, PREPK only moves the pack's arithmetic off warp 0 -- so
+// neither can change a computed value, and the failing image is fully covered (4096/4096 words),
+// i.e. it is real corruption and not a truncated trace.  A -1,095-cycle schedule perturbation is
+// therefore enough to lose the baseline's correctness.  Adding FA_SP_PAX on top (another -536, also
+// bit-exact) does NOT fix it -- it only moves the ONSET, which is the tell:
+//     + CVTX + PREPK          cl0 t0,t1,t2 CORRECT | cl1 t0 CORRECT, t1 106.7%, t2 114.6% WRONG
+//     + CVTX + PREPK + PAX    cl0 t0,t1 CORRECT, t2 119.4% WRONG | cl1 t0,t1,t2 all CORRECT
+// THREE PROPERTIES OF THAT PATTERN PIN THE MECHANISM, and they are why FA_SP_QDRAIN/FA_SP_QEARLY
+// target the Q(t+1) DMA rather than anything else:
+//   * the onset tile differs BETWEEN THE TWO CLUSTERS of one run, which are the same instructions
+//     on the same data -- so the trigger is a RACE whose timing depends on something outside the
+//     instruction stream, and the only such thing per tile is DRAM contention;
+//   * once a cluster goes wrong it stays wrong for every later tile, but with a DIFFERENT Frobenius
+//     each time -- so it is not one frozen corrupt resident operand (K^T, V or their scales, which
+//     are loop-invariant) but a fresh corruption every tile, i.e. of the one thing re-fetched every
+//     tile: Q;
+//   * shortening stage S4 (CVTX -872 on the convert, PREPK -1.3k on the pack) makes it appear, and
+//     lengthening the stage BEFORE S4 does not -- which is what "the DMA has less of S4 to finish
+//     in" predicts and what "a fixed missing fence" does not.
+// See FA_SP_QDRAIN / FA_SP_QEARLY in
+// flash_attention_mx.cpp for the mechanism and the fix; the point here is the METHODOLOGICAL one:
+// *** ON THIS PIPELINE, EVERY PERFORMANCE FLAG MUST BE RE-SCORED AT NT6, AND A "12 of 12" CARRIES
+// OVER TO A NEIGHBOURING CONFIGURATION ONLY IF THE HAZARD HAS BEEN DRAINED RATHER THAN MISSED. ***
+// (The published F6 lever sweep quotes cycles for the CVTX/PREPK rows but no tile verdicts -- they
+// were never scored.  That is how a wrong-answer configuration came to be recorded as a free win.)
+//
+// MEASURED, FA_NT6, seed 12345, CONVERGED (complete traces), pooled over BOTH clusters' steady
+// intervals (fa_marks_cl.py), every row scored per cluster per tile with fa_verify_tiles.py:
+//   configuration (all on FULL_ATTN2 FA_SP FA_SP_QOVL FA_SP_LEANCFG FA_SP_QKACC FA_SP_PKOVL
+//                  FA_SP_QSPLIT)                cyc/tile  util    tile-images        regs
+//   published baseline                            46,902  35.01%  12 of 12            53
+//   + CVTX + PREPK                                45,974  35.72%  7 ok, 4 WRONG /11   53
+//   + CVTX + PREPK + PAX                          46,542  35.28%  8 ok, 4 WRONG /12   53
+//   + CVTX + PREPK + FA_SM_2P                   **43,896  37.41%  12 of 12 CORRECT**  50
+//   + CVTX + PREPK + FA_SM_2P + PAX               44,242  37.11%  8 ok, 4 WRONG /12   50
+// *** SO THE BANKED, VERIFIED RESULT OF THIS PASS IS 43,896 cyc/tile = 37.41%, 12 of 12 -- i.e.
+// -3,006 cycles and +2.40 POINTS of mesh utilisation over the published 34.96%/35.01% baseline,
+// entirely from FA_SM_2P. ***  Its ten steady intervals are 43,147..44,543, i.e. tight.
+//
+// AND A THIRD MEASUREMENT TRAP, WHICH THE TWO WRONG ROWS ABOVE DEMONSTRATE: *** A CORRUPT TILE HAS
+// A CORRUPT *TIMING* TOO, SO A WRONG-ANSWER RUN'S CYCLE COUNT IS NOT A PERFORMANCE MEASUREMENT. ***
+// The two clean rows have interval spreads of ~1,400 cycles; the +PAX row's are
+//     cl0 [45853, 43274, 45748, 50609, 53245]   cl1 [45245, 46713, 45766, 41459, 47504]
+// -- 41,459 to 53,245, a 28% spread, and the outliers are exactly the corrupted tiles.  That is why
+// +PAX appears to be a +568 LOSS here while its own stage (requant pass A) provably shrinks by 661,
+// and why its cluster-0 tiles alone (41,488..43,702 on the FA_SM_2P row) look like a ~600 WIN.  The
+// honest statement is that PAX's tile-level effect is NOT MEASURABLE until the corruption is fixed.
+// Corollary for the published F6 sweep: its CVTX/PREPK rows were never scored, so both their
+// verdicts AND their cycle counts have to be discarded, not just the verdicts.
+//   and the per-stage attribution (cluster 0, steady tiles; +-500 of phase noise per stage):
+//                          CVTX+PREPK   +PAX   +FA_SM_2P
+//     S1 accumulator->S           998    1386        998
+//     S2 softmax               12,825  12,825   *10,799*   <- FA_SM_2P: -2,026
+//     S3 requant pass A         3,415  *2,754*     3,375   <- FA_SP_PAX: -661
+//     S4 convert || pack       10,243  10,422      9,989
+//     S5 PV                     8,883   8,898      8,882   <- mesh; irreducible, see below
+//     S6 QK || finalize         8,938   8,614      9,346   <- already within ~700 of the QK mesh
+//
+// TWO STRUCTURAL LIMITS ESTABLISHED (both negative, both worth not re-deriving):
+//  1. *** NO MATMUL IN THIS KERNEL CAN BE SPLIT ALONG M, N OR K. ***  The mesh's scale-SRAM read
+//     row is a fixed function of the loop bounds latched by CONFIG_SCALE_MEM, so a half-size
+//     matmul re-reads the FIRST half's scale rows; making the second half correct means REWRITING
+//     those rows between the two matmuls (64-128 words at ~65 cyc/word, strictly serial) while the
+//     mesh is reading them.  All four scale slots (SF_A/SF_B x 2 halves) are already occupied by
+//     K, V, Q and packed-P, so there is no spare half to double-buffer through.  This kills the
+//     whole "split the mesh op so SIMT can hide under it" family, which is why stage S5's 8,883
+//     cycles of PV are exposed with five warps idle and stay that way.  THE ONE EXCEPTION is the
+//     store-only loop_ws (fa_store_acc): it has no scale dependency at all and CAN be split.
+//  2. The HW MxRequantizer cannot replace the convert.  copy_P_to_requant is warp-0-only and the
+//     requantizer's SMEM manager takes EXACTLY 32-byte beats, so feeding it 64x256 bf16 is 1,024
+//     sequential 8-lane stores on ONE warp -- the same single-thread-serial-port wall as the SF
+//     pack, against a convert that runs on five warps in parallel.
+//
+// WHERE THE TILE'S TIME ACTUALLY GOES ONCE FA_SM_2P HAS LANDED (cluster 0, steady, the 12-of-12
+// 43,896 configuration), and therefore what the FLOOR of this pipeline shape is:
+//     S1 acc->S            998   agent-serial, 5 warps idle
+//     S2 softmax        10,799   SIMT, 6 warps
+//     S3 requant pass A  3,375   SIMT, 6 warps            (-661 with FA_SP_PAX, or -> 0 with 2PBM)
+//     S4 convert||pack   9,989   SIMT warps 1-5 || warp-0 serial SF pack (~7.0k with PREPK)
+//     S5 PV              8,882   MESH ONLY -- five warps idle, and structurally so (see limit 1)
+//     S6 QK||finalize    9,346   SIMT finalize || QK mesh (8,210), i.e. ~1.1k of mesh slack
+// The mesh-coupled part -- S5 + max(S6, QK) + S1 -- is ~18.2k and cannot shrink without splitting a
+// matmul (impossible, limit 1) or double-buffering the tile (the Sq=32 route below).  The SIMT part
+// is ~24.2k and is where every lever in this pass lives; with FA_SM_2PRAW (-500), FA_SP_PAX (-661)
+// and FA_SP_CVTXS (-1,075) it projects to ~21.0k, i.e. a ~41.7k tile / ~39.4% util, and with
+// FA_SM_2PBM replacing FA_SP_PAX (pass A deleted for ~+1.9k inside the softmax) ~40.8k / ~40.2%.
+// *** SO ~40% IS THE CEILING OF THIS PIPELINE SHAPE, AND THE 8,882 EXPOSED CYCLES OF PV -- 20% OF
+// THE TILE, WITH FIVE OF SIX WARPS IDLE -- ARE THE WHOLE REMAINING PRIZE. ***
+//
+// AND THE STRUCTURAL ROUTE THAT WOULD ACTUALLY PAY, worked out but NOT built: run the outer loop
+// over Sq=32 HALF-TILES with S/P/O and P8 DOUBLE-BUFFERED.  Then tile i's PV overlaps tile i+1's
+// softmax (different buffers), which is the one overlap the single-buffer map cannot express, and
+// the floor becomes the SIMT total rather than SIMT + PV.  The SMEM arithmetic works out EXACTLY:
+// 2 x 16 KB (S/P/O) + 2 x 8 KB (P8) = 48 KB, which is precisely what SP_C (32 KB) + P8 (16 KB)
+// already provide, with V (32 KB), K^T (32 KB), Q (2 x 4 KB) and scratch (8 KB) unchanged = 128 KB.
+// Neither matmul needs splitting (each half-tile issues its own full QK and PV), so limit 1 above
+// does not bite, and one scale half per operand still suffices because PV(i) has drained long
+// before PV(i+1)'s 64 words are packed.  Cost: 2x the matmuls, barriers and marks.
+//
+// THE 3.5666% -> 4.2342% SOFTMAX ACCURACY GAP: TWO MORE REFUTATIONS, ONE NEW MECHANISM, AND THE
+// GENERAL AMPLIFIER -- BUT NOT CLOSED.  (Everything below is numpy bf16-RNE emulation on the REAL
+// golden_S_u16, not argument.)
+//   * l's SUMMATION ORDER IS REFUTED INDEPENDENTLY, reproducing (e3)'s numbers from scratch:
+//     cooperative (16 chains of 16 + 16-leaf tree) l is 0.2919% rms from the exact sum,
+//     thread-per-row (4 chains of 64 + combine) is 0.4287%, and the two l's differ from EACH OTHER
+//     by 0.4986% rms -- against the 2.28% of independent error the step needs.  33 of 64 rows get a
+//     BIT-IDENTICAL l either way.
+//   * m IS REFUTED (as (e3) argued): x |-> RNE(x*scale) is monotone, so max_i RNE(S_i*scale) ==
+//     RNE(max_i S_i * scale); emulated on the real S the two m vectors are byte-identical, 64 of 64.
+//     (FA_SM_2PRAW turns that identity into a -500 cyc/tile lever rather than a worry.)
+//   * NEW, AND REAL, AND FOUND IN THE DISASSEMBLY: *** clang CONTRACTS THE EXP ARGUMENT IN
+//     fa_softmax_tpr. ***  It emits FOUR fmadd.h per unrolled group and ZERO fmul.h/fsub.h, i.e.
+//     S*scale - m with ONE rounding, where online_softmax_block emits 16 fmul.h + 16 fsub.h, i.e.
+//     RNE(RNE(S*scale) - m) with TWO.  The reference escapes contraction only because it
+//     materialises the product into slo[]/shi[] first.  So the two softmaxes do NOT feed mu_fexp the
+//     same numbers, which every previous analysis assumed.  Measured: the arguments differ on 13.26%
+//     of the 16,384 elements, rms 0.0051 absolute, which exp turns into 0.5107% rms on P.
+//   * MEASURED AMPLIFIER, and this is the part worth keeping: *** THE MX-FP8 QUANTISER MULTIPLIES
+//     ANY SUB-PERCENT PERTURBATION OF P BY ~2.4x. ***  e4m3 has 3 mantissa bits, so its grid is
+//     12.5% coarse; a 0.51% shift re-rounds 1.86% of elements by a FULL step and the quantised P
+//     then differs by 1.2402% rms (and the row weights Q/l by 1.2425%).  THIS is why every rounding
+//     change in this kernel costs ~0.7 Frobenius points regardless of what it is, why the whole
+//     SMTPR/SUBMAX/NOMAX family lands at 4.2-7.8%, and why *** THE 3.5666% GATE IS IN PRACTICE A
+//     BIT-EXACTNESS GATE, NOT AN ACCURACY GATE. ***  The operational conclusion: do not look for an
+//     "accuracy-neutral" reordering, reproduce the rounding sequence exactly -- which is what
+//     FA_SM_2P does and why it can be in a verified headline at all.
+//   * STILL NOT CLOSED, and I am not going to claim otherwise: in quadrature the identified terms
+//     give sqrt(3.5666^2 + 1.2402^2 + 0.4986^2) = 3.81%, so ~0.7 points of the step to 4.2342%
+//     remain unaccounted for.  The remaining suspect is mu_fexp's own argument-dependent hardware
+//     error being RE-SAMPLED by the contraction (an effect no software emulation can see), but the
+//     arithmetic does not require it and I have not measured it.  A full numpy emulation of the
+//     pipeline scores 8.74% against golden_O_u16 -- 2.4x the kernel's own 3.5666% -- so the e4m3 /
+//     E8M0 model here is NOT faithful enough to settle a 0.7-point question, and any claim resting
+//     on it would be worthless.  What IS settled: it is not l, not m, and not only the contraction.
+//
+// AND ONE MEASUREMENT THAT CORRECTS A NUMBER THIS FILE HAS BEEN REASONING FROM: *** fence.s COSTS
+// ~22 CYCLES HERE, NOT ~100+. ***  FA_SM_2P removes 41 of a warp's 44 softmax fences and cuts 285
+// instructions per row to 177+100/warp; the measured win is -2,015, of which the instruction count
+// explains ~1,100 and the 41 fences therefore ~900, i.e. ~22 cycles each.  So the cooperative
+// softmax was never "mostly reduction scaffolding fences" -- it was ~55% plain ISSUE on the binding
+// core -- and that is why FA_SP_SM1F (which trades instructions for fences) had to lose, and why
+// FA_SM_2PBM's per-row fence is affordable where a 16 KB warp-batched fold would have been needed
+// if fences really cost 100.
+// ============================================================================================
+#ifdef FA_SM_2P
+// Native single-instruction bf16 multiply with an EXPLICIT rounding of the product -- see the trap
+// note in online_softmax_block's FA_SM_2P block.  (fa_max_h / fa_add_h in flash_attention_mx.cpp
+// are the same idea, but they are declared after this header is included.)
+static inline _Float16 fa_sm2p_mul(_Float16 a, _Float16 b) {
+    _Float16 o; asm("fmul.h %0, %1, %2" : "=r"(o) : "r"(a), "r"(b)); return o;
+}
+#endif
+
 // 16-lane intra-warp tree reduction over a per-warp SMEM buffer (mirrors the
 // softmax kernel's reduce_*: no in-loop fence; relies on warp lockstep). Result
 // ends in buf[0]; caller fences then reads buf[0]. IS_MAX selects max vs sum.
@@ -528,6 +704,248 @@ static __attribute__((noinline)) void online_softmax_block(
     const _Float16 scale = as_bf16(softmax_scale_bf16);
     volatile __shared uint16_t *buf =
         reinterpret_cast<volatile __shared uint16_t *>(0x15000) + warp * NT;
+
+#ifdef FA_SM_2P
+    // ==========================================================================================
+    // FA_SM_2P -- TWO-PASS SOFTMAX WITH *WARP-BATCHED* CROSS-LANE REDUCTIONS.
+    //
+    // WHERE THE REFERENCE SPENDS ITS 12,825 cyc/tile.  online_softmax_block is 243 static
+    // instructions per row with FOUR fence.s and TEN warp-divergence regions, and at FA_SP_QSPLIT
+    // all six warps run it, so each core's issue port sees 32 rows x 243 = 7,776 warp-instructions
+    // -- 61% of the measured stage.  The other ~5,000 cycles are the fences: 11 rows x 4 = 44 per
+    // warp, and because all three warps on a core are executing the SAME code they hit them
+    // together, so the port genuinely idles (~115 cyc/fence).  Both terms are reduction
+    // scaffolding: per row the two warp_tree_reduce calls cost 16 lh + 13 sh + 8 ops + 8
+    // vx_split_n/vx_join + 4 fence.s, i.e. ~76 of the 243 instructions AND all four fences.
+    //
+    // THE FIX: the reduction is per ROW, but the FENCE does not have to be.  Split the row loop
+    // into two passes over the warp's ~11 rows and do ALL of that warp's reductions between them:
+    //   pass A  : per-lane partial row max of RNE(S*scale)      -> pb[row][lane]      (no fence)
+    //   fold A  : lane L folds row (warp + nwarps*L)'s 16 partials -> m_state[row]
+    //   pass B  : a = exp(RNE(S*scale) - m), P in place over S, per-lane partial l -> pb[row][lane]
+    //   fold B  : lane L folds row (warp + nwarps*L)'s 16 partials -> l_state[row]
+    // THREE fence.s PER WARP instead of four per row -- 44 -> 3, measured in the disassembly -- and
+    // zero divergence regions in the passes (fold B needs no trailing fence: every lane computes
+    // the whole reduction itself, so there is no buf[0] to publish).  It costs pass B a RE-READ of S (8 lw + 16 extract + 16 fmul per row), which is
+    // what pays for deleting the slo[8]/shi[8] register arrays: sixteen live fp registers vanish,
+    // and the renamer budget is the binding constraint in this kernel (53 distinct arch regs for
+    // the whole kernel -- see the header of flash_attention_mx.cpp).  That is why this succeeds
+    // where FA_SP_SM1FX -- which keeps the arrays and adds 15 loop-invariant XOR'd pointers -- is
+    // register-fatal at 58.
+    //
+    // *** EVERY SYNCHRONISATION HERE IS INTRA-WARP, WHICH IS WHY mu_fence_smem() IS SUFFICIENT
+    // AND NO BARRIER IS NEEDED. ***  Rows are striped row -> warp (row % nwarps), so warp w owns
+    // exactly the rows {w, w+nwarps, ...}; lane L of warp w folds row w + nwarps*L, which is one
+    // of THAT SAME WARP's rows.  So pb, m_state and l_state are each written and read by one warp
+    // only, and fence.s -- which drains that warp's own LSU queues -- is exactly the right
+    // primitive.  (mu_fence_smem is NOT a drain for a gemmini DMA or an SF-SRAM write; it is a
+    // drain for this.)
+    //
+    // *** BIT-EXACT vs THE REFERENCE, term by term. ***
+    //   m : max over the row of RNE(S*scale).  The reference accumulates one chain per lane and
+    //       then a 16-leaf tree; this uses four chains and then a linear 16-fold.  fmax is exact
+    //       and fully order-independent, so every grouping gives the identical bf16.
+    //   a : mu_fexp(RNE(RNE(S*scale) - m)) with the same m -- the same two roundings on the same
+    //       operands, recomputed from the same S word instead of read from a register.
+    //   l : the per-lane chain is the reference's own `lloc = (_Float16)(lloc + a + b)` in the same
+    //       j order, and fold B reproduces warp_tree_reduce's EXACT 16-leaf balanced pairing
+    //         (((b0+b1)+(b2+b3)) + ((b4+b5)+(b6+b7))) + (((b8+b9)+(b10+b11))+((b12+b13)+(b14+b15)))
+    //       term for term.  This matters: bf16 addition is NOT associative and every node rounds,
+    //       so a linear fold here would NOT be bit-exact (which is why fold A may be linear and
+    //       fold B may not).
+    //   l_state: the reference stores (_Float16)(l_old*corr + lsum) with first_block=1, i.e.
+    //       l_old = 0 and corr = exp(0) = 1, which is RNE(0 + lsum) == lsum.  FA_SM_2P is
+    //       therefore FIRST-BLOCK ONLY (all FA_SP ever uses) and drops the dead corr/rescale
+    //       arithmetic; corr_out is not written, so FA_SP_DUMPL/DUMPLM's corr column is invalid
+    //       under this flag.
+    //
+    // SCRATCH: pb needs SQ x 17 halfwords = 2,176 B at 0x15600, inside the 0x14000..0x16000
+    // scratch window (REDBUF 0x15000 ends at 0x150C0; LPART 0x15400 is FUSE-only and CBMAX_SMEM
+    // 0x15800 is CBMAX-only, both mutually exclusive with this flag).  The stride is 2*NT+1 = 17,
+    // ODD ON PURPOSE: fold A/B have lane L read row (w+nwarps*L), whose halfword base is
+    // 17*(w+nwarps*L), so with an even stride every lane's word index would differ by a multiple
+    // of 8 and the 16 lanes would land on only TWO of the 16 word-subbanks (an 8-way conflict on
+    // every one of the 16 fold loads).  17 makes (6L*17)>>1 mod 16 take 11 distinct values over
+    // the 11 active lanes -- essentially conflict-free -- for the price of one halfword of padding
+    // per row and no instructions at all.  (Same reasoning as FA_SP_CVTX/FA_SP_PAX, but solved by
+    // LAYOUT rather than by an XOR on every access, so it costs nothing in registers.)
+    // *** AND ONE COMPILER TRAP THAT SILENTLY BREAKS THE BIT-EXACTNESS ABOVE, CAUGHT IN THE
+    // DISASSEMBLY AND NOT IN A SIMULATION. ***  Written as `(_Float16)(as_bf16(w) * scale) - m`,
+    // clang CONTRACTS the multiply and the subtract into ONE fmsub.h -- sixteen of them per row --
+    // which computes S*scale - m with a SINGLE rounding.  The reference emits a separate fmul.h and
+    // fsub.h, i.e. TWO roundings, RNE(RNE(S*scale) - m); the fused form is therefore a DIFFERENT
+    // number and the whole bit-exactness argument above collapses.  Neither the cast to _Float16
+    // nor a named local stops it.  fa_sm2p_mul forces the rounding with inline asm, and an asm
+    // result cannot be folded into a later contraction.  (Same class of trap as hardware fact 2 in
+    // flash_attention_mx.cpp: clang reaches for fp32 -- or for contraction -- on its own, and the
+    // only reliable fix is to name the instruction.)
+    {
+    constexpr uint32_t STR = 2 * NT + 1;                 // 17 halfwords per row (odd: see above)
+    __shared uint16_t *const pb = reinterpret_cast<__shared uint16_t *>(0x15680);
+#ifdef FA_SM_2PBM
+    // FA_SM_2PBM block-max partials: 8 blocks x 17 halfwords per warp = 136, x6 warps = 1,632 B at
+    // REDBUF_SMEM (0x15000), which FA_SM_2P no longer uses for anything (it returns before `buf`).
+    // 17 again: the fold has lane L read block (L & 7), and with an even stride all 16 lanes would
+    // land on 2 of the 16 word-subbanks.
+    constexpr uint32_t BSTR = 2 * NT + 1;
+    __shared uint16_t *const bb =
+        reinterpret_cast<__shared uint16_t *>(0x15000) + warp * (WPL * BSTR);
+    // SCALE_SMEM (0x14000): one 32-bit word per (block, row), the layout fa_requant_cvt reads.
+    // Hardcoded for the same reason 0x15000 is: online_softmax_block has no scale_scratch argument
+    // and this flag is FA_SP-only.  Build it together with -DFA_SP_SMBMAX, which is what compiles
+    // the requant pass-A STAGE out of the FA_SP body (that branch is keyed on FA_SP_SMBMAX).
+    __shared uint32_t *const scale_scratch2p = reinterpret_cast<__shared uint32_t *>(0x14000);
+#endif
+    const uint32_t fr = warp + nwarps * lane;            // the row THIS lane folds (may be >= SQ)
+
+    // ---- pass A: per-lane partial row max.  Four chains for memory-level parallelism (max is
+    // ---- order-free, so any grouping is exact); no reduction, no fence.
+#ifdef FA_SM_2PRAW
+    // FA_SM_2PRAW -- MAX THE *RAW* ROW AND SCALE ONCE, deleting 16 fmul.h per row (~500 cyc/tile).
+    // x |-> RNE(x*scale) is MONOTONE NON-DECREASING for scale > 0 (bf16 multiply and
+    // round-to-nearest-even both are), so
+    //     max_i RNE(S_i * scale)  ==  RNE( (max_i S_i) * scale )
+    // and the single product at the end of fold A is the identical bf16.  This is the one place
+    // fa_softmax_tpr's shape is strictly better than the reference's, and it is free.
+    // VERIFIED NUMERICALLY ON THE REAL INPUT, not just argued: emulating bf16 RNE over
+    // golden_S_u16 gives byte-identical m for the two forms on all 64 rows.
+    for (uint32_t row = warp; row < SQ; row += nwarps) {
+        const __shared uint32_t *Srow = S_smem32 + row * BKW;
+        // TWO chains, not four: still four loads per iteration in flight (the loads are what needs
+        // the parallelism; fmax latency is not the limit), but two fewer live fp registers -- and
+        // this is an all-warps function, so each one costs 3x on the binding core.  That is what
+        // buys FA_SP_CVTXS and FA_SM_2PBM room to coexist under the 53-register cliff.
+        _Float16 x0 = as_bf16(NEG_INF_BF16_BITS), x1 = x0;
+        for (uint32_t j = 0; j < WPL; j += 4) {
+            const uint32_t w0 = Srow[(j + 0) * NT + lane], w1 = Srow[(j + 1) * NT + lane],
+                           w2 = Srow[(j + 2) * NT + lane], w3 = Srow[(j + 3) * NT + lane];
+            x0 = fmaxf(fmaxf(as_bf16((uint16_t)w0), as_bf16((uint16_t)(w0 >> 16))), x0);
+            x1 = fmaxf(fmaxf(as_bf16((uint16_t)w1), as_bf16((uint16_t)(w1 >> 16))), x1);
+            x0 = fmaxf(fmaxf(as_bf16((uint16_t)w2), as_bf16((uint16_t)(w2 >> 16))), x0);
+            x1 = fmaxf(fmaxf(as_bf16((uint16_t)w3), as_bf16((uint16_t)(w3 >> 16))), x1);
+        }
+        pb[row * STR + lane] = __builtin_bit_cast(uint16_t, (_Float16)fmaxf(x0, x1));
+    }
+#else
+    for (uint32_t row = warp; row < SQ; row += nwarps) {
+        const __shared uint32_t *Srow = S_smem32 + row * BKW;
+        _Float16 x0 = as_bf16(NEG_INF_BF16_BITS), x1 = x0, x2 = x0, x3 = x0;
+        for (uint32_t j = 0; j < WPL; j += 4) {
+            const uint32_t w0 = Srow[(j + 0) * NT + lane], w1 = Srow[(j + 1) * NT + lane],
+                           w2 = Srow[(j + 2) * NT + lane], w3 = Srow[(j + 3) * NT + lane];
+            x0 = fmaxf(fmaxf((_Float16)(as_bf16((uint16_t)w0) * scale),
+                             (_Float16)(as_bf16((uint16_t)(w0 >> 16)) * scale)), x0);
+            x1 = fmaxf(fmaxf((_Float16)(as_bf16((uint16_t)w1) * scale),
+                             (_Float16)(as_bf16((uint16_t)(w1 >> 16)) * scale)), x1);
+            x2 = fmaxf(fmaxf((_Float16)(as_bf16((uint16_t)w2) * scale),
+                             (_Float16)(as_bf16((uint16_t)(w2 >> 16)) * scale)), x2);
+            x3 = fmaxf(fmaxf((_Float16)(as_bf16((uint16_t)w3) * scale),
+                             (_Float16)(as_bf16((uint16_t)(w3 >> 16)) * scale)), x3);
+        }
+        pb[row * STR + lane] = __builtin_bit_cast(
+            uint16_t, (_Float16)fmaxf(fmaxf(x0, x1), fmaxf(x2, x3)));
+    }
+#endif
+    mu_fence_smem();                                     // fence #1 of 4 PER WARP
+    // ---- fold A: one row per lane, linear (max is order-free) -> m_state[row] ----
+    if (fr < SQ) {
+        const __shared uint16_t *bp = pb + fr * STR;
+        _Float16 q0 = as_bf16(bp[0]), q1 = as_bf16(bp[1]);   // 2 chains (this runs once per warp)
+        for (uint32_t k = 2; k < NT; k += 2) {
+            q0 = fmaxf(q0, as_bf16(bp[k + 0])); q1 = fmaxf(q1, as_bf16(bp[k + 1]));
+        }
+#ifdef FA_SM_2PRAW
+        m_state[fr] = __builtin_bit_cast(                 // ONE product, at the end (see above)
+            uint16_t, fa_sm2p_mul((_Float16)fmaxf(q0, q1), scale));
+#else
+        m_state[fr] = __builtin_bit_cast(uint16_t, (_Float16)fmaxf(q0, q1));
+#endif
+    }
+    mu_fence_smem();                                     // fence #2
+    // ---- pass B: P = exp(RNE(S*scale) - m) in place over S; per-lane partial l ----
+    for (uint32_t row = warp; row < SQ; row += nwarps) {
+        const __shared uint32_t *Srow = S_smem32 + row * BKW;
+        __shared uint32_t *Prow = P_smem32 + row * BKW;
+        const _Float16 m = as_bf16(m_state[row]);        // one broadcast halfword read per row
+        _Float16 lloc = (_Float16)0;
+        for (uint32_t j = 0; j < WPL; j++) {
+            const uint32_t w = Srow[j * NT + lane];
+            const _Float16 a = mu_fexp(
+                (_Float16)(fa_sm2p_mul(as_bf16((uint16_t)w), scale) - m));
+            const _Float16 b = mu_fexp(
+                (_Float16)(fa_sm2p_mul(as_bf16((uint16_t)(w >> 16)), scale) - m));
+            Prow[j * NT + lane] = pack_bf16x2(a, b);
+            lloc = (_Float16)(lloc + a + b);             // the reference's exact chain and order
+#ifdef FA_SM_2PBM
+            // This lane's contribution to MX block j's max.  *** THE LAYOUT MAKES THIS EXACT AND
+            // ALMOST FREE: *** lane L owns word j*NT+L, i.e. row elements 2*(j*NT+L) and +1, so its
+            // MX block index is (j*NT+L)/NT == j and its two elements are positions 2L, 2L+1 WITHIN
+            // block j.  Block j's 32 elements are therefore exactly the 16 lanes' word j, and the
+            // block max is one 16-lane reduction of a register each lane already holds.
+            bb[j * BSTR + lane] = __builtin_bit_cast(uint16_t, (_Float16)fmaxf(a, b));
+#endif
+        }
+        pb[row * STR + lane] = __builtin_bit_cast(uint16_t, lloc);
+#ifdef FA_SM_2PBM
+        // ==== FA_SM_2PBM -- PRODUCE THE E8M0 BLOCK SCALES HERE AND DELETE REQUANT PASS A. =========
+        // Pass A of the requant (fa_requant_max, 3,405 cyc/tile; 2,754 with FA_SP_PAX) exists ONLY
+        // to RE-READ the bf16 P this loop just wrote and take a 32-element max of it.  Pass B above
+        // has those values in registers, so the max costs 8 fmax.h + 8 halfword stores per row plus
+        // ONE 16-lane fold -- and the fold is affordable because fence.s turned out to cost only
+        // ~22 cycles here (measured: FA_SM_2P removes 41 of a warp's 44 fences and only ~890 of the
+        // 1,742-cycle win is attributable to them), so a fence PER ROW is fine and the buffer stays
+        // 256 B per warp instead of the 16 KB a fully warp-batched fold would need.
+        //
+        // WHY IT IS AT *REFERENCE* NUMERICS, WHICH IS THE WHOLE POINT.  FA_SP_SMBMAX does the same
+        // trick but only inside the THREAD-PER-ROW softmax, so it can only be had at that softmax's
+        // 4.2% numerics; FA_SP_CBMAX did it cooperatively but cost +80 instr/row and was a renamer
+        // casualty at 33 registers in an all-warps function.  Here the values folded are the SAME 32
+        // bf16 P values fa_requant_max would have re-read, max is exact and order-independent, and
+        // the code written is byte-identical -- em/K8/max(em,7) and the scale_scratch[b*SQ+row]
+        // layout are copied from fa_requant_max verbatim.  So O stays BIT-EXACT.
+        //
+        // NO DIVERGENCE REGION: all 16 lanes fold block (lane & 7), so lanes L and L+8 compute the
+        // same block and store the same byte to the same address -- a benign duplicate store, which
+        // is cheaper than an `if (lane < WPL)` split/join.  (Requires WPL == 8, static_assert'd.)
+        static_assert(WPL == 8, "FA_SM_2PBM's lane&7 block fold assumes 8 MX blocks per row");
+        mu_fence_smem();
+        {
+            const uint32_t bsel = lane & (WPL - 1u);
+            const __shared uint16_t *bp = bb + bsel * BSTR;
+            // ONE accumulator chain, not two: this is an all-warps function, so every register here
+            // costs 3x on the binding core, and the 16 loads still overlap regardless of how many
+            // chains consume them (fmax latency is not the limit -- SMEM latency is).
+            _Float16 y0 = as_bf16(bp[0]);
+            for (uint32_t k = 1; k < NT; k++) y0 = fmaxf(y0, as_bf16(bp[k]));
+            const uint32_t em =
+                ((uint32_t)__builtin_bit_cast(uint16_t, (_Float16)y0) >> 7) & 0xffu;
+            const uint32_t K8 = fa_clamp_K8(((int)em - 7) << 3);
+            scale_scratch2p[bsel * SQ + row] = ((K8 - 8u) >> 3) + 7u;              // max(em,7)
+        }
+#endif
+    }
+#ifndef FA_SM_2PBM
+    mu_fence_smem();                                     // fence #3
+#endif
+    // ---- fold B: warp_tree_reduce's EXACT 16-leaf balanced pairing (bf16 add is not
+    // ---- associative, so the shape is load-bearing) -> l_state[row] ----
+    if (fr < SQ) {
+        const __shared uint16_t *bp = pb + fr * STR;
+        _Float16 t0 = (_Float16)((_Float16)(as_bf16(bp[0]) + as_bf16(bp[1]))
+                               + (_Float16)(as_bf16(bp[2]) + as_bf16(bp[3])));
+        _Float16 t1 = (_Float16)((_Float16)(as_bf16(bp[4]) + as_bf16(bp[5]))
+                               + (_Float16)(as_bf16(bp[6]) + as_bf16(bp[7])));
+        const _Float16 hA = (_Float16)(t0 + t1);
+        t0 = (_Float16)((_Float16)(as_bf16(bp[8]) + as_bf16(bp[9]))
+                      + (_Float16)(as_bf16(bp[10]) + as_bf16(bp[11])));
+        t1 = (_Float16)((_Float16)(as_bf16(bp[12]) + as_bf16(bp[13]))
+                      + (_Float16)(as_bf16(bp[14]) + as_bf16(bp[15])));
+        l_state[fr] = __builtin_bit_cast(uint16_t, (_Float16)(hA + (_Float16)(t0 + t1)));
+    }
+    (void)corr_out; (void)first_block; (void)buf;
+    return;
+    }
+#endif  // FA_SM_2P
 
     for (uint32_t row = warp; row < SQ; row += nwarps) {
         const __shared uint32_t *Srow = S_smem32 + row * BKW;

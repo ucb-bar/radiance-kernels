@@ -2290,7 +2290,40 @@ static __attribute__((noinline)) void fa_requant_cvt(
         const uint32_t K8 = ((scale_scratch[b * SQ + row] - 7u) << 3) + 8u;   // inverse of pass A
         const uint32_t ti = row / 16, rr = row % 16;
         __shared uint32_t *dst = spad_u32 + ti * (PE_TILES_K * 64u) + b * 128u + rr * 4u;
-#ifdef FA_SP_CVTX
+#ifdef FA_SP_CVTXS
+        // ==== FA_SP_CVTXS -- FA_SP_CVTX's XOR ADDRESSING *AND* THE SWAR PACKER, TOGETHER. ========
+        // These two are orthogonal and the #if chain below only ever let you pick one:
+        //   FA_SP_CVTX     kills the 16-way subbank conflict (+23 instr/item, measured -872 cyc)
+        //   FA_SP_CVTSWAR  packs 4 elements in 25 straight-line instructions instead of 34
+        //                  (345 -> 289 instr/item, i.e. -56/item = -1.5k of issue on the binding
+        //                  core) but was REGISTER-FATAL at 58 and so could never be used.
+        // Two things make the combination available now.  (1) The XOR rotation costs ZERO live
+        // registers -- it folds into the two base pointers once per item and every access stays a
+        // compile-time-immediate XOR -- so it is free to add on top of SWAR.  (2) FA_SM_2P +
+        // FA_SM_2PRAW take the whole-kernel register union from 53 to 47 by deleting the softmax's
+        // slo[8]/shi[8] arrays and its 16 per-row fmul.h, which buys back exactly the headroom the
+        // SWAR packer needs: 47 + 5 = 52, one under the empirical cliff.  *** So this lever only
+        // exists BECAUSE of the softmax rewrite -- the register budget is a single global resource
+        // and spending it well in one function is what makes another function affordable. ***
+        // Bit-identical to e4m3_pack4 by construction (flash_mx_impl.hpp derives the SWAR chain
+        // from the per-element one), and the XOR is a permutation of the 8 output words, each of
+        // which still receives its own 4 consecutive elements.
+        {
+        const uint32_t lane_ = tid % MU_NUM_THREADS;
+        const uint32_t Pbx  = ((uint32_t)(uintptr_t)Pb) ^ ((lane_ & 7u) << 3);
+        const uint32_t dstx = ((uint32_t)(uintptr_t)dst)
+                            ^ ((((lane_ & 4u) << 6) | ((lane_ & 3u) << 2)));
+        const uint32_t D1 = 0x7ff8u - (K8 - 8u), D2 = D1 | (D1 << 16);
+        const uint32_t C = 0x07ff07ffu, M = 0x80008000u, H = 0x0000ffffu;
+#pragma unroll
+        for (uint32_t uu = 0; uu < 8; uu++)
+            *reinterpret_cast<__shared uint32_t *>(
+                dstx ^ (((uu & 4u) << 6) | ((uu & 3u) << 2))) =
+                e4m3_pack4_swar(*reinterpret_cast<const __shared uint32_t *>(Pbx ^ (uu << 3)),
+                                *reinterpret_cast<const __shared uint32_t *>(Pbx ^ ((uu << 3) | 4u)),
+                                D2, C, M, H);
+        }
+#elif defined(FA_SP_CVTX)
         // See the long FA_SP_CVTX comment in fa_requant_cvt_bal: rotate the pair index by lane&7
         // through an XOR that folds into the two base pointers, breaking the 16-way subbank
         // conflict at the cost of one xori per access and no live registers.  Present in BOTH the
@@ -3153,6 +3186,21 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 #else
     // FA_SP_QOVL3 moves the Q prefetch under the PV MATMUL (stage S5) and FA_SP_QOVL4 under the
     // QK compute (stage S6), so this stage gets all six warps.
+#ifdef FA_SP_QEARLY
+    // ==== FA_SP_QEARLY -- ISSUE Q(t+1)'s MOVE-IN DMA THREE STAGES EARLIER. ====================
+    // FA_SP_QSPLIT issues it at the top of stage S4 because S4 was described as "the ONLY stage
+    // with no mesh operation in flight at all".  That is true of S2 and S3 as well: under
+    // FA_SP_QKACC, QK(t) is DRAINED in stage S1 (fa_gfl) and PV(t) is not issued until S5, so the
+    // mesh is idle for the whole softmax + requant-pass-A + convert run.  Issuing here gives the
+    // 8 KB transfer S2+S3+S4 (~23.5k cycles at the measured stage costs) to complete in instead of
+    // S4 alone (~10k), which is what makes FA_SP_QDRAIN's fence FREE rather than a stall -- and it
+    // removes the property that CVTX/PREPK exploited to break correctness, namely that SHORTENING
+    // STAGE S4 shortens the DMA's window.  Costs warp 0 the ~200 cycles of 32 ROCC issues at the
+    // start of a stage whose length is set by its slowest warp, so ~200 cyc/tile at worst.
+    if (warp == 0) {
+        if (t + 1 < (uint32_t)FA_SPTILES) fa_mvin_A<QKF>(&QK_A_in[0][0], SP_Q, FA_D, tid);
+    } else { asm volatile("nop"); }   // the `else` is MANDATORY (unbalanced warp-uniform region)
+#endif
     FA_SP_SOFTMAX(tid, thr);
 #endif
     FAP_BAR(5);
@@ -3244,9 +3292,13 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         // the DMA cannot break an accumulator->spad move-out's atomic 16-subbank grant, which is
         // the hazard FA_SP_QOVL3 hit and FA_SP_QOVL4 only relocated.  Only the ROCC ISSUE (32
         // gemmini_extended_mvin commands) is on warp 0's critical path here; the transfer is not.
+#ifndef FA_SP_QEARLY   /* FA_SP_QEARLY issues it at the top of stage S2 instead */
         if (t + 1 < (uint32_t)FA_SPTILES) fa_mvin_A<QKF>(&QK_A_in[0][0], SP_Q, FA_D, tid);
 #endif
-#ifdef FA_SP_PREPK
+#endif
+#ifdef FA_SP_HSF
+        /* the host packs; warp 0 has nothing to do here and joins the convert below */
+#elif defined(FA_SP_PREPK)
         copy_scales_to_sfmem<FA_SQ, FA_SK>(
             reinterpret_cast<const __shared uint32_t*>(PACKED_SMEM),
             reinterpret_cast<volatile __shared uint32_t*>(GEMMINI_SF_MEM_A), tid);
@@ -3318,10 +3370,61 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         // slave independent of the mesh's scale READ port, half 1 is dead (QK(t) drained in S1) and
         // the mesh is reading SF_A half 0 + SF_B half 1.  FA_PIPE writes 256 V-scale words under a
         // matmul that also moves out, so this placement is already proven on this RTL.
+#ifdef FA_SP_QDRAIN
+        // ==== FA_SP_QDRAIN -- DRAIN Q(t+1)'s MOVE-IN *DMA* BEFORE ISSUING PV.  ==================
+        // *** THIS IS A CORRECTNESS FIX, AND THE MEASUREMENT THAT FORCED IT IS: FA_SP_QSPLIT +
+        // FA_SP_CVTX + FA_SP_PREPK PRODUCES A WRONG TILE (cluster 1 tile 1, Frobenius 106.66%
+        // against golden_O_u16) EVEN THOUGH BOTH FLAGS ARE BIT-EXACT BY CONSTRUCTION. ***
+        // CVTX only XOR-permutes which of 8 output words an unrolled iteration writes and PREPK
+        // only moves the pack's arithmetic off warp 0; neither can change a computed value.  So the
+        // 12-of-12 that FA_SP_QSPLIT scores is NOT a property of the fix -- it is a property of the
+        // SCHEDULE, and a -726-cycle perturbation is enough to lose it.  (Exactly the caveat (F4)
+        // records for FA_SP_QOVL4 + SM1F + SM1FL, now with the sign reversed.)
+        //
+        // WHAT IS STILL RACING.  FA_SP_QSPLIT moved Q(t+1)'s move-in ISSUE into stage S4 and says
+        // so explicitly: "Only the ROCC ISSUE (32 gemmini_extended_mvin commands) is on warp 0's
+        // critical path here; the transfer is not."  The TRANSFER therefore runs on into stage S5,
+        // where the PV matmul's accumulator->spad move-out is live -- and that move-out needs an
+        // ATOMIC ALL-16-SUBBANK GRANT (Hazard 2).  O lands in SP_C = spad rows 3072..5120 =
+        // 0xC000..0x14000, i.e. the 32 KB SMEM banks 1 AND 2, while Q's DMA writes SP_Q =
+        // 0x16000..0x18000, which is ALSO bank 2.  That is the SAME bank collision FA_SP_QOVL3 hit;
+        // QSPLIT removed the issue from S5 but not the traffic.  Shortening stage S4 -- which is
+        // precisely what CVTX (-872 on the convert) and PREPK (-1.3k on the pack) do -- leaves LESS
+        // of S4 for the DMA to finish in, so more of it spills into S5.  That predicts the observed
+        // direction, and it also predicts why FA_SP_PAX (which shortens the stage BEFORE S4, moving
+        // the issue earlier in absolute time and so giving the DMA MORE room) comes out clean.
+        //
+        // THE FIX IS A DRAIN, NOT A DELAY: gemmini_fence() polls the BUSY register, so it actually
+        // waits for the DMA, unlike mu_fence_smem() which only drains this warp's own LSU queues
+        // (the bug class fixed in 1cce749).  It is close to free -- the DMA has had all of stage S4
+        // (~10k cycles) to move 8 KB -- and it makes correctness independent of how long S4 takes,
+        // which is the property every performance lever in this file needs.
+        //
+        // THERE ARE THREE INDEPENDENT WAYS TO KILL THIS HAZARD, AND THEY COMPOSE:
+        //   FA_SP_QDRAIN  (here)  wait for the DMA before the PV that shares its bank -- removes the
+        //                         OVERLAP IN TIME.
+        //   FA_SP_QEARLY  issue the DMA at the top of stage S2 instead of S4, giving it ~23.5k
+        //                 cycles instead of ~10k -- removes the SENSITIVITY TO S4's LENGTH, which is
+        //                 the specific thing CVTX and PREPK perturb.
+        //   FA_SP_BANKA   give S a whole 32 KB bank so PV's C destination is bank 1 EXACTLY and Q's
+        //                 DMA is bank 2 -- removes the BANK SHARING itself, i.e. the most structural
+        //                 of the three.  Note that FA_SP_BANKA already exists in this file for an
+        //                 unrelated reason (the four-entry, no-backpressure spad read queue that
+        //                 FA_SP_OPV asserts on) and its own comment states the collision this bug
+        //                 exploits -- "O lands in SP_C ... spanning banks 1 AND 2, while Q's DMA
+        //                 writes SP_Q, which is ALSO in bank 2" is the FA_SP_QOVL4 comment's own
+        //                 diagnosis of FA_SP_QOVL3.  FA_SP_QSPLIT moved the DMA's ISSUE out of stage
+        //                 S5 but not its TRANSFER, so the collision was never actually removed --
+        //                 only made rarer, which is why it took a bit-exact -1,095-cycle flag pair
+        //                 to expose it again.
+        fa_gf(tid);
+#endif
         fa_mm<PVF>(SP_P, SP_V_END, SP_C, /*asel=*/0, /*wsel=*/1, tid);
+#ifndef FA_SP_HSF
         if (t + 1 < (uint32_t)FA_SPTILES)
             fa_scl(fa_sf_a(1), &QK_A_scales_row[0][0], QKF.SCALE_FACTORS_PER_TILE(), tid);
-        fa_gf(tid);
+#endif
+        fa_gfl(tid);   // PV's move-out writes SP_C, which finalize READS in S6 (FA_SP_WCNT)
 #elif defined(FA_SP_QOVL4)
         // FA_SP_QOVL4: the Q(t+1) prefetch is NOT issued here -- see stage S6.  *** THIS IS THE
         // FIX FOR THE STEADY-STATE CORRECTNESS BUG. ***  FA_SP_QOVL3 issues Q(t+1)'s move-in
