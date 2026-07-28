@@ -1093,6 +1093,21 @@ static __attribute__((noinline)) void online_softmax_block(
             const uint32_t K8 = fa_clamp_K8(((int)em - 7) << 3);
             scale_scratch2p[bsel * SQ + row] = ((K8 - 8u) >> 3) + 7u;              // max(em,7)
         }
+        // *** SECOND FENCE, AND WITHOUT IT FA_SM_2PBM IS WRONG: bb IS REUSED EVERY ROW. ***
+        // The fold above has lane L read bb[bsel*BSTR + k] for k = 0..15 -- sixteen halfwords that
+        // OTHER LANES wrote.  The next iteration of this row loop then has those same other lanes
+        // OVERWRITE exactly those halfwords for the next row.  So there is a CROSS-LANE
+        // write-after-read between consecutive rows, and the fence before the fold only covers the
+        // read-after-write.  Without a fence here, row r+1's stores can be serviced before row r's
+        // fold loads are, and row r gets block maxima belonging to row r+1 -- which is a WRONG E8M0
+        // exponent for that (row, block), i.e. a whole 32-element block quantised against the wrong
+        // scale.  MEASURED before this fence: 4 correct, 7 WRONG of 11 tile-images at FA_NT6, with a
+        // 50,283-cycle mean whose spread (48,954..52,088) is the corrupt-timing signature.
+        // The alternative -- double-buffering bb by row parity -- does not fit: 2 x 1,632 B from
+        // 0x15000 reaches 0x15CC0 and would collide with pb at 0x15680, which is the bug fixed in
+        // fd722ac.  So it is a fence, at ~22 cycles x 11 rows = ~242 cyc/warp against the 2,754 that
+        // deleting requant pass A saves.
+        mu_fence_smem();
 #endif
     }
 #ifndef FA_SM_2PBM
