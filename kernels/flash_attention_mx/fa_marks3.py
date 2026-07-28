@@ -18,6 +18,13 @@ A = re.compile(r'clid=(\d).*?pc=([0-9a-f]{8}).*?inst=([0-9a-f]{16}).*?rs1\.data=
 def main():
     path = sys.argv[1]
     per = int(sys.argv[sys.argv.index('--per')+1]) if '--per' in sys.argv else 7
+    # *** MESH-BUSY PER INTERVAL, AND IT IS NOT ALWAYS 16,420. ***  Utilisation is
+    # mesh_busy_cycles / interval, and the interval this script measures is ONE ITERATION OF THE
+    # MARKED LOOP -- which for FA_SP_SQ32 is a HALF-tile of 32 query rows, i.e. 2 x 4,096 = 8,192
+    # mesh cycles, not the 64-row tile's 16,420.  Dividing 16,420 by a half-tile interval reports
+    # ~60% for a build whose real figure is ~30%, and that is exactly the kind of number that ships
+    # as a headline and then has to be retracted.  Pass --mesh 8192 for any FA_SP_SQ32 trace.
+    mesh = int(sys.argv[sys.argv.index('--mesh')+1]) if '--mesh' in sys.argv else 16420
     seq = {0: [], 1: []}
     for line in open(path, errors='replace'):
         if '[ISSUE]' not in line: continue
@@ -51,5 +58,6 @@ def main():
     if pooled:
         m = sum(pooled)/len(pooled)
         print(f"  POOLED steady intervals (n={len(pooled)}, drops the fill tile): mean {round(m)}  "
-              f"min {min(pooled)} max {max(pooled)}   util = {16420/m*100:.2f}%")
+              f"min {min(pooled)} max {max(pooled)}   util = {mesh/m*100:.2f}%  "
+              f"(mesh-busy {mesh}/interval{'' if mesh == 16420 else '  <-- HALF-TILE'})")
 main()
