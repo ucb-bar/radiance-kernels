@@ -325,15 +325,32 @@ static inline uint32_t e4m3_pack4_swar(uint32_t wlo, uint32_t whi, uint32_t D2,
 // that is what lets them be part of a verified headline, unlike the whole SMTPR/SMBMAX/SUBMAX/
 // NOMAX family which buys speed by moving the numerics to 4.2-7.8%.
 //
-// *** THE ONE-LINE LESSON OF THIS PASS: THE REGISTER BUDGET IS A SINGLE GLOBAL RESOURCE, AND
-// SPENDING IT WELL IN ONE FUNCTION IS WHAT MAKES ANOTHER FUNCTION AFFORDABLE. ***  FA_SP_CVTSWAR
-// (the 25-instruction SWAR fp8 packer, worth -56 instr/item on the second-largest SIMT stage) has
-// been sitting in this tree DEAD since the third pass because it cost 58 registers against a
-// 53-register cliff.  It is not the packer that changed: FA_SM_2P deletes the softmax's slo[8]/
-// shi[8] arrays and FA_SM_2PRAW deletes its 16 per-row fmul.h, which together take the whole-kernel
-// union 53 -> 46 -- and the packer then fits at 51.  Two levers that look independent are coupled
-// through Rename.scala, in both directions: FA_SM_2PBM and FA_SP_CVTXS each fit alone (50 / 51) but
-// TOGETHER need 55, because the allocator does not reuse names across the two all-warps functions.
+// *** RETRACTED: THE "53-REGISTER CLIFF" THIS BLOCK WAS ORIGINALLY WRITTEN AROUND DOES NOT EXIST,
+// AND fa_regs.py's WHOLE-FILE UNION IS NOT A MEASURE OF THE CONSTRAINT. ***  Rename.scala:110-123
+// hands out a physical register the first time a given WARP writes a given ARCH register and draws
+// from ONE counter per CORE, so the constraint is  sum over a core's resident warps of |arch regs
+// THAT WARP writes| <= 255.  A whole-file union charges the warp-0 agent path to warps that branch
+// around it, misses the RUNTIME entirely (_start / init_regs / mu_schedule are in the linked elf,
+// not in the kernel .s, and every warp runs them), and collapses the 3-warps-per-core multiplier
+// that is the term that actually binds.  fa_regs3.py computes it properly from the LINKED GPU elf.
+// Measured there, on the FA_SP_WCNT baseline:
+//     FA_SM_2P + FA_SM_2PRAW + FA_SP_PAX + FA_SP_CVTXS        core 1 = 3 x 55 = 165 / 255
+//     ... + FA_SM_2PBM + FA_SP_SMBMAX                         core 1 = 3 x 57 = 171 / 255
+// i.e. ~90 and ~84 PHYSICAL registers of headroom -- room for ~28-30 MORE arch registers in an
+// all-warps function.  The union metric is not even MONOTONE in the real figure (FA_SP_SQ32 has a
+// HIGHER union than a running baseline, 55 vs 53, and a much LOWER per-warp figure, 57 vs 72), so it
+// could not have been rescued by moving its threshold.  The empirical "53 runs / 55 and 58 abort"
+// bracket that this whole campaign designed around was reading a quantity that is not the budget.
+// WHAT SURVIVES the retraction, because it is mechanism rather than threshold: registers ARE a
+// shared per-core resource, so spending them in one all-warps function does reduce what another can
+// use -- that part of the reasoning below is sound.  WHAT DOES NOT: every "X is fatal at N
+// registers" judgement, including my own worry that FA_SM_2PBM and FA_SP_CVTXS could not coexist.
+// They coexist at 171/255 with 84 to spare.  The one rejection that stands is FA_SP_SM1FX, and it
+// stands for the right reason on the right metric: 3 x 90 = 270 / 255, genuinely over.
+// The practical consequence for the code below: several of its structures were contorted to save
+// registers that were never scarce -- pass A's max was cut from four independent chains to two, and
+// FA_SM_2PBM's block fold from two to one -- purely to chase the union down.  Those were free
+// memory-level parallelism given away for nothing, and are the first thing to undo.
 //
 // *** AND THE RESULT THAT MATTERS MOST IN THIS PASS IS A CORRECTNESS RESULT, NOT A SPEED ONE:
 // FA_SP_QSPLIT's "12 of 12" IS A PROPERTY OF ITS SCHEDULE, NOT OF ITS FIX. ***  Measured at
@@ -923,6 +940,17 @@ static __attribute__((noinline)) void online_softmax_block(
     // NT + 1, for the same reason and with the same bug history as STR above: at 2*NT+1 this buffer
     // is 6*8*33*2 = 3,168 B from 0x15000 and reaches 0x15C60, which COLLIDES WITH pb at 0x15680 --
     // a second, independent out-of-bounds that only FA_SM_2PBM activates.
+    //
+    // *** NOTE FOR ANYONE HOLDING A MEASUREMENT OF FA_SM_2PBM FROM BEFORE fd722ac: THIS IS ALMOST
+    // CERTAINLY WHY IT WAS WRONG, AND IT IS NOT THE BLOCK-MAX ALGORITHM. ***  bb holds the per-lane
+    // block maxima and pb holds the l/m partials, so before the fix the two scribbled over each
+    // other on every row -- and the observed signature of that is precisely "the stack WITH
+    // FA_SM_2PBM + FA_SP_SMBMAX is wrong on every tile-image, the same stack WITHOUT it is clean",
+    // which is what a concurrent pass measured and reasonably attributed to the block-max path.
+    // The block-max path had never been run without the collision.  Any build predating fd722ac
+    // carries BOTH overruns (pb into SP_Q for every FA_SM_2P build, plus this one for 2PBM), so
+    // those tile verdicts want re-running rather than believing; the cycle counts are unaffected,
+    // since pb and bb are pure scratch and nothing downstream reads them after the fold.
     constexpr uint32_t BSTR = NT + 1;
     constexpr uint32_t BB_BASE = 0x15000, BB_WARPS = 6;
     static_assert(BB_BASE + BB_WARPS * WPL * BSTR * sizeof(uint16_t) <= PB_BASE,
@@ -950,20 +978,23 @@ static __attribute__((noinline)) void online_softmax_block(
     // golden_S_u16 gives byte-identical m for the two forms on all 64 rows.
     for (uint32_t row = warp; row < SQ; row += nwarps) {
         const __shared uint32_t *Srow = S_smem32 + row * BKW;
-        // TWO chains, not four: still four loads per iteration in flight (the loads are what needs
-        // the parallelism; fmax latency is not the limit), but two fewer live fp registers -- and
-        // this is an all-warps function, so each one costs 3x on the binding core.  That is what
-        // buys FA_SP_CVTXS and FA_SM_2PBM room to coexist under the 53-register cliff.
-        _Float16 x0 = as_bf16(NEG_INF_BF16_BITS), x1 = x0;
+        // FOUR independent chains, one per load, so the four loads of an iteration have no
+        // dependence between them.  This was cut to two to chase fa_regs.py's whole-file union
+        // under a "53-register cliff" that fa_regs3.py has since shown does not exist (this stack
+        // measures 165/255 on the binding core, ~30 spare arch regs) -- i.e. it was free
+        // memory-level parallelism given away for nothing.  Restored.  Bit-exact either way: fmax
+        // is exact and fully order-independent, so any grouping gives the identical bf16.
+        _Float16 x0 = as_bf16(NEG_INF_BF16_BITS), x1 = x0, x2 = x0, x3 = x0;
         for (uint32_t j = 0; j < WPL; j += 4) {
             const uint32_t w0 = Srow[(j + 0) * NT + lane], w1 = Srow[(j + 1) * NT + lane],
                            w2 = Srow[(j + 2) * NT + lane], w3 = Srow[(j + 3) * NT + lane];
             x0 = fmaxf(fmaxf(as_bf16((uint16_t)w0), as_bf16((uint16_t)(w0 >> 16))), x0);
             x1 = fmaxf(fmaxf(as_bf16((uint16_t)w1), as_bf16((uint16_t)(w1 >> 16))), x1);
-            x0 = fmaxf(fmaxf(as_bf16((uint16_t)w2), as_bf16((uint16_t)(w2 >> 16))), x0);
-            x1 = fmaxf(fmaxf(as_bf16((uint16_t)w3), as_bf16((uint16_t)(w3 >> 16))), x1);
+            x2 = fmaxf(fmaxf(as_bf16((uint16_t)w2), as_bf16((uint16_t)(w2 >> 16))), x2);
+            x3 = fmaxf(fmaxf(as_bf16((uint16_t)w3), as_bf16((uint16_t)(w3 >> 16))), x3);
         }
-        pb[row * STR + lane] = __builtin_bit_cast(uint16_t, (_Float16)fmaxf(x0, x1));
+        pb[row * STR + lane] =
+            __builtin_bit_cast(uint16_t, (_Float16)fmaxf(fmaxf(x0, x1), fmaxf(x2, x3)));
     }
 #else
     for (uint32_t row = warp; row < SQ; row += nwarps) {
@@ -1051,13 +1082,14 @@ static __attribute__((noinline)) void online_softmax_block(
         {
             const uint32_t bsel = lane & (WPL - 1u);
             const __shared uint16_t *bp = bb + bsel * BSTR;
-            // ONE accumulator chain, not two: this is an all-warps function, so every register here
-            // costs 3x on the binding core, and the 16 loads still overlap regardless of how many
-            // chains consume them (fmax latency is not the limit -- SMEM latency is).
-            _Float16 y0 = as_bf16(bp[0]);
-            for (uint32_t k = 1; k < NT; k++) y0 = fmaxf(y0, as_bf16(bp[k]));
+            // TWO chains (was cut to one for the same non-existent register cliff; see the
+            // retraction at the top of this file).  Order-free, so bit-exact either way.
+            _Float16 y0 = as_bf16(bp[0]), y1 = as_bf16(bp[1]);
+            for (uint32_t k = 2; k < NT; k += 2) {
+                y0 = fmaxf(y0, as_bf16(bp[k + 0])); y1 = fmaxf(y1, as_bf16(bp[k + 1]));
+            }
             const uint32_t em =
-                ((uint32_t)__builtin_bit_cast(uint16_t, (_Float16)y0) >> 7) & 0xffu;
+                ((uint32_t)__builtin_bit_cast(uint16_t, (_Float16)fmaxf(y0, y1)) >> 7) & 0xffu;
             const uint32_t K8 = fa_clamp_K8(((int)em - 7) << 3);
             scale_scratch2p[bsel * SQ + row] = ((K8 - 8u) >> 3) + 7u;              // max(em,7)
         }
