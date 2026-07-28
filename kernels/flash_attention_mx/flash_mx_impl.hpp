@@ -376,9 +376,26 @@ static inline uint32_t e4m3_pack4_swar(uint32_t wlo, uint32_t whi, uint32_t D2,
 //   + CVTX + PREPK + PAX                          46,542  35.28%  8 ok, 4 WRONG /12   53
 //   + CVTX + PREPK + FA_SM_2P                   **43,896  37.41%  12 of 12 CORRECT**  50
 //   + CVTX + PREPK + FA_SM_2P + PAX               44,242  37.11%  8 ok, 4 WRONG /12   50
-// *** SO THE BANKED, VERIFIED RESULT OF THIS PASS IS 43,896 cyc/tile = 37.41%, 12 of 12 -- i.e.
-// -3,006 cycles and +2.40 POINTS of mesh utilisation over the published 34.96%/35.01% baseline,
-// entirely from FA_SM_2P. ***  Its ten steady intervals are 43,147..44,543, i.e. tight.
+// *** THAT 43,896 / 37.41% ROW IS RETRACTED AS A *VERIFIED* NUMBER, AND THE REASON IS A BUG IN
+// FA_SM_2P ITSELF THAT REVIEW CAUGHT AND TWELVE CLEAN TILE-IMAGES DID NOT. ***  The pb stride was
+// coded `2 * NT + 1` = 33 where it had to be `NT + 1` = 17, so the buffer ran 1,756 bytes past
+// 0x16000 into Q's operand spad on every tile -- and it scored 12 of 12 anyway, because Q(t+1)'s
+// move-in DMA is issued in stage S4, AFTER this stage's barrier, and happened to rewrite exactly
+// the rows the overrun had corrupted before the QK in S6 could read them.  A second, independent
+// overrun sat in FA_SM_2PBM's bb buffer (3,168 B from 0x15000, colliding with pb at 0x15680).
+// THREE THINGS ARE WORTH TAKING FROM THIS, because it is the third time in this campaign that a
+// green result rested on an accident:
+//   * the timing measurement was never in doubt (pb is pure scratch, so the cycle count is real),
+//     but the CORRECTNESS verdict was, and only the correctness verdict;
+//   * FA_SP_QEARLY WOULD HAVE DETONATED IT -- that flag moves the Q DMA to the top of this very
+//     stage so it runs CONCURRENTLY with the softmax, after which nothing covers the overrun.  The
+//     two flags were built and queued together, so the accident was one run away from becoming a
+//     mystery corruption in a configuration where the softmax looked innocent;
+//   * the fix is not "change 33 to 17", it is to make the bound a COMPILE-TIME property:
+//     static_assert(PB_BASE + SQ*STR*2 <= 0x16000) and the matching one for bb.  Verified
+//     non-vacuous by reinstating the bug, which now fails the build instead of the golden.
+// The in-bounds version is re-measured at FA_NT6 before any number here is quoted as verified; the
+// register counts are unchanged (50 / 51 / 55), so the register conclusions above stand.
 //
 // AND A THIRD MEASUREMENT TRAP, WHICH THE TWO WRONG ROWS ABOVE DEMONSTRATE: *** A CORRUPT TILE HAS
 // A CORRUPT *TIMING* TOO, SO A WRONG-ANSWER RUN'S CYCLE COUNT IS NOT A PERFORMANCE MEASUREMENT. ***
@@ -409,6 +426,15 @@ static inline uint32_t e4m3_pack4_swar(uint32_t wlo, uint32_t whi, uint32_t D2,
 //     whole "split the mesh op so SIMT can hide under it" family, which is why stage S5's 8,883
 //     cycles of PV are exposed with five warps idle and stay that way.  THE ONE EXCEPTION is the
 //     store-only loop_ws (fa_store_acc): it has no scale dependency at all and CAN be split.
+//  1b. RETRACTION, for the record: I reported that HEAD "cannot build any FA_SP configuration"
+//     because fa_cfg_settle was referenced five times and never defined.  That was true of the
+//     commit I tested against (1cce749: zero occurrences in its mxgemm_core.hpp) and is NOT a
+//     latent flag hole -- mxgemm_core.hpp guards the definition with
+//     `#if defined(FA_CFGSETTLE)||...` / `#else static inline void fa_cfg_settle() {}`, so BOTH
+//     branches define it and all six FA_CFGSETTLE* combinations compile (verified).  It was a
+//     transient window in a shared tree: the definition lived in a concurrently-edited
+//     mxgemm_core.hpp that landed in ea1be58, after 1cce749 and after my own commit.  Nothing to
+//     close; the claim as I first phrased it was wrong.
 //  2. The HW MxRequantizer cannot replace the convert.  copy_P_to_requant is warp-0-only and the
 //     requantizer's SMEM manager takes EXACTLY 32-byte beats, so feeding it 64x256 bf16 is 1,024
 //     sequential 8-lane stores on ONE warp -- the same single-thread-serial-port wall as the SF
@@ -870,16 +896,39 @@ static __attribute__((noinline)) void online_softmax_block(
     // flash_attention_mx.cpp: clang reaches for fp32 -- or for contraction -- on its own, and the
     // only reliable fix is to name the instruction.)
     {
-    constexpr uint32_t STR = 2 * NT + 1;                 // 17 halfwords per row (odd: see above)
-    __shared uint16_t *const pb = reinterpret_cast<__shared uint16_t *>(0x15680);
+    // *** STRIDE BUG, FOUND BY REVIEW AND NOT BY A SIMULATION -- READ THIS BEFORE TOUCHING IT. ***
+    // This was written `2 * NT + 1`, which is 33, not the 17 the comment above claims: a row needs
+    // NT=16 halfwords plus ONE of padding to make the stride odd, i.e. NT + 1.  At 33 the buffer is
+    // 64*33*2 = 4,224 B from 0x15680 and its last write lands at 0x166DC -- 1,756 BYTES INSIDE Q's
+    // SPAD (SP_Q = 0x16000), i.e. it corrupted Q rows 0..13 on every tile.
+    // IT PASSED 12 of 12 ANYWAY, and that is the whole lesson: Q(t+1)'s move-in DMA is issued in
+    // stage S4, AFTER this stage's barrier, so it happened to rewrite exactly the rows this
+    // overran before the QK in stage S6 could read them.  A correctness result that depends on a
+    // later DMA coincidentally clobbering your out-of-bounds writes is not a correctness result --
+    // it is the same class of accident as FA_SP_QSPLIT's schedule-dependent 12 of 12 documented
+    // above, with a longer fuse.  *** AND FA_SP_QEARLY LIGHTS IT: *** that flag moves the Q DMA to
+    // the TOP of this stage so it runs CONCURRENTLY with the softmax, after which the overrun is no
+    // longer covered by anything and Q really is corrupt when QK reads it.
+    // The static_asserts below make the bound a compile-time property instead of a coincidence.
+    constexpr uint32_t STR = NT + 1;                     // 17 halfwords per row (odd: see above)
+    constexpr uint32_t PB_BASE = 0x15680;
+    static_assert(PB_BASE + SQ * STR * sizeof(uint16_t) <= 0x16000,
+                  "FA_SM_2P: pb overruns SP_Q (the Q operand spad at 0x16000)");
+    __shared uint16_t *const pb = reinterpret_cast<__shared uint16_t *>(PB_BASE);
 #ifdef FA_SM_2PBM
     // FA_SM_2PBM block-max partials: 8 blocks x 17 halfwords per warp = 136, x6 warps = 1,632 B at
     // REDBUF_SMEM (0x15000), which FA_SM_2P no longer uses for anything (it returns before `buf`).
     // 17 again: the fold has lane L read block (L & 7), and with an even stride all 16 lanes would
     // land on 2 of the 16 word-subbanks.
-    constexpr uint32_t BSTR = 2 * NT + 1;
+    // NT + 1, for the same reason and with the same bug history as STR above: at 2*NT+1 this buffer
+    // is 6*8*33*2 = 3,168 B from 0x15000 and reaches 0x15C60, which COLLIDES WITH pb at 0x15680 --
+    // a second, independent out-of-bounds that only FA_SM_2PBM activates.
+    constexpr uint32_t BSTR = NT + 1;
+    constexpr uint32_t BB_BASE = 0x15000, BB_WARPS = 6;
+    static_assert(BB_BASE + BB_WARPS * WPL * BSTR * sizeof(uint16_t) <= PB_BASE,
+                  "FA_SM_2PBM: bb collides with FA_SM_2P's pb buffer");
     __shared uint16_t *const bb =
-        reinterpret_cast<__shared uint16_t *>(0x15000) + warp * (WPL * BSTR);
+        reinterpret_cast<__shared uint16_t *>(BB_BASE) + warp * (WPL * BSTR);
     // SCALE_SMEM (0x14000): one 32-bit word per (block, row), the layout fa_requant_cvt reads.
     // Hardcoded for the same reason 0x15000 is: online_softmax_block has no scale_scratch argument
     // and this flag is FA_SP-only.  Build it together with -DFA_SP_SMBMAX, which is what compiles
