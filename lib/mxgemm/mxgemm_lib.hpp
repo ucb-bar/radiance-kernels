@@ -21,6 +21,9 @@ struct GemmConfig {
     GemmDatatype DATATYPE = GemmDatatype::FP8;
     // quantize output to fp4/fp6/fp8
     bool QUANT_OUTPUT = false;
+    // Accumulate C in ACCMEM for the whole K-loop and move out Acc->GMEM directly,
+    // instead of draining Acc->SMEM on the last k-tile then SMEM->GMEM.
+    bool ACC_TO_GMEM = false;
 
     constexpr bool IS_FP8() const { return DATATYPE == GemmDatatype::FP8; }
     constexpr uint32_t PE_M() const { return (IS_FP8() ? 16 : 32); }
@@ -555,18 +558,24 @@ static void copy_accmem_to_gmem_dma_sync(uint8_t *dest_gmem,
     asm volatile("copy_accmem_to_gmem_dma_sync_start_%=:" ::);
 
     if (tid_in_threadblock == 0) {
-        for (int i = 0; i < C.PE_TILES_I(); i++) {
+        // Block the move-out by C's own geometry, not the PE tile: one mvout covers DIM
+        // accmem rows of ELEMS_PER_ACC_ROW outputs each. Deriving it from PE_TILES_J
+        // under-covers C whenever PE_N != DIM (i.e. all of fp4/fp6).
+        constexpr uint32_t ELEMS_PER_ACC_ROW = 4 * DIM;
+        constexpr uint32_t RBLK = C.TILE_M_QUANT() / DIM;
+        constexpr uint32_t CBLK = C.TILE_N_QUANT() / ELEMS_PER_ACC_ROW;
+        static_assert(RBLK * CBLK * DIM <= ACC_ROWS, "C move-out exceeds ACCMEM");
+
+        for (uint32_t i = 0; i < RBLK; i++) {
 #pragma unroll 32
-            // need 4 because 4 fit in accmem row
-            for (int j = 0; j < C.PE_TILES_J() / 4; j++) {
+            for (uint32_t j = 0; j < CBLK; j++) {
                 const uint32_t tile_acc_addr =
-                    GEMMINI_ACC_ADDR + (i * C.PE_TILES_J() / 4 + j) * DIM;
+                    GEMMINI_ACC_ADDR + (i * CBLK + j) * DIM;
                 // row-major layout
                 // TODO: DRAM stride is wrong for re-quantized output
                 uint8_t *dram_ptr =
                     dest_gmem +
-                    (i * DIM * dim_n + j * DIM * 2 /*is this right?*/) *
-                        C.OUT_ELEM_SIZE();
+                    (i * DIM * dim_n + j * ELEMS_PER_ACC_ROW) * C.OUT_ELEM_SIZE();
                 gemmini_mvout(rad_device_to_host_address(
                                   reinterpret_cast<uint32_t>(dram_ptr)),
                               tile_acc_addr);
@@ -708,7 +717,8 @@ void mxgemm_single_output_tile(const uint32_t dim_m, const uint32_t dim_n,
 
         // asynchrously kick off matmul for this tile_k
         // gemmini_fence_ready();
-        matmul_tile_async<C>(tile_k, last_k);
+        // ACC_TO_GMEM never drains to SMEM, so suppress the last-k STC too.
+        matmul_tile_async<C>(tile_k, last_k && !C.ACC_TO_GMEM);
 
         // update scale factors for the next tile_k
         // make sure to place this between tile_async and fence to hide latency
@@ -751,10 +761,12 @@ mxgemm(const uint32_t dim_m, const uint32_t dim_n, const uint32_t dim_k,
     // The C accumulator must fit in a scratchpad gap between the double-buffered A/B
     // operand tiles. If it does not, C would be written over an operand and the result
     // would be silently wrong (see GemmConfig::SPAD_DEST()). Reject at compile time.
-    static_assert(C.C_FITS_IN_SPAD(),
+    // ACC_TO_GMEM never stages C through SMEM, so the constraint does not apply there.
+    static_assert(C.ACC_TO_GMEM || C.C_FITS_IN_SPAD(),
                   "C does not fit in the scratchpad alongside the double-buffered A/B "
                   "tiles for this GemmConfig. Reduce TILE_K (a 128x128 tile needs "
-                  "TILE_K <= 128) or shrink TILE_M/TILE_N.");
+                  "TILE_K <= 128), shrink TILE_M/TILE_N, or set ACC_TO_GMEM = true to "
+                  "keep C in ACCMEM and move out Acc->GMEM directly.");
 
     mxgemm_single_output_tile<C>(dim_m, dim_n, dim_k, tid_in_threadblock,
                                  threads_per_threadblock);
@@ -762,8 +774,20 @@ mxgemm(const uint32_t dim_m, const uint32_t dim_n, const uint32_t dim_k,
     const auto warps_per_threadblock = threads_per_threadblock / MU_NUM_THREADS;
     mu_barrier(1, warps_per_threadblock);
 
-    // Move-out C from SMEM to GMEM
-    if constexpr (!DISABLE_GMEM_MOVE_OUT) {
+    // Move-out C: Acc->GMEM directly when C never entered the scratchpad, else SMEM->GMEM.
+    if constexpr (C.ACC_TO_GMEM) {
+        if constexpr (!DISABLE_GMEM_MOVE_OUT) {
+            copy_accmem_to_gmem_dma_sync<C>(C_gmem, dim_n, tid_in_threadblock);
+            mu_barrier(2, warps_per_threadblock);
+
+            // DMA moves are not traced; mirror C via SIMT so it is verifiable.
+            auto trace_gmem = reinterpret_cast<uint8_t *>(0x60000000);
+            copy_gmem_to_gmem_simt<C.TILE_M_QUANT(), C.TILE_N_QUANT(),
+                                   C.OUT_ELEM_SIZE()>(C_gmem, trace_gmem,
+                                                      tid_in_threadblock,
+                                                      threads_per_threadblock);
+        }
+    } else if constexpr (!DISABLE_GMEM_MOVE_OUT) {
         auto C_smem =
             reinterpret_cast<const __shared uint8_t *>(C.SPAD_DEST() * DIM);
         if constexpr (SIMT_GMEM_MOVE_OUT) {
