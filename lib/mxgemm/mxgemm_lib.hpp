@@ -99,6 +99,14 @@ struct GemmConfig {
     constexpr bool C_FITS_IN_SPAD() const { return SPAD_DEST() != 0; }
 };
 
+// Scale-factor copy in-flight depth (words held in registers per loop body). The copy is
+// GMEM-load-latency bound on a single lane, so throughput scales with this until register
+// pressure forces spills. 16 is the sweet spot: 32 still gains a little but spills in the
+// prologue, 64 spills in the hot loop. Override with -DMXGEMM_SF_ILP=N.
+#ifndef MXGEMM_SF_ILP
+#define MXGEMM_SF_ILP 16
+#endif
+
 // Gemmini constants -----------------------------------------------------------
 
 // GUARD: the scratchpad geometry must match the silicon we target.
@@ -276,19 +284,27 @@ load_scale_factors(volatile __shared uint32_t *sf_mem, const uint8_t *scale_fact
     // asm volatile ("load_scale_factors_start_%=:" :: );
     auto word_scale_factors = reinterpret_cast<const uint32_t *>(scale_factors);
 
-    // unroll in registers to reduce back-to-back WAW/WAR
-    constexpr auto ILP = 8;
+    // Runs under the `tid_in_threadblock != 0` gate, so ONE lane: GMEM-load-latency bound,
+    // and the only lever is how many lw.global are in flight (0.31 B/clk at ILP=8, 0.39 at
+    // 16). One fused body, not `#pragma unroll 4`, which emitted four separately branched
+    // copies. The remainder loop covers n/4 % ILP != 0 -- n is a runtime arg.
+    constexpr int ILP = MXGEMM_SF_ILP;
+    const size_t words = n / 4;
+    size_t i = 0;
     uint32_t unrolled[ILP];
-    #pragma unroll 4
-    for (size_t i = 0; i < n / 4; i += ILP) {
+    for (; i + ILP <= words; i += ILP) {
         #pragma unroll
         for (int j = 0; j < ILP; j++) {
             // do full-word stores instead of 1-byte stores
             unrolled[j] = word_scale_factors[i + j];
         }
+        #pragma unroll
         for (int j = 0; j < ILP; j++) {
             sf_mem[i + j] = unrolled[j];
         }
+    }
+    for (; i < words; i++) {
+        sf_mem[i] = word_scale_factors[i];
     }
     // asm volatile ("load_scale_factors_end_%=:" :: );
 }
