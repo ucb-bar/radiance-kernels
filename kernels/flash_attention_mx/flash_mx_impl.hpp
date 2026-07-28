@@ -532,6 +532,82 @@ static inline void warp_tree_reduce(volatile __shared uint16_t *buf, uint32_t la
     }
 }
 
+// ============================================================================================
+// FA_TREEFIX -- *** CORRECTNESS FIX for warp_tree_reduce.  PROVEN FROM AN ISSUE TRACE. ***
+//
+// warp_tree_reduce has NO FENCE BETWEEN TREE LEVELS: at level s+1 lane L loads
+// buf[L + stride/2], which was written at level s by a DIFFERENT LANE.  The comment above
+// claims warp lockstep orders that hand-off.  IT DOES NOT.  Caught red-handed in the
+// FULL_ATTN2 + FA_NOSCALES + FA_EARLYV 6-tile run (trace /tmp/hsruns/nt6ver.out), cluster 1,
+// global warp 1, row 61, l-reduce -- the 16 stored partials and every level's stored result are
+// bit-identical across tiles, and yet:
+//     tile 2 (correct): level1 buf[0]=0x403d buf[2]=0x4056 -> level2 buf[0]=0x40ca ... buf[0]=0x41e2 (28.25)
+//     tile 4          : level2 buf[0]=0x4087 = 0x403d + *0x3a03*  <- buf[2] BEFORE level 1 ran
+//     tile 1          : level4 buf[0]=0x41ac = 0x4147 + *0x4111*  <- buf[8] one LEVEL behind
+// i.e. the load at level s+1 returned the pre-level-s value, exactly (the arithmetic closes to
+// the bit).  Result: ONE row's l is a PARTIAL sum, that row of O is divided by the wrong
+// denominator, and the tile scores 5.4356% / 3.7232% instead of 3.5666%.  It is a latent race in
+// the SHARED softmax helper -- the unmodified sequential kernel happens not to hit the window.
+//
+// THE FIX: do not hand values between lanes at all.  Every lane loads all 16 partials (as 8
+// 32-bit words -- buf is 4-byte aligned, warp*NT halfwords) and folds them IN REGISTERS in the
+// SAME balanced binary tree order, so the result is BIT-IDENTICAL to the tree's:
+//     level 1: (b0+b1) (b2+b3) ...      level 2: ((b0+b1)+(b2+b3)) ...
+//     level 3: (b0..b3)+(b4..b7) ...    level 4: (b0..b7)+(b8..b15)
+// One store + one fence per reduce, no further SMEM traffic, no divergence regions (the tree
+// needed 4 vx_split_n/vx_join), and no store->load hand-off to race.
+// ============================================================================================
+// FA_FOLDX -- *** THE SAME FOLD WITH THE SUBBANK CONFLICT REMOVED, STILL BIT-EXACT. ***
+// warp_fold16 as written has all 16 lanes of a warp read THE SAME EIGHT WORDS, i.e. an 8-load
+// 16-WAY SMEM SUBBANK CONFLICT per reduction (the subbank is word_index & 15 and the index is
+// warp*8 + k, which is lane-uniform).  That is the entire reason FA_SP_SM1F -- the same one-fence
+// idea -- measured +1,502 cyc/tile instead of a win, and why FA_SP_SM1FR, which broke it with a
+// (k + lane) & 15 rotation, cost 70 instructions and 4 registers and lost too.
+// XOR COSTS NOTHING AND IS EXACT.  `buf` is warp*NT halfwords = warp*32 BYTES, so its low FIVE
+// address bits are zero and the eight word offsets occupy exactly bits 4:2 -- hence `+` is `^`, the
+// lane term folds into the base pointer ONCE, and every read is a compile-time-immediate XOR:
+//     addr(k ^ r) = (base ^ (r<<2)) ^ (k<<2),     r = lane & 7.
+// Over 16 lanes r takes 8 values, so each step touches 8 distinct words = 2-way instead of 16-way.
+// *** WHY THE SUM STAYS BIT-IDENTICAL, which is the whole point. ***  Reading u[k] = f(word k^r)
+// permutes the eight level-1 results by XOR, and XOR-by-a-constant is an AUTOMORPHISM OF THE
+// DYADIC TREE: the pair {k, k^1} is a level-2 tree pair, {k,k^1} vs {k^2,k^3} is a level-3 pair,
+// and so on.  So the same expression evaluated over the permuted array is the tree's expression
+// with some subtrees' operands SWAPPED -- and bf16 addition is COMMUTATIVE even though it is not
+// associative, so every intermediate, and the result, is bit-identical.  (Note this is exactly
+// what a `(k + lane) & 15` rotation canNOT claim: a cyclic shift by an odd amount maps {0,1} to
+// {1,2}, which is not a tree pair, so FA_SP_SM1FR's rotation was only legal for the max.)
+// Level 1 itself is untouched: word k^r still holds the ADJACENT pair (b_{2j}, b_{2j+1}).
+template <bool IS_MAX>
+static inline _Float16 warp_fold16(const volatile __shared uint16_t *buf,
+                                   uint32_t lane_rot = 0) {
+    const volatile __shared uint32_t *w =
+        reinterpret_cast<const volatile __shared uint32_t *>(buf);
+    _Float16 u[8];
+#ifdef FA_FOLDX
+    const uint32_t wx = ((uint32_t)(uintptr_t)w) ^ ((lane_rot & 7u) << 2);
+#pragma clang loop unroll(full)
+    for (uint32_t k = 0; k < 8; k++) {
+        const uint32_t x = *reinterpret_cast<const volatile __shared uint32_t *>(wx ^ (k << 2));
+        const _Float16 a = as_bf16((uint16_t)x), b = as_bf16((uint16_t)(x >> 16));
+        u[k] = IS_MAX ? fmaxf(a, b) : (_Float16)(a + b);       // == the tree's level 1
+    }
+#else
+    (void)lane_rot;
+#pragma clang loop unroll(full)
+    for (uint32_t k = 0; k < 8; k++) {
+        const uint32_t x = w[k];
+        const _Float16 a = as_bf16((uint16_t)x), b = as_bf16((uint16_t)(x >> 16));
+        u[k] = IS_MAX ? fmaxf(a, b) : (_Float16)(a + b);       // == the tree's level 1
+    }
+#endif
+#pragma clang loop unroll(full)
+    for (uint32_t s = 1; s < 8; s <<= 1)
+#pragma clang loop unroll(full)
+        for (uint32_t k = 0; k + s < 8; k += 2 * s)
+            u[k] = IS_MAX ? fmaxf(u[k], u[k + s]) : (_Float16)(u[k] + u[k + s]);
+    return u[0];
+}
+
 // multiply a bf16 value by 2^e (exact: add to exponent field).
 static inline _Float16 bf16_scale_pow2(_Float16 v, int e) {
     uint16_t b = __builtin_bit_cast(uint16_t, v);
@@ -684,6 +760,20 @@ static __attribute__((noinline)) void softmax_to_smem(const __shared uint32_t *S
 }
 
 // ===== Streaming (flash) online-softmax helpers =====
+// FA_SP_RBPAD -- pad the PER-WARP stride of the cross-lane reduce buffer so the six warps stop
+// colliding with each other.  buf sits at 0x15000 + warp*NT halfwords = warp*32 BYTES = warp*8
+// WORDS, and the subbank is word_index & 15, so warps 0/2/4 all land on subbank 0 and warps 1/3/5
+// all land on subbank 8 -- a 3-way INTER-warp conflict layered on top of the 16-way INTRA-warp one
+// (all 16 lanes of a warp read buf[0] to broadcast each reduction's result).  A stride of NT+2 = 18
+// halfwords = 9 words puts warps 0..5 on subbanks 0, 9, 2, 11, 4, 13: six distinct.  The footprint
+// grows from 192 B to 216 B, still inside the scratch window, and it is an ADDRESS change only, so
+// it is bit-exact and costs zero registers and zero instructions.  (It does NOT touch the intra-warp
+// broadcast conflict -- that needs FA_FOLDX or FA_SM_2P.)
+#ifdef FA_SP_RBPAD
+#define FA_RB_STRIDE (MU_NUM_THREADS + 2u)
+#else
+#define FA_RB_STRIDE (MU_NUM_THREADS)
+#endif
 // online_softmax_block: for one key-block S_j [SQ][BK] (bf16 in SMEM), update the running
 // per-row max m and denom l, emit corr = exp(m_old - m_new) for rescaling the O
 // accumulator, and write the UNNORMALIZED probs P_j = exp(S_j*scale - m_new) (bf16, in
@@ -703,7 +793,7 @@ static __attribute__((noinline)) void online_softmax_block(
     const uint32_t nwarps = threads_per_threadblock / NT;
     const _Float16 scale = as_bf16(softmax_scale_bf16);
     volatile __shared uint16_t *buf =
-        reinterpret_cast<volatile __shared uint16_t *>(0x15000) + warp * NT;
+        reinterpret_cast<volatile __shared uint16_t *>(0x15000) + warp * FA_RB_STRIDE;
 
 #ifdef FA_SM_2P
     // ==========================================================================================
@@ -961,6 +1051,10 @@ static __attribute__((noinline)) void online_softmax_block(
         }
 #ifdef FA_SM_FAST
         _Float16 bmax = warp_butterfly_reduce<true>(buf, lane, mloc);
+#elif defined(FA_TREEFIX)
+        buf[lane] = __builtin_bit_cast(uint16_t, mloc);
+        mu_fence_smem();
+        _Float16 bmax = warp_fold16<true>(buf, lane);           // race-free, bit-identical
 #else
         buf[lane] = __builtin_bit_cast(uint16_t, mloc);
         mu_fence_smem(); warp_tree_reduce<true>(buf, lane); mu_fence_smem();
@@ -978,6 +1072,10 @@ static __attribute__((noinline)) void online_softmax_block(
         }
 #ifdef FA_SM_FAST
         _Float16 lsum = warp_butterfly_reduce<false>(buf, lane, lloc);
+#elif defined(FA_TREEFIX)
+        buf[lane] = __builtin_bit_cast(uint16_t, lloc);
+        mu_fence_smem();
+        _Float16 lsum = warp_fold16<false>(buf, lane);          // race-free, bit-identical
 #else
         buf[lane] = __builtin_bit_cast(uint16_t, lloc);
         mu_fence_smem(); warp_tree_reduce<false>(buf, lane); mu_fence_smem();

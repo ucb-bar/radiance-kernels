@@ -5,6 +5,231 @@
 #include "include/gemmini.h"
 #include "mxgemmini_mmio.h"
 
+// ============================================================================================
+// FA_NS_FENCE / FA_NS_OCC -- FENCE-TOO-EARLY GUARDS APPLIED TO *EVERY* GEMMINI FENCE.
+//
+// gemmini_fence() (mxgemmini_mmio.h) is `while (load32_shared(GEMMINI_BUSY_ADDR) != 0) nop;`.
+// It drains only what is ALREADY VISIBLE AS BUSY.  Measured from a full [ISSUE] trace of
+// FULL_ATTN2 + FA_NOSCALES + FA_EARLYV at FA_NT6 (/tmp/hsruns/nt6ver.out), counting the BUSY
+// loads that each fence actually performs:
+//     mxgemm_prefetch_tile   configure_mxgemmini's fence   1 poll   in EVERY tile  (drains nothing)
+//     mxgemm_compute_tile    leading fence (QK)            1..120 polls, and 1 (= nothing) in
+//                                                          cl0 tile 2 and cl1 tile 5
+//     mxgemm_compute_tile    leading fence (PV)            1 poll   in EVERY tile (drains nothing)
+//     mxgemm_compute_tile    trailing fences               234..245 polls (these do drain)
+// So the leading drains routinely return having waited for nothing, which is only safe if the
+// gemmini's own reservation station orders the pending move-in ahead of the matmul.
+//   FA_NS_FENCE: bounded wait for busy to ASSERT, then the normal drain -- at EVERY fence, not
+//                just the one in mxgemm_compute_tile that FA_NS_SETTLE guards.
+//   FA_NS_OCC:   drain on the OCCUPANCY counter instead (incremented when the command is
+//                accepted, so there is no assert-latency race at all).  H8 warns the occupancy
+//                MMIO can be phantom-poisoned on the SKIP_A path, hence the separate flag.
+// ============================================================================================
+// ============================================================================================
+// FA_CFGSETTLE -- *** CORRECTNESS FIX: CONFIG_SCALE_MEM MUST BE APPLIED BEFORE THE MATMUL. ***
+//
+// ScaleFactorMem.scala computes the MX scale-SRAM READ ROW from the loop bounds that
+// CONFIG_SCALE_MEM (funct 26, gemmini_mxquant_config_mvout) latches:
+//     read_row_addr_act := loop_bound_i * (counter_k_runtime >> 1) + counter_i_runtime
+//     read_row_addr_w   := loop_bound_j * (counter_k_runtime >> 1) + counter_j_runtime
+// and the half of the double buffer from the same register's scale_mem_read_act_sel /
+// _w_sel.  In this kernel the two gemms differ in loop_bound_j (QKF: N=Sk=256 -> 16;
+// PVF: N=d=128 -> 8) but NOT in loop_bound_i (both M=Sq=64 -> 4).  So if a matmul starts
+// while the register still holds the PREVIOUS gemm's value, the WEIGHT (B) scale rows are
+// aliased and the ACT (A) scale rows are not -- a B-side-only corruption.
+//
+// THAT IS EXACTLY WHAT THE FAILING BUILD MEASURES.  Recovering S from the softmax's bf16 P
+// and projecting onto the row space of the correct effective K matrix leaves a 22.0% residual
+// (floor 2.3%); with the hw mesh model -- which reproduces golden_S BIT-EXACTLY -- an
+// arbitrarily corrupted A operand or A scale set leaves the residual AT the 2.3% floor
+// (mathematically: S = A''@B' for any A''), while corrupting the B scales pushes it to
+// 25-63%.  |S| is also preserved to 0.08%, which is what aliasing scale bytes that only
+// span 127..129 does and what substituting the act half does NOT (|S| drops 2.7x).
+//
+// WHY THE BASELINE IS SAFE AND BOTH OPTIMISATIONS ARE NOT -- AND WHY THE TWO FAILURES ARE ONE BUG.
+// mxgemm_compute_tile issues CONFIG_SCALE_MEM and then matmul_tile_async with NOTHING in
+// between, and the two take different paths inside the gemmini (CONFIG_SCALE_MEM is latched by
+// ExecuteController's decode, LOOP_WS is expanded by the LoopMatmul FSM), so program order at the
+// MMIO port does not order the register update against the mesh work that reads it.  The
+// unmodified kernel gets away with it because mxgemm_prefetch_tile's configure_mxgemmini already
+// issued the SAME CONFIG_SCALE_MEM for this gemm, and then spent ~12.6k cycles in
+// load_scale_factors -- so by matmul time the register ALREADY holds the right value and a late
+// second write is harmless.  BOTH optimisations delete exactly that slack:
+//     FULL_ATTN2 + FA_NOSCALES : load_scale_factors is gone, so the prefetch's CONFIG_SCALE_MEM
+//                                is only a few hundred cycles ahead of the matmul;
+//     FA_SP + FA_SP_LEANCFG    : configure_mxgemmini is compiled out entirely, so the ONLY
+//                                CONFIG_SCALE_MEM is the one inside fa_mm(), zero instructions
+//                                before the matmul.
+// Both therefore run a matmul whose scale addressing may still be the PREVIOUS gemm's.  Measured
+// on the two failing traces (/tmp/hsruns/nt6ver.out and the FA_SP one), the signature is
+// IDENTICAL and confined to ONE cluster: the bf16 P the softmax writes is bit-identical for tiles
+// 0..2 and then ALL 8192 words change at tile 3 and stay changed, with every downstream stage
+// (requant, pack, PV, finalize) bit-exact given S.  Measured from the trace: every "leading"
+// gemmini_fence in these builds returns after ONE BUSY poll, i.e. drains nothing, so nothing else
+// separates the config from the matmul.
+//
+// WHY IT NEVER RECOVERS.  ScaleFactorMem's counter_i/j/k_runtime are RegInits that advance per
+// 16x16 tile-step and re-zero ONLY by completing a full (i,j,k) sweep of the CURRENT bounds --
+// there is no reset path (gemmini_mxquant_config_mvout never sets rs1[62], and that bit resets
+// the REQUANTIZER's write counter, MxRequantizer.scala:558, not these).  So a bound change that
+// lands mid-sweep strands them permanently, which is exactly "correct until tile 3, wrong for
+// every tile after".
+//
+// THE FIX is 16 MMIO round trips (~600 cyc) between the config and the matmul issue (use
+// FA_CFGSETTLE2 -- the serialized form; see the note in fa_cfg_settle()).  Cost ~1.2k cyc/tile
+// out of ~69k (1.7%).
+//
+// WHAT IS PROVEN AND WHAT IS INFERRED, so nobody has to re-derive it:
+//   PROVEN from the traces: (a) S itself is wrong from the onset tile, and every downstream stage
+//     is bit-exact given S; (b) the two failing configs produce the SAME wrong S -- 85-89% of the
+//     16384 bf16 P halfwords are IDENTICAL between them at the same tile index, with row-space
+//     residual 22.0% vs 21.5% and |S| 1298.0 vs 1298.0 -- so it is ONE bug, not two; (c) it is
+//     confined to one cluster and never recovers; (d) a static A-operand or A-scale corruption is
+//     mathematically incapable of producing the observed row-space residual, so the weight side of
+//     the QK gemm is involved.
+//   PROVEN from the RTL: the weight scale read row depends on loop_bound_j (16 for QKF, 8 for
+//     PVF) while the act row depends on loop_bound_i (4 for both), and the counters that index
+//     them have no reset path.
+//   INFERRED: that the trigger is specifically the CONFIG_SCALE_MEM/LOOP_WS ordering.  No single
+//     static aliasing model reproduces the observed S bit-for-bit (the best -- a one-k-tile
+//     counter strand -- lands on 21.7% residual against the measured 22.0% but the wrong |S|),
+//     which is expected if the bounds change PART-WAY through a sweep: the counters then
+//     desynchronise progressively rather than by a fixed offset.  A time-varying operand
+//     reproduces the residual magnitude too (18-19%), so an operand-move-in race cannot be fully
+//     excluded -- which is why FA_NS_FENCE (drain harder everywhere) exists alongside this flag.
+// ============================================================================================
+// FA_CFGSETTLE_AFTER is the COST-MATCHED CONTROL: identical instruction count and
+// identical gemmini-port traffic, moved to AFTER the matmul issue.  If "before" is
+// correct and "after" is not, the ordering -- not the delay -- is what matters.
+#if defined(FA_CFGSETTLE) || defined(FA_CFGSETTLE_AFTER) || defined(FA_CFGSETTLE_PRE) \
+    || defined(FA_CFGSETTLE2) || defined(FA_CFGSETTLE_BIG)
+static inline void fa_cfg_settle() {
+#ifdef FA_CFGSETTLE_BIG
+    // DIAGNOSTIC ONLY (~9.5k cyc per matmul): if even this does not close the window then the
+    // CONFIG_SCALE_MEM-vs-matmul ordering is NOT the mechanism.
+    { uint32_t zero = 0; asm volatile("" : "+r"(zero));
+      uint32_t v = 0;
+      for (uint32_t _i = 0; _i < 256u; _i++) v = load32_shared(GEMMINI_BUSY_ADDR + (v & zero));
+      asm volatile("" :: "r"(v)); }
+#elif defined(FA_CFGSETTLE2)
+    // SERIALIZED form.  `+ (v & 0u)` is NOT enough: clang folds it away and emits 16 INDEPENDENT
+    // `lw.shared a6, 0x0(a5)` (verified in the objdump), which the LSU can pipeline, and since the
+    // loaded value is never used the warp never stalls -- the "settle" then costs ~16 issue slots
+    // and guarantees nothing.  Launder the address through an empty asm that also takes the
+    // previous result, so each load genuinely waits for its predecessor: 16 real MMIO round trips
+    // (~37 cyc each, measured from the gemmini_fence spin rate) = ~590 cyc.
+    uint32_t zero = 0;
+    asm volatile("" : "+r"(zero));          // an OPAQUE zero: clang cannot fold `v & zero`
+    uint32_t v = 0;
+    for (uint32_t _i = 0; _i < 16u; _i++) v = load32_shared(GEMMINI_BUSY_ADDR + (v & zero));
+    asm volatile("" :: "r"(v));
+#else
+    uint32_t v = 0;
+    for (uint32_t _i = 0; _i < 16u; _i++) v = load32_shared(GEMMINI_BUSY_ADDR + (v & 0u));
+    asm volatile("" :: "r"(v));
+#endif
+}
+#else
+static inline void fa_cfg_settle() {}
+#endif
+
+// ============================================================================================
+// FA_NS_SENT -- POSITIVE COMPLETION PROOF FOR THE A-OPERAND MOVE-IN.
+//
+// Every drain this kernel has is a poll of the gemmini's `busy` bit, and `busy` is measurably
+// unreliable here: in the failing builds mxgemm_compute_tile's LEADING fence returns after a
+// single BUSY read in some tiles, and neither waiting for busy to assert first (FA_NS_FENCE),
+// nor draining on OCCUPANCY instead (FA_NS_OCC), nor inserting 0.6k/9.5k cycles of MMIO round
+// trips (FA_CFGSETTLE/FA_CFGSETTLE_BIG) removes the corruption -- each of them only MOVES the
+// tile at which it starts.  So instead of trusting the gemmini's status bits, prove the move-in
+// landed by reading the destination: the operand scratchpad IS cluster SMEM, so stamp a sentinel
+// into the last word of every 16x16 destination tile before issuing the DMA and spin until the
+// DMA has overwritten all of them.  That is a positive, timing-independent proof for the A
+// operand (Q), whose stale content -- the previous tile's requantized P8 -- is the only candidate
+// carried state that can explain the observed "the wrong S changes once and then sticks".
+// A `while` loop, NOT a bounded `for (..) if (..) break;` -- see the FA_NS_SETTLE note below.
+// ============================================================================================
+// ============================================================================================
+// FA_PHASE<k> -- MEASUREMENT HARNESS: SWEEP THE INTER-CLUSTER PHASE.
+//
+// The ~110-113% corruption is a race whose outcome is decided by which of the TWO clusters loses
+// a contest for a shared resource: across every failing run seen so far EXACTLY ONE cluster is
+// hit, never both and never neither, which for independent per-cluster events would happen with
+// probability <= 0.5 each time (7 for 7 => <= 0.8%).  It is therefore anti-correlated, i.e. the
+// clusters compete, and the lottery variable is their RELATIVE PHASE.  Perturbing the code
+// resamples that lottery, which is why 14 of 19 arbitrary "fix" variants score 12/12 and 5 do
+// not, with no correlation to which flag was set -- A SINGLE 12/12 RUN IS ~74% LIKELY BY CHANCE
+// AND IS NOT EVIDENCE OF A FIX.
+//
+// FA_PHASE<k> delays cluster 1 (and only cluster 1) by k * 64 dependent MMIO round trips
+// (~2.4k cycles each) at the top of every tile, so the phase can be swept deliberately instead of
+// resampled by accident.  A real fix must be correct at EVERY k; a lucky one will not be.
+// ============================================================================================
+#if defined(FA_PHASE1) || defined(FA_PHASE2) || defined(FA_PHASE3) || defined(FA_PHASE4) \
+    || defined(FA_PHASE5)
+#if   defined(FA_PHASE1)
+#define FA_PHASE_N 1
+#elif defined(FA_PHASE2)
+#define FA_PHASE_N 2
+#elif defined(FA_PHASE3)
+#define FA_PHASE_N 3
+#elif defined(FA_PHASE4)
+#define FA_PHASE_N 4
+#else
+#define FA_PHASE_N 5
+#endif
+static inline void fa_phase_skew_impl(uint32_t tid) {
+    if (tid != 0) return;
+    uint32_t cl; asm volatile("csrr %0, 0xCD0" : "=r"(cl));
+    if (cl == 0) return;
+    uint32_t z = 0; asm volatile("" : "+r"(z));
+    uint32_t v = 0;
+    for (uint32_t i = 0; i < 64u * FA_PHASE_N; i++)
+        v = load32_shared(GEMMINI_BUSY_ADDR + (v & z));
+    asm volatile("" :: "r"(v));
+}
+#define fa_phase_skew(t) fa_phase_skew_impl(t)
+#else
+#define fa_phase_skew(t) do { } while (0)      // literally nothing at the call site
+#endif
+
+#if defined(FA_NS_SENT) || defined(FA_NS_SENTB)
+#define FA_SENT_MAGIC 0xA5A5F00Du
+static inline void fa_sent_stamp(uint32_t spad_row_start, uint32_t ntiles) {
+    volatile __shared uint32_t *sp = reinterpret_cast<volatile __shared uint32_t *>(0);
+    for (uint32_t n = 0; n < ntiles; n++)
+        sp[((spad_row_start + n * 16u) * 16u + 252u) >> 2] = FA_SENT_MAGIC;
+    mu_fence_smem();
+}
+static inline void fa_sent_wait(uint32_t spad_row_start, uint32_t ntiles) {
+    volatile __shared uint32_t *sp = reinterpret_cast<volatile __shared uint32_t *>(0);
+    for (uint32_t n = 0; n < ntiles; n++) {
+        const uint32_t w = ((spad_row_start + n * 16u) * 16u + 252u) >> 2;
+        while (sp[w] == FA_SENT_MAGIC) { asm volatile("nop"); }
+    }
+}
+#endif
+
+#if defined(FA_NS_FENCE) || defined(FA_NS_OCC)
+static inline void fa_gemmini_fence_safe() {
+#ifdef FA_NS_OCC
+    while (load32_shared(GEMMINI_OCCUPANCY_ADDR) != 0) asm volatile("nop");
+#else
+    // *** NOT a bounded `for (..) if (busy) break;` ***  That shape -- which is what the
+    // pre-existing FA_NS_SETTLE uses -- overflows the warp scheduler's IPDOM stack here
+    // ("Assertion failed: ipdom stack is full", WarpScheduler.scala:456, $finish at ~112k
+    // cycles), so FA_NS_SETTLE could never have produced a result.  An UNCONDITIONAL
+    // dependent chain of MMIO reads has no divergence region at all.
+    { uint32_t _z = 0; asm volatile("" : "+r"(_z));   // opaque 0 -> a real dependent chain
+      uint32_t _v = 0;
+      for (uint32_t _i = 0; _i < 16u; _i++) _v = load32_shared(GEMMINI_BUSY_ADDR + (_v & _z));
+      asm volatile("" :: "r"(_v)); }
+#endif
+    while (load32_shared(GEMMINI_BUSY_ADDR) != 0) asm volatile("nop");
+}
+#define gemmini_fence() fa_gemmini_fence_safe()
+#endif
+
 // Tiling parameters -----------------------------------------------------------
 
 enum class GemmDatatype : uint8_t {
@@ -989,7 +1214,24 @@ __attribute__((noinline)) void mxgemm_prefetch_tile(
 #else
         if constexpr (DO_CONFIG) configure_mxgemmini<C>(dim_m, dim_n, dim_k, wsel, asel);
         CPROF(SKIP_A ? 0x11 : 0x01);   // after configure_mxgemmini (7 ROCC cmds + gemmini_fence)
+#if defined(FA_NS_SENT) || defined(FA_NS_SENTB)
+        if constexpr (!SKIP_A) fa_sent_stamp(0, C.PE_TILES_I() * C.PE_TILES_K());
+#endif
+#ifdef FA_NS_SENTB
+        // The B operand (K^T) is 32 KB -- FOUR TIMES the A operand -- so if the move-in DMA is
+        // what loses the race against the matmul, B is the more likely victim.  Its spad grows
+        // DOWN from the end: b_start = b_end - PE_TILES_K*PE_TILES_J*DIM.
+        fa_sent_stamp(BANK_NUM * BANK_ROWS - C.PE_TILES_K() * C.PE_TILES_J() * DIM,
+                      C.PE_TILES_K() * C.PE_TILES_J());
+#endif
         copy_gmem_to_smem_async<C, SKIP_A, EXPLICIT_MVIN>(A_in, B_in, dim_m, dim_n, dim_k, 0, 0, tile_k);
+#if defined(FA_NS_SENT) || defined(FA_NS_SENTB)
+        if constexpr (!SKIP_A) fa_sent_wait(0, C.PE_TILES_I() * C.PE_TILES_K());
+#endif
+#ifdef FA_NS_SENTB
+        fa_sent_wait(BANK_NUM * BANK_ROWS - C.PE_TILES_K() * C.PE_TILES_J() * DIM,
+                     C.PE_TILES_K() * C.PE_TILES_J());
+#endif
 #endif
         CPROF(SKIP_A ? 0x12 : 0x02);   // after A/B move-in issue (5 ROCC cmds, async)
     }
@@ -1022,6 +1264,53 @@ __attribute__((noinline)) void mxgemm_prefetch_tile(
                            calculate_scale_factor_gmem_addr<C, true>(B_scales, 0, dim_m, dim_n),
                            C.SCALE_FACTORS_PER_TILE_B());
     }
+#if defined(FA_NS_KRELOAD) || defined(FA_NS_PADB)
+    // ============================================================================================
+    // DIAGNOSTIC PAIR for the FA_NOSCALES steady-state corruption (2026-07-27).
+    //
+    // WHAT THE DATA SAYS (full [ISSUE]-trace forensics on /tmp/hsruns/nt6ver.out, the 6-tile
+    // FULL_ATTN2 + FA_NOSCALES + FA_EARLYV run):
+    //   * the bf16 P that the softmax writes is bit-identical across tiles 0,1,2 and then ALL 8192
+    //     words change at tile 3, so S ITSELF is wrong -- the fault is in the QK gemm, not in
+    //     softmax/requant/PV;
+    //   * recovering S from P and m and projecting it onto the row space of the correct effective
+    //     K matrix leaves a 22.0% residual, against a 2.3% floor.  With the verified hw mesh model
+    //     (which reproduces golden_S BIT-EXACTLY) an arbitrarily corrupted A operand or A scale set
+    //     leaves the residual at 2.3-2.4% -- it is mathematically confined to the row space -- while
+    //     a corrupted B operand or B scale set pushes it to 27-71%.  So the corruption is on the
+    //     WEIGHT (K) side of the QK gemm;
+    //   * tile 4 == tile 5 exactly, and tile 3 != tile 4: the error is SELF-SUSTAINING through a
+    //     P -> (something the QK gemm reads) -> S -> P loop, which reaches a fixed point in one
+    //     iteration;
+    //   * the only per-tile writer of the MX scale SRAM is pack_scales_to_sfmem (the runtime P
+    //     scales), and the only thing FA_NOSCALES changes about the static scales is that NOTHING
+    //     REWRITES THEM -- the control build reloads all 704 words every tile and is 12/12 correct.
+    // Together those say: the K scales in weight half 0 stop being right, the corrupting data is
+    // P-derived, and the control build survives only because it repairs them every tile.
+    //
+    // FA_NS_KREPAIR tests exactly that by repairing weight half 0 from GMEM every tile.
+    // FA_NS_PADB is its COST-MATCHED CONTROL: the same 256 single-thread word stores at the same
+    // point in the tile, to SMEM scratch instead of the scale SRAM.  Both perturb the schedule by
+    // the same ~16k cycles, so
+    //     KRELOAD correct + PADB still wrong  =>  the K scales really are being corrupted;
+    //     both correct                        =>  it is only the extra delay (inconclusive);
+    //     both wrong                          =>  the K scales are NOT the carried state.
+    // ============================================================================================
+    if (tid_in_threadblock == 0) {
+        if constexpr (!SKIP_A) {
+#ifdef FA_NS_PADB
+            load_scale_factors(reinterpret_cast<volatile __shared uint32_t *>(0x14000u /*SCALE*/
+                                                                             + 0x2000u),
+                               calculate_scale_factor_gmem_addr<C, true>(B_scales, 0, dim_m, dim_n),
+                               C.SCALE_FACTORS_PER_TILE_B());
+#else
+            load_scale_factors(calculate_scale_factor_smem_addr<true>(0),
+                               calculate_scale_factor_gmem_addr<C, true>(B_scales, 0, dim_m, dim_n),
+                               C.SCALE_FACTORS_PER_TILE_B());
+#endif
+        }
+    }
+#endif
 #ifdef FA_NOSCALES
     // ---- Wait for the host's scale write to land -------------------------------------------
     // Placed HERE (after config + DMA issue, where load_scale_factors used to be) on purpose:
@@ -1218,7 +1507,7 @@ __attribute__((noinline)) void mxgemm_compute_tile(const uint32_t tid_in_threadb
         }
     }
 #endif
-#if defined(FA_NS_SETTLE) || defined(FA_NS_PAD)
+#if defined(FA_NS_SETTLE) || defined(FA_NS_PAD) || defined(FA_NS_SETTLE_LONG)
     // ---- FENCE-TOO-EARLY GUARD (-DFA_NS_SETTLE / -DFA_NS_PAD) ---------------------------------
     // gemmini_fence() is `while (load32_shared(GEMMINI_BUSY_ADDR) != 0) nop;`
     // (lib/include/mxgemmini_mmio.h:74-78) -- it drains only what is ALREADY visible as busy.  The
@@ -1229,10 +1518,23 @@ __attribute__((noinline)) void mxgemm_compute_tile(const uint32_t tid_in_threadb
     // only in the STEADY state -- and only once -DFA_NOSCALES removes the 12.6k-cycle
     // load_scale_factors that used to sit between the move-in issue and this fence.
     //   FA_NS_SETTLE: bounded wait for busy to ASSERT, then the normal drain (~16 MMIO polls).
+    //     *** DO NOT USE -- MEASURED 2026-07-27: THIS FLAG $finishes.  The bounded
+    //     `for (i<N) if (busy) break;` shape overflows the warp scheduler's IPDOM stack here
+    //     ("Assertion failed: ipdom stack is full", WarpScheduler.scala:456) at ~112k cycles,
+    //     i.e. inside tile 0, on FULL_ATTN2 FA_NOSCALES FA_EARLYV FA_NT6.  That is why this flag
+    //     has never appeared in any results table.  Use the UNCONDITIONAL dependent MMIO chain
+    //     (fa_cfg_settle / FA_NS_FENCE at the top of this file) instead -- no divergence region. ***
     //   FA_NS_PAD:    a blunt fixed spin instead, purely to confirm the diagnosis.
     {
 #ifdef FA_NS_PAD
         for (uint32_t i = 0; i < 3000u; i++) asm volatile("nop");
+#elif defined(FA_NS_SETTLE_LONG)
+        // Same idea as FA_NS_SETTLE but with a bound long enough that "busy never asserted"
+        // means the command really has already retired, not "I gave up too early".  It costs
+        // NOTHING when busy comes up promptly, so it is the shippable form.
+        for (uint32_t i = 0; i < 3000u; i++) {
+            if (load32_shared(GEMMINI_BUSY_ADDR) != 0) break;
+        }
 #else
         for (uint32_t i = 0; i < 16u; i++) {
             if (load32_shared(GEMMINI_BUSY_ADDR) != 0) break;
@@ -1244,13 +1546,25 @@ __attribute__((noinline)) void mxgemm_compute_tile(const uint32_t tid_in_threadb
     else if constexpr (FM == FenceMode::BUSY) gemmini_fence();
     CPROF(wsel ? 0x21 : 0x29);   // after LEADING drain (waits for the move-in DMA)
     // FM==NONE: no leading drain (V-mvin data already resident; the poisoned occupancy MMIO would livelock).
+#ifdef FA_CFGSETTLE_PRE
+    fa_cfg_settle();   // control placement: settle BEFORE the config, i.e. give the PREVIOUS
+                       // gemm's scale reads time to finish under the OLD loop bounds.
+#endif
     gemmini_mxquant_config_mvout(
         rad_device_to_host_address(reinterpret_cast<uint32_t>(&C_scale_factors[0])),
         C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
         asel, wsel, QUANT_LUT_UPDATE_GRANULARITY);   // A/B double-buffer parity MUST match tile_k
+#if defined(FA_CFGSETTLE_AFTER) || defined(FA_CFGSETTLE_PRE)
+#else
+    fa_cfg_settle();   // FA_CFGSETTLE: the mesh's scale-SRAM read row depends on this command's
+                       // loop_bound_j, and LOOP_WS is not ordered against it.  See the header.
+#endif
     CPROF(wsel ? 0x22 : 0x2a);   // after CONFIG_SCALE_MEM
     matmul_tile_async<C>(tile_k, /*acc_move_out (last_k)=*/true, /*accumulate=*/false,
                          b_spad_override, c_spad_dest, a_spad_override, /*force_first=*/1);
+#ifdef FA_CFGSETTLE_AFTER
+    fa_cfg_settle();   // control placement -- provably too late to help
+#endif
     CPROF(wsel ? 0x23 : 0x2b);   // after matmul ISSUE (the mesh work starts here)
     if constexpr (FM == FenceMode::READY) gemmini_fence_ready();
     else if constexpr (FM == FenceMode::BUSY) gemmini_fence();

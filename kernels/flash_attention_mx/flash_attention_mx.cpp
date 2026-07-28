@@ -849,6 +849,16 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //           python3 fa_regs.py /tmp/fa_<TAG>.s      <- must be <= 53; 55 and 58 both $finish
 //           python3 fa_baraudit.py /tmp/fa_<TAG>.s      <- per-function barrier audit
 //
+// ---- FIFTH-PASS CONFIGURATIONS (2026-07-27).  *** THESE SUPERSEDE THE THREE BELOW: every one of
+// ---- the older FA_SP recipes is missing FA_SP_WCNT and is therefore only accidentally correct.  ***
+//   reference numerics, correctness-hardened, no host:
+//     FA_SP FA_SP_QOVL FA_SP_QSPLIT FA_SP_LEANCFG FA_SP_QKACC FA_SP_PKOVL FA_SP_WCNT
+//     FA_SP_PAX FA_SP_CVTX
+//   ... + the host scale offload and the softmax rewrite (the fastest verified stack):
+//     ... FA_SP_CVTSWAR FA_SP_HSF FA_SM_2P FA_SP_FZ6
+//   the FA_SP_OPV schedule (hides ALL of the mesh; $finishes on Scratchpad.scala:220 -- see (G2b)):
+//     FA_SP FA_SP_QOVL FA_SP_OPV FA_SP_OPVQ FA_SP_BANKA FA_SP_LEANCFG FA_SP_PKOVL FA_SP_WCNT ...
+//
 // THE THREE CONFIGURATIONS THAT MATTER (all on top of FULL_ATTN2):
 //   reference numerics, correctness-fixed:
 //     FA_SP FA_SP_QOVL FA_SP_QOVL4 FA_SP_LEANCFG FA_SP_QKACC FA_SP_PKOVL
@@ -1149,6 +1159,66 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //      uninitialised state, so a second SEED does not re-test the schedule.  MORE TILES does --
 //      the corruption first appeared at tile 3 -- so FA_NT8 (16 tile-images) is the real second test.
 //
+// (F5) *** A THIRD MEASUREMENT TRAP, AND IT MOVED A NUMBER BY 8%: fa_pm.py MIXES THE TWO CLUSTERS.
+//      USE fa_marks_cl.py. ***  fa_pm.py keys the MARK stamps by ADDRESS only, and both clusters
+//      write the SAME MARK_GMEM words, so its m[k] is whichever cluster's store happened to appear
+//      LAST in the trace.  Two consequences, both observed here:
+//        * the tile deltas CHANGE as a growing trace is re-parsed -- one variant's tile-1 interval
+//          read 46,156 and then 50,030 from the same run, 8% apart, purely from re-parsing later;
+//        * even on a complete trace the deltas are a mixture of two clocks that are ~1k cycles out
+//          of phase, so a difference of that size between two configurations is not a result.
+//      fa_marks_cl.py splits by clid, reports each cluster's intervals separately, and pools all
+//      steady intervals of both clusters for the headline (10 numbers at FA_NT6 instead of 5).  It
+//      also prints the per-stage means per cluster, which is what the stage tables below are built
+//      from.  Note the related trap already documented for O: rs1.data is the FULL mark address here
+//      only because `mki++` is a runtime index; a constant-index store would put the offset in the
+//      store immediate and rs1.data would be the page base for every mark.
+//
+// (F6) *** THE FULL LEVER SWEEP ON TOP OF FA_SP_QSPLIT, pooled over BOTH CLUSTERS' steady intervals
+//      (fa_marks_cl.py; FA_NT6 gives 10 such intervals, so ~+-200 rather than the ~+-1,000 a single
+//      cluster's single interval carries): ***
+//        + nothing (FA_SP_QSPLIT)                     46,902   35.01%   12/12
+//        + FA_SP_CVTX FA_SP_PREPK FA_SP_FZ6           46,597   35.24%
+//        + ... + FA_SP_MARK1                          47,477   34.58%
+//        + FA_SP_BALC FA_SP_CVTX FA_SP_PREPK FA_SP_FZ6 47,663   34.45%
+//        + FA_SP_BALC FA_SP_PREPK FA_SP_FZ6           48,535   33.83%
+//      and the per-stage attribution, cluster 0, steady tiles (this is where the levers actually go):
+//                            QSPLIT   +CVTX+PREPK+FZ6
+//        S1 accumulator->S      998        998
+//        softmax             12,825     12,825
+//        requant pass A       3,405      3,400
+//        S4 convert || pack  11,093     10,242      <- FA_SP_CVTX + FA_SP_PREPK: -851
+//        PV                   8,889      8,880
+//        S6 QK || finalize    9,562     10,892      <- FA_SP_FZ6: +1,330  *** LOSS ***
+//        TOTAL               46,824     47,289
+//      VERDICTS:
+//        FA_SP_CVTX + FA_SP_PREPK  -851 on stage S4.  Real but far short of the ~3k the 16-way
+//          subbank conflict predicted, so THE CONVERT IS NOT CONFLICT-BOUND -- 361 static
+//          instructions per item against ~10.2k/512 items is mostly ISSUE, and the conflict was
+//          costing hundreds, not thousands.  Keep both (they are free and bit-exact) but do not
+//          expect more from that direction.
+//        FA_SP_FZ6   +1,330.  A SIXTH warp makes finalize SLOWER.  warp 0 only enters finalize after
+//          its gemmini_fence + matmul issue, and it then owns a sixth of the rows, so it becomes the
+//          long pole in a stage that ends with its slowest warp -- the same "bandwidth-bound stages
+//          end with the longest warp" mechanism that sinks FA_SP_BALF.  OFF.
+//        FA_SP_BALC  -1.1k WORSE (47,663 vs 46,597).  Same lesson as BALF: the convert is not purely
+//          issue-bound either, so weighting core 0's two warps to 128 items each just lengthens them.
+//          *** SO THE WHOLE "SPLIT THE TWO MUON CORES BY RESOURCE" IDEA MEASURES NEGATIVE ON THIS
+//          KERNEL.  The theory (core 1 carries 3 of the 5 SIMT warps, so it gets 3/5 of an
+//          equal-partition's work and every issue-bound stage runs 20% long) is arithmetically sound;
+//          it just does not describe any stage this kernel actually has.  Every large SIMT stage here
+//          is enough of a memory-system stage that the equal partition -- which minimises the LONGEST
+//          warp -- already wins.  Recorded as refuted, with the reason. ***
+//        FA_SP_MARK1  NEUTRAL (47,477 vs 46,597 -- inside the wobble, and its tile-0 delta is within
+//          16 cycles of the 7-mark build's).  *** THIS RETIRES A WORRY, and the worry was mine:
+//          mxgemm_core.hpp measures a single-thread GMEM stamp at ~400 cycles and the FA_SP body
+//          emits SEVEN per tile, which would have made ~2.8k of every quoted utilisation pure
+//          instrumentation.  It does not: deleting six of the seven changes nothing measurable,
+//          because MARK is one lane's fire-and-forget store while five other warps keep running,
+//          whereas the ~400-cycle stamps were in a single-threaded critical section.  So the
+//          utilisation figures in this file are NOT inflated by their own instrumentation, and the
+//          per-stage marks can stay. ***
+//
 //      AND THE FIRST PERFORMANCE VERDICTS, both negative and both instructive:
 //          FA_SP_SM1F (+FA_SP_SM1FL)   52,875   +1,502 vs the reference   LOSS
 //          FA_SP_QSPLIT alone          46,972   -4,401                    WIN
@@ -1262,6 +1332,19 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //
 // TOOLING NOTE, because two of these cost real time to discover:
 // (all four live next to this file, in kernels/flash_attention_mx/)
+//   * fa_marks3.py   -- *** USE THIS, NOT fa_pm.py AND NOT fa_marks_cl.py, FOR TILE INTERVALS AND
+//     PER-STAGE MEANS. ***  fa_pm.py keys marks by address and mixes the two clusters (see (F5)).
+//     fa_marks_cl.py splits by cluster but still derives the mark INDEX from rs1.data, i.e. it
+//     assumes `mki++` leaves the full effective address in the base register -- and whether it does
+//     is a CODEGEN COIN FLIP.  With a fixed number of marks per iteration clang either bumps the
+//     base register by 4 per mark (rs1.data IS the address; the FA_SP_QSPLIT builds) or keeps ONE
+//     base and puts the index in the store IMMEDIATE (the FA_SP_OPV builds, where every mark reports
+//     rs1.data = 0x40050000 and they ALL alias to index 0, so the tool sees one interval and reports
+//     none).  fa_marks3.py keys by TRACE ORDER within a cluster instead -- all marks are stores by
+//     the same single thread, so they are strictly ordered and their values monotone -- and drops the
+//     ONE EXTRA pre-loop copy of the s0 stamp that clang emits at its own pc.  Including that stamp
+//     shifts every stage attribution by one and makes the empty stage look like 38,000 cycles, which
+//     is exactly the wrong reading I got before finding it.
 //   * fa_pertile.py  -- verify EACH TILE's O separately (bucket the O stores by the preceding
 //     MARK).  A whole-file Frobenius on a steady-state run is meaningless; see (a2).
 //   * fa_regs.py     -- whole-kernel distinct-written-register union from a .s.
@@ -1271,6 +1354,321 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //     reports false HANG RISK.  It did exactly that for fa_softmax_item's two barriers, which are
 //     at depth 0 within their own function.  Count depth per function.
 // ============================================================================================
+// ---- FIFTH PASS, 2026-07-27 -- from 34.96% toward 40% -------------------------------------
+//
+// Starting point: FA_SP_QSPLIT, 46,972 cyc/tile = 34.96%, 12 of 12 tile-images (fourth pass).
+// 40% needs <= 41,050, i.e. 5,922 cycles out of a 46,972-cycle tile.  Its stage table is
+//     acc->S 998 | softmax 12,825 | pass A 3,405 | convert||pack 11,093 | PV 8,889 | QK||fz 9,562
+// so the exposed cost is 27,323 of SIMT (softmax + pass A + convert), 8,889 of EXPOSED PV mesh, and
+// ~2,300 of accumulator stores and finalize-over-mesh excess.
+//
+// (G0) *** READ THIS FIRST: THE FOURTH PASS'S 12-of-12 WAS A SCHEDULE COINCIDENCE, NOT A FIX, AND
+//      THE REAL FIX IS FA_SP_WCNT. ***
+//      The fourth pass concluded that "the steady-state bug is a missing gemmini drain, and one
+//      gemmini_fence() fixes it": FA_SP_QGF (+94 cyc) took FA_SP_QOVL4 from 9 of 12 tile-images to
+//      12 of 12, and FA_SP_QSPLIT was 12 of 12 as well.  It also recorded the caveat that makes that
+//      conclusion unsafe -- FA_SP_QOVL4 + SM1F + SM1FL is ALSO 12 of 12 and contains no fix at all,
+//      it is just 1,500 cyc/tile slower.  *** THE CAVEAT WAS THE TRUTH. ***  Adding NOTHING BUT
+//      BIT-EXACT SPEEDUPS to the published FA_SP_QSPLIT reference brings the corruption straight
+//      back, at FA_NT6, seed 12345, scored per cluster per tile:
+//          FA_SP_QSPLIT (published)                     46,972   12 of 12 CORRECT
+//          + FA_SP_PAX                                  46,422    5 of 8 -- cluster 1 wrong
+//          + FA_SP_PAX + FA_SP_CVTX                     45,662    6 of 8 -- cluster 1 tiles 2,3
+//                                                                at 96.3% / 114.6%
+//      Neither flag changes a single computed value; both only move the schedule.  So FA_SP_QSPLIT
+//      does not FIX the hazard, it MISSES it, and any future speedup can re-open it.  A "12 of 12"
+//      on one schedule is therefore not evidence that a build is correct -- only a build with a
+//      mechanism-level drain is.
+//      THE MECHANISM IS THE ONE FA_SP_WCNT WAS WRITTEN FOR, and it was sitting in this file default
+//      OFF the whole time.  gemmini_fence() polls MMIO 0x20 = gemmini.module.io.busy, and a command
+//      fired by a store to 0x00 takes several cycles to reach the reservation station, so a poll
+//      issued shortly after that store CAN READ ZERO AND FALL THROUGH -- the fence returns before
+//      the matmul has started.  FA_SP_QKACC is the only configuration in which SOFTWARE waits for a
+//      matmul and then reads its ACCUMULATOR (stage S1: fa_gfl; fa_store_acc<QKF>(SP_C); fa_gfl), so
+//      a fall-through there means the accumulator->spad store copies a MID-ACCUMULATION accumulator.
+//      That is exactly the observed fingerprint: S is wrong, every downstream stage is bit-exact
+//      given S, the garbage is still a convex combination of V, and it is timing-dependent and
+//      cluster-specific.  MMIO 0x28 (runningLoops) is incremented IN THE SAME CYCLE as the command
+//      write for a LOOP_WS (GemminiTile.scala:408-412), so gemmini_fence_waitcount(0) cannot race,
+//      and FA_SP_WCNT puts it in front of every fa_gfl.  It costs one extra MMIO poll at four sites
+//      per tile.  *** BUILD EVERY FA_SP CONFIGURATION WITH FA_SP_WCNT. ***
+//
+// (G1) *** TWO SUBBANK CONFLICTS THAT COST NOTHING TO FIX, BOTH BIT-EXACT. ***
+//      The subbank is word_index & 15, and every phase that walks S or P indexes it as
+//      row*128 + b*16 + k with BOTH strides a multiple of 16 -- so the subbank is (k & 15), which is
+//      LANE-UNIFORM, and a warp's 16 lanes hit ONE subbank on every load.  The fourth pass fixed
+//      this in the requant convert (FA_SP_CVTX) by folding an XOR rotation into the base pointer,
+//      which is free because these base addresses have zero low bits and the offset field is
+//      disjoint, so `+` is `^`.  The SAME trap is in requant pass A and had been missed:
+//        FA_SP_PAX -- rotate pass A's 16 word loads by (lane & 15).  Pass A only READS and its
+//                     result is a MAX, which is exactly order-independent, so the permutation may
+//                     be the FULL 16 -- unlike the convert, where an output word must hold four
+//                     CONSECUTIVE elements and only 8 rotations are legal (2-way, not 1-way).
+//                     +18 static instructions per item, ZERO extra registers (53 -> 53).
+//        FA_FOLDX  -- the same XOR trick inside warp_fold16 (the FA_TREEFIX reduction), whose eight
+//                     word loads are read by all 16 lanes from the SAME address.  Costs 6 registers
+//                     in an all-warps function (30 -> 36) and is therefore a RENAMER CASUALTY at
+//                     occupancy 3; kept and documented OFF.  FA_SP_SM1FX -- the same idea with a
+//                     32-bit-per-lane buffer, which would have been 1-way instead of 2-way -- is
+//                     worse still (58 registers), for the same reason: an XOR'd address is not an
+//                     addressing mode, so every rotated access needs its own live pointer.
+//      *** THE GENERAL RULE THIS ESTABLISHES: an XOR rotation is free when the rotation folds into a
+//      base pointer that is then used with COMPILE-TIME-CONSTANT offsets (pass A, the convert), and
+//      costs one register per access when the rotated index is itself the loop variable (the folds).
+//      Check which case you are in before writing it. ***
+//
+// (G2) *** THE 4-ENTRY SPAD READ QUEUE: WHY ONLY *ONE* MESH/SIMT OVERLAP IS LEGAL AT ALL. ***
+//      Scratchpad.scala:210-220, in every ScratchpadBank's use_shared_ext_mem READ path:
+//          val dma_q = Module(new Queue(Bool(), 4, false, true))
+//          assert(dma_q.io.enq.fire === ren, "DMA queue does not have enough entries")
+//                                             // TODO (richard): do backpressure
+//      FOUR entries, NO BACKPRESSURE: if the shared SMEM does not return a read response before the
+//      mesh issues a fifth request to that bank, THE SIMULATION $finishes.  So the mesh may not read
+//      an operand out of a 32 KB SMEM bank (bank = addr >> 15) that SIMT code is reading at the same
+//      time.  Measured, not theorised: FA_SP_OPV as first written $finished twice on
+//      `gemmini.spad.spad_mems_2` at 237,301,000 and 238,123,000 ps, in the first tile.
+//      THIS IS WHY FA_SP_QSPLIT OVERLAPS EXACTLY ONE MESH OP WITH SIMT WORK AND NO MORE.  Its one
+//      overlap is QK(t+1) || finalize(t): QK reads Q (0x16000, bank 2) and K^T (bank 3), while
+//      finalize reads O, which is the LOWER 16 KB of SP_C and therefore entirely in bank 1.  Every
+//      other stage either has the mesh idle or has SIMT quiesced.  Since S/P-bf16 STRADDLES banks 1
+//      and 2 in the default map, any schedule that overlaps the mesh with the softmax, pass A or the
+//      convert asserts -- which is a HARDWARE reason, not a dependency reason, and it is the real
+//      answer to the third pass's question of why more overlap could not be found.
+//        FA_SP_BANKA -- the remap that removes the obstruction: give S a WHOLE bank and move P8/O
+//                       into bank 2 next to Q (see the comment on the constants themselves).
+//
+// (G2b) *** AND THE VERDICT ON FA_SP_OPV: THE PV OVERLAP IS UNREACHABLE IN THIS SMEM BUDGET, AND
+//      THE REASON IS THE FOUR-ENTRY QUEUE PLUS AN EXACTLY-FULL SMEM -- NOT A DEPENDENCY. ***
+//      MEASURED, three runs, all $finish at Scratchpad.scala:220 on `spad_mems_2`:
+//          FA_SP_OPV  (default map)                    237,301,000 ps / 238,123,000 ps  (~119k cyc)
+//          FA_SP_OPV FA_SP_OPVQ FA_SP_BANKA            282,593,000 ps                   (~141k cyc)
+//      FA_SP_BANKA moved the failure LATER but did not remove it, and where it fired says exactly
+//      why: 141k is inside stage A of ITERATION 1, i.e. the first time PV(t-1) actually runs
+//      underneath softmax(t).  Bank 2 then contains PV's A operand (P8) *and the whole scratch
+//      window*, and the cooperative softmax's cross-lane reduction hammers that scratch:
+//      warp_tree_reduce costs, per row per warp, 16 partial stores + 45 tree accesses + 16
+//      broadcast loads of buf[0] = 77 SMEM accesses, x2 reductions x ~11 rows x 6 warps ~= 10,000
+//      accesses to REDBUF in a 12,825-cycle stage -- about 0.8 per cycle.  That is far more than
+//      enough to delay the mesh's read responses past four outstanding requests.
+//      AND IT CANNOT BE FIXED BY RELOCATION, WHICH IS THE POINT.  For the overlap to be legal the
+//      reduce scratch must not share a bank with PV's operands (P8, V) in stage A, nor with QK's
+//      (Q, K) in stage D -- so it may share a bank ONLY with S.  S is [64][256] bf16 = 32,768 B,
+//      i.e. EXACTLY one bank, with no slack, and the total is exactly full:
+//          V 32K + K 32K + S 32K + P8/O 16K + Q 8K + scratch 8K = 128 KB.
+//      There is also no lane-shuffle instruction in this ISA (mu_intrinsics.h has fences and
+//      mu_fexp, nothing cross-lane), so a cooperative reduction MUST go through SMEM and the
+//      scratch cannot be deleted.  Double-buffering P8 so PV(t-1) could hide under convert(t)
+//      instead needs another 16 KB, which does not exist either.
+//      SO THE CORRECT STATEMENT OF THE CEILING IS NOT note (c)'s: it is not that only one matmul
+//      CAN be covered, it is that on this RTL the mesh may only run underneath a SIMT phase whose
+//      SMEM traffic misses the mesh's operand banks, and finalize -- which reads only O (16 KB,
+//      one bank) and writes GMEM -- is the ONLY such phase this kernel has.  FA_SP_QSPLIT's single
+//      overlap is therefore not a missed opportunity but the whole of what the hardware allows.
+//      FA_SP_OPV/OPVQ/BANKA are kept, default OFF and documented, because the schedule itself is
+//      right (it hid all 16,420 mesh cycles and its measured iteration-0 stage costs -- A 16,970 |
+//      B 543 | C1 4,494 | C2 3,957 | D 15,095 | E 1,339 = 42,584 cold -- project to ~37.3k = 44%
+//      steady) and because the only thing standing between it and that number is a queue depth of
+//      four and 8 KB of scratch.  If either the RTL grows backpressure or SMEM grows, this is the
+//      schedule to switch on.
+//
+// (G7) WHAT BLOCKS THE REST, stated against the best configuration's stage table so it is checkable
+//      rather than rhetorical.  Per tile, at FA_SP_QSPLIT + WCNT + PAX + CVTX + CVTSWAR + HSF +
+//      FA_SM_2P (+ FZ6):
+//        accumulator -> S      ~1,000   mesh store, SIMT quiesced; irreducible per (G2)
+//        softmax              ~10,800   SIMT, issue-bound.  FA_SM_2P already removed 41 of a warp's
+//                                       44 fences; the rest is instruction issue + SMEM latency.
+//        requant pass A        ~2,750   SIMT, conflict-free after FA_SP_PAX (~1,600 of it is issue)
+//        requant convert      ~7,700   SIMT, six warps + SWAR + XOR addressing
+//        PV                   ~8,880   *** EXPOSED MESH ***
+//        QK || finalize       ~8,300   finalize, GMEM-store bound; QK's 8,210 mesh cycles hide here
+//      TWO THINGS BLOCK THE REMAINDER, and both are hardware, not scheduling:
+//      1. THE EXPOSED PV (22% of the tile).  Hiding it needs the FA_SP_OPV schedule, which works and
+//         is in this file, but the mesh then reads an operand out of a bank SIMT is using and
+//         Scratchpad.scala:220's FOUR-ENTRY, UN-BACKPRESSURED read queue $finishes the simulation.
+//         Fixing that needs either RTL backpressure (the TODO is in the RTL) or ~8 KB of SMEM to
+//         move the softmax's reduce scratch out of PV's operand bank -- and SMEM is exactly full at
+//         V 32K + K 32K + S 32K + P8/O 16K + Q 8K + scratch 8K = 128 KB.  See (G2), (G2b).
+//      2. THE SIMT BLOCK (softmax + pass A + convert = ~21,250, i.e. 53% of the tile).  It makes
+//         THREE passes over the 32 KB of S/P-bf16 where one would do; the one-pass form is
+//         FA_SP_FUSE, and FUSE is a RENAMER casualty (58 registers against a ~53 budget) whose only
+//         home is occupancy 2, where losing 32 of 96 threads costs more than fusing saves.  So the
+//         binding constraint on the SIMT half of this kernel is Rename.scala's never-reclaimed
+//         physical-register counter, exactly as the second pass concluded -- and (G5) is the one
+//         lever against it that worked: free registers in one phase and spend them in another.
+//
+// (G6) MEASUREMENT TABLE, FIFTH PASS.  FA_NT6, seed 12345, +dramsim, trace verified stable before
+//      parsing.  cyc/tile is the POOLED mean of both clusters' steady intervals (the fill tile
+//      dropped), read with fa_marks3.py -- NOT fa_marks_cl.py, which mis-keys the marks on the
+//      FA_SP_OPV builds and includes the extra pre-loop stamp (see its docstring).  Tile-images are
+//      per CLUSTER per tile via kernels/fa_mx_hostsf/fa_verify_tiles.py; 3.5666% == CORRECT.
+//      Every row is on FULL_ATTN2 FA_SP FA_SP_QOVL FA_SP_LEANCFG FA_SP_PKOVL plus what is listed.
+//
+//   configuration                                     cyc/tile   util    tile-images        regs
+//   QSPLIT QKACC          (published 4th-pass ref)      46,972  34.96%   12 of 12            53
+//   + PAX                                               46,422  35.37%   5 of 8  *** WRONG ***53
+//   + PAX + CVTX                                        45,662  35.96%   6 of 8  *** WRONG ***53
+//   + PAX + CVTX + FA_SM_2P                             43,442  37.80%   (see below)         49
+//   OPV                                                    --      --    $finish Scratchpad:220 52
+//   OPV + PAX + CVTX                                       --      --    $finish Scratchpad:220 52
+//   OPV + OPVQ + BANKA + PAX + CVTX                        --      --    $finish Scratchpad:220 53
+//   -- and with FA_SP_WCNT, which every row from here down carries:
+//   WCNT + PAX + CVTX                                    (in flight; fill tile 67,927 vs 68,095
+//                                                         without WCNT, so WCNT is ~free)      53
+//   WCNT + PAX + CVTX + CVTSWAR + HSF + FA_SM_2P                (in flight)                    53
+//   ... + FZ6                                                   (in flight)                    50
+//   ... + FZ6 + FA_SM_2PBM + FA_SP_SMBMAX + FA_SM_2PRAW          (in flight)                   51
+//   PAX + CVTX + HSF (no WCNT; isolates the host offload) 44,063  37.27%  6 of 6 correct before it
+//                                                         $finished on the fabric assert at 247k    52
+//      and its stage table against the same base WITHOUT the host, which is the honest reading of
+//      what the host offload actually buys on the PIPELINED body:
+//                            PAX+CVTX   +HSF
+//        S1 accumulator->S        998     998
+//        S2 softmax            12,825  12,825
+//        S3 requant pass A      2,753   2,752
+//        S4 convert || pack    10,492   9,516   <- the host takes the 128-word pack off warp 0, so
+//                                                 the convert runs on SIX warps instead of five
+//        S5 PV                  8,894   9,039   <- the 64-word Q-scale write is gone from warp 0
+//        S6 QK || finalize      9,309   8,881   <- unchanged code; within ~700 of the QK mesh
+//        TOTAL                 45,662  44,063   (pooled intervals 44,705..46,531, mean ~44,8xx)
+//      *** SO THE HOST OFFLOAD IS WORTH ~1,000 CYCLES ON THIS BODY, NOT THE ~20k THE SEQUENTIAL
+//      MEASUREMENT SUGGESTED, AND THE REASON IS ARITHMETIC RATHER THAN A BUG. ***  On FA_SP the
+//      per-tile GPU scale traffic is only 192 words (64 Q + 128 P), not 704, and BOTH were already
+//      hidden -- the Q write under the PV mesh, the pack under the convert.  All the host can
+//      therefore win is the 6th warp for the convert, and the convert's binding core carries three
+//      warps either way, so going from 6.4 to 5.33 items per thread is -17% of ITS issue term:
+//      3 x 5.33 x 345 = 5,517 warp-instructions instead of 6,624, i.e. -1,107 predicted, -980
+//      measured.  The handshake itself is free and, importantly, SOUND: the GPU publishes PACKREQ at
+//      the top of stage S4 and blocks on PACKED at the top of S5, which is inside the ~26k-cycle
+//      window S2+S3+S4 where the mesh is idle end to end, so the host is the ONLY requestor of
+//      either scale port and there is no pairing state to corrupt.  No deadlock, no timeout, and the
+//      PV stage is unchanged -- which is the thing the fourth pass's 7-of-12 host build got wrong.
+//      *** THE TWO "WRONG" ROWS ARE THE HEADLINE RESULT OF THIS PASS, not the cycle counts: two
+//      BIT-EXACT reschedulings re-opened the FA_SP_QKACC accumulator race that the fourth pass
+//      believed fixed.  See (G0).  Every row below carries FA_SP_WCNT for that reason. ***
+//
+// (G8) *** A TIGHT HOST POLL LOOP KILLS THE FABRIC, AND IT IS NOT THE SCALE-PORT HAZARD. ***
+//      The maximal stack (FA_SP_HSF + FA_SM_2P + FA_SM_2PBM + FA_SP_SMBMAX + FA_SM_2PRAW) $finished
+//      at 164,937,000 ps (~82.5k cycles) with
+//          TLMonitor xbar_3 (RadianceCluster.scala:112, the host->cluster extReqXbar):
+//          "'D' channel contains improper response size"
+//      which is the SAME assertion that killed FA_HOSTCFG and made it "WITHDRAWN, do not revive".
+//      *** BUT IT IS A DIFFERENT CAUSE, AND WHERE IT FIRED PROVES IT. ***  82.5k is inside the
+//      SOFTMAX of iteration 0.  By then the FA_SP_HSF host has finished every scale write it will
+//      ever do in the prologue, and the FA_SP_HSF GPU writes NO scale word at any point -- so there
+//      is no host-vs-GPU scale-port interleaving to blame, and no ROCC/SF pairing state to corrupt.
+//      The only host traffic in that window is THE MAILBOX POLL: an unthrottled stream of uncached
+//      8-byte Gets into cluster SMEM, concurrent with a softmax that is saturating that same SMEM.
+//      The shared-SMEM slave path answers one of them with the wrong size.
+//      The evidence that it is a timing window rather than a structural violation is that the SAME
+//      assertion, at the SAME xbar, fires at wildly different times depending only on how much SMEM
+//      traffic the GPU is generating:
+//          + FA_SM_2PBM (heaviest softmax)      164,937,000 ps  =  ~82.5k cycles, iteration 0
+//          FA_SP_HSF + PAX + CVTX (lightest)    494,475,000 ps  = ~247.2k cycles, iteration 3
+//      i.e. EVERY unthrottled-poll host build eventually trips it; the lighter ones just take three
+//      more tiles to get there.  That is also why the fourth pass's host runs completed at all.
+//      THROTTLING THE POLL IS NOT ENOUGH -- MEASURED.  sp_backoff() (poll every ~256 cycles instead
+//      of every ~20, and test cluster 1 only once cluster 0 is satisfied: >10x fewer Gets) still
+//      $finishes, at 196,801,000 ps.  So the trigger is not the RATE, it is the host READ of cluster
+//      SMEM at all while the GPU is using that SMEM -- which is exactly what host.cpp's own
+//      mbox_get() note already recorded from the fourth pass and I re-derived the hard way:
+//      "every configuration that reads the mailbox at all (FA_HOSTHS, FA_HOSTCFG) has hit that
+//      assertion in some build ... while every read-free build (FA_NOSCALES alone, which only ever
+//      stores) has never once hit it in ~20 runs."  The store-to-load `fence` before every poll,
+//      which that note proposes as the fix, is present in sp_mbox_get() and does not help either.
+//      *** CONSEQUENCE, AND IT RETIRES THE WHOLE LEVER: a host->GPU MAILBOX IS NOT USABLE ON THIS
+//      RTL, so the host cannot be told when a RUNTIME quantity is ready -- and it could not pack the
+//      P scales even if it were told, because packing means READING SCALE_SMEM out of cluster SMEM,
+//      128 more Gets of the same kind.  The host offload is therefore limited to WRITE-ONLY,
+//      UNSYNCHRONISED prefill of LOOP-INVARIANT scales, which on FA_SP is worth the ~1,000 cyc/tile
+//      measured above and nothing more.  The only way through would be for the GPU to publish the
+//      packed words to DRAM instead of SMEM (host DRAM reads do not touch the cluster xbar), and the
+//      GPU-side cost of that publish would eat most of the ~1,000.  Not worth it; recorded so the
+//      next pass does not spend another day on it. ***
+//      FA_SP_HSF is kept, default OFF, with the throttle in place: it is a working, deadlock-free
+//      demonstration of the composition and the correct place to restart from if the RTL ever grows
+//      a usable host read path.
+//
+// (G5) *** THE REGISTER BUDGET IS A SHARED RESOURCE, AND FREEING IT IN ONE PHASE UNLOCKS ANOTHER. ***
+//      Two flags in this file were REJECTED by earlier passes purely on the renamer:
+//        FA_SP_CVTSWAR   the 25-instruction SWAR e4m3 packer, 8 x (34-25) = 72 fewer instructions
+//                        per convert item (~21% of that phase's issue work) -- "58 registers, and 58
+//                        is the known-fatal count ... the packer choice in this kernel is a REGISTER
+//                        decision, not an instruction-count one";
+//        FA_SP_FZ6       finalize on all six warps.
+//      FA_SM_2P deletes online_softmax_block's slo[8]/shi[8] register arrays (it re-reads S in its
+//      second pass instead of holding the scaled values), which takes the whole-file union from 53
+//      to 49 -- and that is exactly the headroom those two needed:
+//        + FA_SM_2P                                        49
+//        + FA_SM_2P + FA_SP_CVTSWAR + FA_SP_CVTX           53   (was 58 without FA_SM_2P)
+//        + FA_SM_2P + FA_SP_CVTSWAR + FA_SP_CVTX + FZ6     50
+//      So the right way to read the renamer constraint is not "this flag costs too much" but "the
+//      budget is one number for the whole kernel, and a register freed anywhere is spendable
+//      anywhere".  Check the union of the COMBINATION, not of each flag against the reference.
+//      RELATED FIX IN THIS PASS: FA_SP_CVTX and FA_SP_CVTSWAR used to be mutually exclusive #elif
+//      arms of fa_requant_cvt, so choosing the SWAR packer put the 16-way subbank conflict BACK and
+//      roughly cancelled its own win.  They are orthogonal -- one is the ADDRESSING, the other the
+//      ARITHMETIC -- and the CVTX arm now uses the SWAR chain when both are set.
+//
+// (G4) FLAG CATALOGUE FOR THIS PASS (all default OFF; the plain build and the plain FULL_ATTN2
+//      build stay byte-for-byte the pre-existing kernel, and the published FA_SP_QSPLIT reference
+//      build is verified BYTE-IDENTICAL after every edit below).
+//        FA_SP_PAX    XOR-rotate requant pass A's 16 word loads by (lane & 15).  Bit-exact (max is
+//                     order-free), 53 -> 53 registers, +18 instr/item.  See (G1).
+//        FA_FOLDX     the same for warp_fold16's eight word loads (FA_TREEFIX's reduction).  Costs
+//                     6 registers in an all-warps function -- RENAMER CASUALTY, kept OFF.
+//        FA_SP_SM1FX  one-fence folds for BOTH softmax reductions over a 32-bit-per-lane XOR-indexed
+//                     buffer.  Bit-exact for the SUM too, which FA_SP_SM1FR's (k+lane)&15 rotation
+//                     was not: XOR by a constant is an AUTOMORPHISM of the dyadic reduction tree
+//                     (the pair {k,k^1} is a tree pair, {k,k^1} vs {k^2,k^3} is the next one, ...),
+//                     so the tree's expression is reproduced with some subtrees' operands SWAPPED,
+//                     and bf16 addition is commutative even though it is not associative.  A cyclic
+//                     rotation maps {0,1} to {1,2}, which is not a tree pair, and is therefore only
+//                     legal for the max -- that asymmetry is the whole reason to prefer XOR.
+//                     58 registers: RENAMER CASUALTY, kept OFF.
+//        FA_SP_RBPAD  pad the cross-lane reduce buffer's PER-WARP stride from NT to NT+2 halfwords.
+//                     buf is at 0x15000 + warp*NT halfwords = warp*8 WORDS, so the subbank
+//                     (word & 15) is 0 for warps 0/2/4 and 8 for warps 1/3/5 -- a 3-way INTER-warp
+//                     conflict on top of the 16-way INTRA-warp one (all 16 lanes read buf[0] to
+//                     broadcast each reduction).  A stride of 9 words spreads warps 0..5 over
+//                     subbanks 0,9,2,11,4,13.  Address change only: bit-exact, zero registers, zero
+//                     instructions, +24 bytes of scratch.  Does NOT touch the intra-warp broadcast
+//                     conflict -- that needs FA_FOLDX (register-fatal) or FA_SM_2P.
+//        FA_SP_BANKA  bank-align S and move P8/O next to Q.  MANDATORY with FA_SP_OPV -- see (G2).
+//        FA_SP_OPV    the six-stage pipeline that hides the PV matmul under the next tile's softmax
+//                     and puts O_unnorm in the (dead) P8 region.  Needs FA_SP_QOVL + FA_SP_PKOVL;
+//                     replaces FA_SP_QSPLIT / QOVL3 / QOVL4 / QKACC.
+//        FA_SP_OPVQ   move the Q(t+1) prefetch into stage C2, the one stage with NO mesh activity.
+//                     That frees warp 0 in stage A, so the softmax and pass A run on all SIX warps,
+//                     and it removes the last place where an SF scale write or a prefetch DMA can
+//                     sit next to a live mesh operation.
+//        FA_SP_WCNT   NOT NEW, but promoted from "diagnostic" to MANDATORY -- see (G0).  Puts
+//                     gemmini_fence_waitcount(0) (MMIO 0x28, runningLoops, which rises in the SAME
+//                     CYCLE as the LOOP_WS command write) in front of every busy-poll fence, so the
+//                     accumulator->spad store in stage S1 can no longer be read by the softmax
+//                     while the mesh is still writing it.  Four extra MMIO polls per tile.
+//        FA_SP_HSF    *** the host MX-scale offload COMPOSED WITH THE PIPELINE. ***  The GPU writes
+//                     NO scale word anywhere (K/V/Q and the runtime packed P scales all come from
+//                     Rocket's 8-byte stores), which makes both scale ports HOST-PRIVATE and
+//                     removes ScaleFactorMem's shared 2-beat pairing hazard by construction instead
+//                     of by scheduling -- the thing the fourth pass's 7-of-12 host build got wrong.
+//                     The hand-off is PACKREQ at the top of stage C2 / PACKED at the top of stage D,
+//                     i.e. entirely inside the mesh-idle stage.  It pays off twice: warp 0's ~4.2k
+//                     Q-scale write and ~8.3k P pack both disappear, so finalize AND the convert go
+//                     from five warps to six.  Mailbox at device 0x15F00 (the sequential kernel's
+//                     0x17F00 is inside FA_SP's Q scratchpad and would be overwritten by the Q DMA).
+//
+// (G3) *** FA_SP_OPV -- THE EXPOSED PV MATMUL CAN BE HIDDEN, AND NOTE (c) WAS WRONG ABOUT WHY. ***
+//      Note (c) of the second pass argued that exactly one of the two matmuls must be exposed
+//      because "the only SIMT work that does not depend on its own tile's mesh result is finalize,
+//      and finalize(t) depends on PV(t)".  That is true WITHIN a tile and false ACROSS tiles:
+//      PV(t-1) and softmax(t) are independent, so sliding the loop by one hides PV.  Note (c) also
+//      recorded the real obstruction correctly -- O(t-1) must stay alive across tile t's softmax and
+//      "a second 16 KB O buffer does not exist" -- but the buffer IS there: it is the P8 region,
+//      which is dead from the moment PV(t-1) has read it until convert(t) rewrites it.
+//      FA_SP_OPV puts O there and runs six stages per iteration; FA_SP_OPVQ additionally moves the
+//      Q prefetch into the one stage with NO mesh activity, which frees warp 0 for a SIX-warp
+//      softmax and a six-warp pass A.  Full derivation at the flag itself.
+// ============================================================================================
 #if defined(FA_SP)
 #ifdef FA_SP_MAP2
 // MAP2: swap V and P8 so requant's fp8 WRITES (P8) and its bf16 READS (S) land in different
@@ -1279,6 +1677,52 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 static constexpr uint32_t SP_P     = 0;      // P8  (A op of PVF)  rows    0..1024
 static constexpr uint32_t SP_V_END = 3072;   // V   (B op of PVF)  rows 1024..3072
 static constexpr uint32_t SP_C     = 3072;   // S/P/O (C dest)     rows 3072..5120
+#elif defined(FA_SP_BANKA)
+// ============================================================================================
+// FA_SP_BANKA -- *** BANK-ALIGN S.  THIS IS A HARDWARE CONSTRAINT, NOT A MICRO-OPTIMISATION. ***
+//
+// THE RTL FACT, measured the hard way (FA_SP_OPV $finished on it twice, at 237,301,000 and
+// 238,123,000 ps, naming `...gemmini.spad.spad_mems_2`):
+//   Scratchpad.scala:210-220 -- the `use_shared_ext_mem` READ path of every ScratchpadBank --
+//   tracks outstanding spad read requests in
+//       val dma_q = Module(new Queue(Bool(), 4, false, true))
+//       assert(dma_q.io.enq.fire === ren, "DMA queue does not have enough entries")
+//                                          // TODO (richard): do backpressure
+//   FOUR entries, and NO BACKPRESSURE.  If the shared SMEM does not return a read response before
+//   the mesh issues a fifth request to that bank, the SIMULATION $finishes.  So THE MESH MAY NOT
+//   READ AN OPERAND OUT OF A 32 KB SMEM BANK THAT SIMT CODE IS READING AT THE SAME TIME: the SIMT
+//   traffic delays the responses and the queue overflows.
+//
+// WHY THE DEFAULT MAP CANNOT OVERLAP THE MESH WITH THE SOFTMAX / PASS A / THE CONVERT.  Banks are
+// 32 KB (bank = addr >> 15) and the default map puts
+//     S -> P-bf16 -> O  at 0x0C000..0x14000, STRADDLING banks 1 AND 2,   and   Q at 0x16000, bank 2.
+// Every large SIMT phase reads S, so every one of them touches bank 2 -- and the QK matmul reads its
+// A operand (Q) out of bank 2.  FA_SP_QSPLIT survives this BY CONSTRUCTION, not by luck: the only
+// stage where it runs the mesh underneath SIMT work is QK(t+1) || finalize(t), and finalize reads
+// only O, which is the LOWER 16 KB of SP_C and therefore entirely in bank 1.  Any schedule that
+// overlaps the mesh with a phase that touches S -- which is exactly what FA_SP_OPV does -- asserts.
+//
+// THE FIX IS A THREE-LINE REMAP: give S a WHOLE bank and move P8/O into bank 2, next to Q.
+//     bank 0  0x00000..0x08000   V (32 KB)                PV's B operand
+//     bank 1  0x08000..0x10000   S -> P-bf16 (32 KB)      the SIMT working set, EXACTLY one bank
+//     bank 2  0x10000..0x14000   P8 / then O_unnorm       PV's A operand, then finalize's input
+//             0x14000..0x16000   scratch (8 KB)           (REDBUF 0x15000 is hard-coded: unmoved)
+//             0x16000..0x18000   Q (8 KB)                 QK's A operand
+//     bank 3  0x18000..0x20000   K^T (32 KB)              QK's B operand
+// Now every concurrent pair in the FA_SP_OPV schedule is bank-disjoint ON THE READ PORT:
+//     PV mesh reads P8(b2) + V(b0)  ||  softmax reads AND writes S(b1)        disjoint
+//     QK mesh reads Q(b2)  + K(b3)  ||  convert READS S(b1), writes P8(b2)    disjoint READS
+//     finalize reads O(b2)          ||  no mesh operation at all
+// The convert's P8 WRITES do land in bank 2 while the mesh reads Q there, which is the one pairing
+// this map does not separate -- it should be safe because the subbanks are 1R1W (a read and a write
+// proceed in the same cycle) and the four-entry queue is on the READ port, but it is the assumption
+// to suspect first if this configuration asserts on spad_mems_2 anyway.
+// Nothing else moves: SM_S / SM_P8 are derived, the 0x14000..0x16000 scratch window is untouched
+// (its 0x15000 REDBUF address is hard-coded inside flash_mx_impl.hpp), and so are Q and K^T.
+// ============================================================================================
+static constexpr uint32_t SP_V_END = 2048;   // V   (B op of PVF)  rows    0..2048  bank 0
+static constexpr uint32_t SP_C     = 2048;   // S -> P-bf16        rows 2048..4096  bank 1 EXACTLY
+static constexpr uint32_t SP_P     = 4096;   // P8 / O_unnorm      rows 4096..5120  bank 2
 #else
 static constexpr uint32_t SP_V_END = 2048;   // V   (B op of PVF)  rows    0..2048
 static constexpr uint32_t SP_P     = 2048;   // P8  (A op of PVF)  rows 2048..3072
@@ -1309,6 +1753,9 @@ static __attribute__((noinline)) void fa_mvin_A(const uint8_t *A, uint32_t spad_
                                                 uint32_t dim_k, uint32_t tid) {
     if (tid != 0) return;
     gemmini_config_ld(dim_k * sizeof(uint8_t));
+#ifdef FA_NS_SENT
+    fa_sent_stamp(spad_row, C.PE_TILES_I() * C.PE_TILES_K());   // positive completion proof
+#endif
     // rolled on purpose: 32 unrolled ROCC mvin commands are 632 B of a 16 KB direct-mapped
     // icache, and this runs once per tile (the DMA, not the issue, is the cost).
 #pragma clang loop unroll(disable)
@@ -1319,6 +1766,9 @@ static __attribute__((noinline)) void fa_mvin_A(const uint8_t *A, uint32_t spad_
             gemmini_extended_mvin(rad_device_to_host_address(reinterpret_cast<uint32_t>(p)),
                                   spad_row + (i * C.PE_TILES_K() + k) * DIM, DIM, DIM);
         }
+#ifdef FA_NS_SENT
+    fa_sent_wait(spad_row, C.PE_TILES_I() * C.PE_TILES_K());
+#endif
 }
 // B-operand move-in: PE_TILES_K x PE_TILES_J tiles, GMEM row stride dim_n; spad grows DOWN
 // from spad_end_row.  Prologue-only (K^T, V) -> keep it rolled, it is cold code.
@@ -1431,6 +1881,99 @@ static __attribute__((noinline)) void fa_gf(uint32_t tid) {
     if (tid != 0) return;
     gemmini_fence();
 }
+#ifdef FA_SP_HSF
+// ---- FA_SP_HSF host<->GPU mailbox (must match SP_MBOX / SPM_* in host.cpp) -------------------
+// ADDRESS CHOICE, and it took two tries.  The sequential kernel's mailbox at device 0x17F00 is NOT
+// usable here: it lands inside FA_SP's Q scratchpad (0x16000..0x18000), which the Q move-in DMA
+// rewrites every tile.  The obvious replacement, 0x15F00 ("above everything the map puts in the
+// 0x14000..0x16000 scratch window"), is ALSO wrong: FA_SM_2P's per-row partial buffer `pb` is at
+// 0x15680 with a stride of 2*NT+1 = 33 HALFWORDS (its comment says 17), so it spans
+// 0x15680..0x166E0 -- it overruns the scratch window into Q AND writes 0x15F10 / 0x15F20, i.e.
+// exactly the PACKREQ and PACKED words.  With FA_SM_2P on, the handshake would silently break.
+// 0x14D00 sits in the 512-byte CORR_SMEM slot above the 128 bytes corr_out actually uses (0x14C00..
+// 0x14C80), which no configuration touches, and nothing in flash_mx_impl.hpp hard-codes.
+// *** SEPARATE HAZARD WORTH FIXING IN flash_mx_impl.hpp, NOT OWNED HERE: pb's 4,224-byte footprint
+// overwrites Q rows 0..13 on every softmax.  It survives only because FA_SP re-issues Q's move-in
+// in stage S4, i.e. after the softmax and before the QK that reads Q -- so the corruption is always
+// repaired before use.  That is luck, not design; STR should be NT+1 = 17 as its comment says. ***
+// The host writes these words with 8-byte stores (a 4-byte host store is silently dropped) and the
+// GPU reads/writes the low 32-bit word of each.
+static constexpr uint32_t FA_SP_MBOX     = 0x14D00;
+static constexpr uint32_t FA_SPM_READY   = 0x00;   // host -> GPU: K/V/Q scales resident
+static constexpr uint32_t FA_SPM_PACKREQ = 0x10;   // GPU  -> host: SCALE_SMEM(t) is published
+static constexpr uint32_t FA_SPM_PACKED  = 0x20;   // host -> GPU: Q + P scales resident
+static constexpr uint32_t FA_SPM_MAGIC   = 0x5CA1E5u;
+// Bounded spin: a broken mailbox must degrade to a WRONG ANSWER with a finite run, never to a hang
+// that is indistinguishable from too small a cycle budget.  200k polls is far more than one tile.
+static __attribute__((noinline)) void fa_sp_wait(uint32_t off, uint32_t want, uint32_t tid) {
+    if (tid != 0) return;
+    volatile __shared uint32_t *p =
+        reinterpret_cast<volatile __shared uint32_t *>(FA_SP_MBOX + off);
+    for (uint32_t i = 0; i < 200000u; i++) if (*p >= want) return;
+}
+static __attribute__((noinline)) void fa_sp_post(uint32_t off, uint32_t val, uint32_t tid) {
+    if (tid != 0) return;
+    *reinterpret_cast<volatile __shared uint32_t *>(FA_SP_MBOX + off) = val;
+    mu_fence_smem();          // publish it to the host before we go on to wait for the reply
+}
+#endif
+// ============================================================================================
+// FA_SP_WCNT -- *** gemmini_fence() IS NOT A DRAIN FOR A MATMUL YOU JUST ISSUED. ***
+//
+// gemmini_fence() spins on MMIO 0x20, which is wired straight to `gemmini.module.io.busy`
+// (GemminiTile.scala:403-406, 428).  A gemmini command is fired by the store to 0x00 and then has
+// to travel to the reservation station before io.busy rises, so a poll issued a few cycles after
+// that store CAN READ ZERO AND FALL STRAIGHT THROUGH -- the fence returns before the matmul has
+// even started, never mind finished.  Whether it does depends on exactly how many cycles separate
+// the issuing store from the poll, which is why every schedule change flips this on and off.
+//
+// MMIO 0x28 is the register that cannot lie: GemminiTile.scala:408-412 keeps
+//     runningLoops := runningLoops + loopStarted + mmioLoopStarted - completionCount
+// where mmioLoopStarted is asserted IN THE SAME CYCLE as the command write when its funct is
+// LOOP_WS.  So runningLoops is >= 1 from the instant the matmul is issued until the loop reports
+// completion, and `gemmini_fence_waitcount(0)` is a true drain.  It only tracks LOOP_WS, so an
+// mvin still needs the busy poll -- hence both, in that order.
+//
+// WHY THIS IS THE FA_SP_QKACC BUG.  FA_SP_QKACC is the ONLY configuration in which SOFTWARE has to
+// wait for a matmul and then read its ACCUMULATOR: every other path passes acc_move_out=true and
+// lets the loop FSM do the move-out, which is internally ordered.  With FA_SP_QKACC, stage S1 does
+//     fa_gf(tid);  fa_store_acc<QKF>(SP_C, tid);  fa_gf(tid);
+// and if the first fence falls through, the accumulator->spad store reads the accumulator WHILE THE
+// MESH IS STILL ACCUMULATING INTO IT.  What lands in S is a set of partial sums -- wrong, finite,
+// of plausible magnitude, self-consistent enough that the softmax and requant downstream produce a
+// P and an l that still agree with each other, and therefore an O that is still a convex
+// combination of V.  That is EXACTLY the fingerprint measured in (F1), and it explains every other
+// property of the bug: it needs FA_SP_QKACC (the bisection), it is timing-dependent, it moves tiles
+// when the schedule moves, and it never appears on tile 0 (whose QK is issued in the prologue, a
+// barrier and a whole stage away from the store).
+// ============================================================================================
+static __attribute__((noinline)) void fa_gfl(uint32_t tid) {
+    if (tid != 0) return;
+#ifdef FA_SP_WCNT
+    gemmini_fence_waitcount(0);   // MMIO 0x28: runningLoops == 0  (rises AT ISSUE -- cannot race)
+#endif
+    gemmini_fence();              // MMIO 0x20: io.busy == 0       (also covers mvin DMAs)
+}
+#ifdef FA_SP_DUMPWC
+// DIAGNOSTIC (FA_SP_DUMPWC): PROVE OR REFUTE the gemmini_fence() race directly, at a cost of three
+// instructions and one store, so the schedule it is measuring barely moves.  Sample MMIO 0x28
+// (runningLoops -- see fa_gfl) BEFORE the busy-fence and AGAIN AFTER it, and publish both.
+//     after != 0   =>  gemmini_fence() RETURNED WHILE A LOOP_WS WAS STILL RUNNING.  The
+//                      accumulator->spad store that follows therefore read a mid-accumulation
+//                      accumulator, which is the whole bug.
+//     before == 0  =>  io.busy had not even risen yet when we arrived -- the command was still in
+//                      flight to the reservation station -- which is the mechanism by which the
+//                      fence can fall straight through.
+// Lands at 0x40056000 + 4*t, inside the window the trace filter already keeps.
+static __attribute__((noinline)) void fa_gfl_probe(uint32_t tid, uint32_t t) {
+    if (tid != 0) return;
+    const uint32_t before = load32_shared(GEMMINI_OCCUPANCY_ADDR);
+    gemmini_fence();
+    const uint32_t after = load32_shared(GEMMINI_OCCUPANCY_ADDR);
+    volatile uint32_t *o = (volatile uint32_t *)(0x40056000u + 4u * t);
+    *o = (before << 16) | (after & 0xffffu);
+}
+#endif
 
 // Native single-instruction bf16 max / add.  Going through C's fmaxf() or `a+b` on _Float16
 // makes clang promote to fp32 (fcvt.s.h + fmax.s/fadd.s + fcvt.h.s), which triples the op count
@@ -1553,16 +2096,48 @@ static __attribute__((noinline)) void fa_softmax_tpr(
             const uint32_t w2 = Srow[(i + 2u + lane) & (SKW - 1u)];
             const uint32_t w3 = Srow[(i + 3u + lane) & (SKW - 1u)];
 #endif
+#ifdef FA_SP_MAXSC
+            // FA_SP_MAXSC: reduce over the SCALED values with the native bf16 fmax.h, exactly as
+            // online_softmax_block does, instead of maxing the RAW row and scaling once at the end
+            // with clang's fp32-promoted fmaxf.  ALGEBRAICALLY the two are the same -- bf16 multiply
+            // and bf16 round-to-nearest are both monotone, so max_i RNE(S_i*scale) ==
+            // RNE(max_i S_i * scale) -- so this flag exists ONLY to test whether the HARDWARE agrees.
+            // It is a real suspicion, not a fishing trip: hardware fact 2 says the bf16<->fp32
+            // converters on this machine are UNVALIDATED and have already produced garbage once
+            // (`a += (float)e` gave 5,120 of 8,192 cells at +-inf), and the raw-max form is the one
+            // place left in fa_softmax_tpr that routes a value through fcvt.s.h/fcvt.h.s where the
+            // cooperative version does not.  If fcvt.h.s is not monotone for some bit patterns then
+            // m differs on a few rows, every fp8 mantissa in those rows shifts, and that is exactly
+            // the shape of the unexplained 3.5666% -> 4.2342% step.  Costs SK extra fmul.h per row.
+            x0 = fa_max_h(x0, fa_max_h((_Float16)(as_bf16((uint16_t)w0) * scale),
+                                       (_Float16)(as_bf16((uint16_t)(w0 >> 16)) * scale)));
+            x1 = fa_max_h(x1, fa_max_h((_Float16)(as_bf16((uint16_t)w1) * scale),
+                                       (_Float16)(as_bf16((uint16_t)(w1 >> 16)) * scale)));
+            x2 = fa_max_h(x2, fa_max_h((_Float16)(as_bf16((uint16_t)w2) * scale),
+                                       (_Float16)(as_bf16((uint16_t)(w2 >> 16)) * scale)));
+            x3 = fa_max_h(x3, fa_max_h((_Float16)(as_bf16((uint16_t)w3) * scale),
+                                       (_Float16)(as_bf16((uint16_t)(w3 >> 16)) * scale)));
+#else
             x0 = fmaxf(x0, fmaxf(as_bf16((uint16_t)w0), as_bf16((uint16_t)(w0 >> 16))));
             x1 = fmaxf(x1, fmaxf(as_bf16((uint16_t)w1), as_bf16((uint16_t)(w1 >> 16))));
             x2 = fmaxf(x2, fmaxf(as_bf16((uint16_t)w2), as_bf16((uint16_t)(w2 >> 16))));
             x3 = fmaxf(x3, fmaxf(as_bf16((uint16_t)w3), as_bf16((uint16_t)(w3 >> 16))));
+#endif
         }
+#ifdef FA_SP_MAXSC
+        const _Float16 mraw = fa_max_h(fa_max_h(x0, x1), fa_max_h(x2, x3));
+#ifdef FA_SP_SUBMAX
+        const _Float16 m = fa_add_h(mraw, as_bf16((uint16_t)MARGIN_BF16));
+#else
+        const _Float16 m = mraw;      // already scaled
+#endif
+#else
 #ifdef FA_SP_SUBMAX
         const _Float16 m = fa_add_h((_Float16)(fmaxf(fmaxf(x0, x1), fmaxf(x2, x3)) * scale),
                                     as_bf16((uint16_t)MARGIN_BF16));
 #else
         const _Float16 m = (_Float16)(fmaxf(fmaxf(x0, x1), fmaxf(x2, x3)) * scale);
+#endif
 #endif
 #endif  // FA_SP_NOMAX
         // ---- pass 2: P = exp(S*scale - m), written IN PLACE; row sum in bf16 (4 chains) ----
@@ -2264,6 +2839,36 @@ static __attribute__((noinline)) void fa_requant_max(
         const uint32_t row = item / NBLK, b = item % NBLK;
         const __shared uint32_t *Pb = P32 + row * (SK / 2) + b * 16u;
         _Float16 x0 = (_Float16)0, x1 = (_Float16)0, x2 = (_Float16)0, x3 = (_Float16)0;
+#ifdef FA_SP_PAX
+        // ==== FA_SP_PAX -- KILL THE 16-WAY SMEM SUBBANK CONFLICT IN REQUANT PASS A, FOR FREE ====
+        // Exactly the trap FA_SP_CVTX fixes in the convert, and pass A has it too: the subbank is
+        // word_index & 15, the index here is row*(SK/2) + b*16 + i = row*128 + b*16 + i, and BOTH
+        // 128 and 16 are multiples of 16 -- so the subbank is (i & 15), which is LANE-UNIFORM.  A
+        // warp's 16 lanes hold 16 different (row,b) items but run the same inner iteration, so all
+        // 16 lanes hit ONE subbank on every one of the 16 loads.  Pass A costs 3,405 cyc/tile for
+        // ~90 static instructions x 5.33 items = ~1.4k of issue on the binding core, so most of the
+        // remaining ~2k is this conflict.
+        // THE FIX IS FREE AND BIT-EXACT.  Unlike the convert, pass A only READS -- and its result is
+        // a MAX, which is exact and completely order-independent -- so the word index may be
+        // permuted ARBITRARILY per lane, giving the full 16-way break rather than the convert's
+        // 2-way (there an output word must hold 4 CONSECUTIVE elements, which pins the rotation).
+        // Pb's byte address is (row*128 + b*16)*4 = row*512 + b*64, whose low SIX bits are zero, and
+        // the 16 word offsets occupy exactly bits 5:2 -- so `+` is `^` and the rotation folds into
+        // the base pointer ONCE per item, leaving every access a compile-time-immediate XOR (the
+        // same argument as FA_SP_CVTX).  Costs one andi + one xor per item and ZERO live registers.
+        const uint32_t Pbx = ((uint32_t)(uintptr_t)Pb) ^ (((tid % MU_NUM_THREADS) & 15u) << 2);
+#define FA_PAX_LD(ix) (*reinterpret_cast<const __shared uint32_t *>(Pbx ^ ((ix) << 2)))
+#pragma unroll
+        for (uint32_t i = 0; i < 16; i += 4) {
+            const uint32_t w0 = FA_PAX_LD(i + 0), w1 = FA_PAX_LD(i + 1),
+                           w2 = FA_PAX_LD(i + 2), w3 = FA_PAX_LD(i + 3);
+            x0 = fmaxf(x0, fmaxf(as_bf16((uint16_t)w0), as_bf16((uint16_t)(w0 >> 16))));
+            x1 = fmaxf(x1, fmaxf(as_bf16((uint16_t)w1), as_bf16((uint16_t)(w1 >> 16))));
+            x2 = fmaxf(x2, fmaxf(as_bf16((uint16_t)w2), as_bf16((uint16_t)(w2 >> 16))));
+            x3 = fmaxf(x3, fmaxf(as_bf16((uint16_t)w3), as_bf16((uint16_t)(w3 >> 16))));
+        }
+#undef FA_PAX_LD
+#else
         for (uint32_t i = 0; i < 16; i += 4) {
             const uint32_t w0 = Pb[i + 0], w1 = Pb[i + 1], w2 = Pb[i + 2], w3 = Pb[i + 3];
             x0 = fmaxf(x0, fmaxf(as_bf16((uint16_t)w0), as_bf16((uint16_t)(w0 >> 16))));
@@ -2271,6 +2876,7 @@ static __attribute__((noinline)) void fa_requant_max(
             x2 = fmaxf(x2, fmaxf(as_bf16((uint16_t)w2), as_bf16((uint16_t)(w2 >> 16))));
             x3 = fmaxf(x3, fmaxf(as_bf16((uint16_t)w3), as_bf16((uint16_t)(w3 >> 16))));
         }
+#endif
         const _Float16 bmax = fmaxf(fmaxf(x0, x1), fmaxf(x2, x3));
         const uint32_t em = ((uint32_t)__builtin_bit_cast(uint16_t, bmax) >> 7) & 0xffu;
         const uint32_t K8 = fa_clamp_K8(((int)em - 7) << 3);
@@ -2335,6 +2941,24 @@ static __attribute__((noinline)) void fa_requant_cvt(
         const uint32_t Pbx  = ((uint32_t)(uintptr_t)Pb) ^ ((lane_ & 7u) << 3);
         const uint32_t dstx = ((uint32_t)(uintptr_t)dst)
                             ^ ((((lane_ & 4u) << 6) | ((lane_ & 3u) << 2)));
+#ifdef FA_SP_CVTSWAR
+        // FA_SP_CVTX + FA_SP_CVTSWAR TOGETHER.  These used to be mutually exclusive #elif arms, so
+        // the SWAR packer came at the price of putting the 16-way subbank conflict back -- roughly
+        // cancelling its own win.  They are ORTHOGONAL (one is the ADDRESSING, the other is the
+        // ARITHMETIC), so this arm uses the XOR-rotated addresses AND the 25-instruction SWAR chain:
+        // 8 x (34 - 25) = 72 fewer instructions per item, ~21% of the phase's issue work, with the
+        // conflict still broken.  The three SWAR masks cost registers, which is why this was
+        // unreachable until FA_SM_2P deleted the softmax's slo[8]/shi[8] arrays -- see (G5).
+        const uint32_t D1 = 0x7ff8u - (K8 - 8u), D2s = D1 | (D1 << 16);
+        const uint32_t C = 0x07ff07ffu, M = 0x80008000u, H = 0x0000ffffu;
+#pragma unroll
+        for (uint32_t uu = 0; uu < 8; uu++)
+            *reinterpret_cast<__shared uint32_t *>(
+                dstx ^ (((uu & 4u) << 6) | ((uu & 3u) << 2))) =
+                e4m3_pack4_swar(*reinterpret_cast<const __shared uint32_t *>(Pbx ^ (uu << 3)),
+                                *reinterpret_cast<const __shared uint32_t *>(Pbx ^ ((uu << 3) | 4u)),
+                                D2s, C, M, H);
+#else
 #pragma unroll
         for (uint32_t uu = 0; uu < 8; uu++)
             *reinterpret_cast<__shared uint32_t *>(
@@ -2342,6 +2966,7 @@ static __attribute__((noinline)) void fa_requant_cvt(
                 e4m3_pack4(*reinterpret_cast<const __shared uint32_t *>(Pbx ^ (uu << 3)),
                            *reinterpret_cast<const __shared uint32_t *>(Pbx ^ ((uu << 3) | 4u)),
                            K8);
+#endif
         }
 #elif defined(FA_SP_CVTSWAR)
         // FA_SP_CVTSWAR: use the SWAR packer (25 straight-line instructions for 4 elements)
@@ -2595,7 +3220,10 @@ static __attribute__((noinline)) void fa_finalize_bal(
 #if defined(FA_SP_SM1FL) && !defined(FA_SP_SM1F)
 #  error "FA_SP_SM1FL extends FA_SP_SM1F to the l reduction -- set FA_SP_SM1F too"
 #endif
-#if defined(FA_SP_CBMAX) || defined(FA_SP_SM1F)
+#if defined(FA_SP_SM1FX) && (defined(FA_SP_SM1F) || defined(FA_SP_CBMAX))
+#  error "FA_SP_SM1FX replaces FA_SP_SM1F / FA_SP_SM1FL -- do not set them together"
+#endif
+#if defined(FA_SP_CBMAX) || defined(FA_SP_SM1F) || defined(FA_SP_SM1FX)
 // Per-warp scratch for the eight per-block max partials: 8 blocks x 16 lanes x 2 B = 256 B per
 // warp, 6 warps = 1.5 KB.  Lives at 0x15800, inside the 0x14000..0x16000 scratch window and above
 // everything the FA_SP map puts there (REDBUF 0x15000 uses 32 B/warp; LPART 0x15400 is FUSE-only).
@@ -2623,6 +3251,38 @@ static __attribute__((noinline)) void fa_softmax_coop(
     const _Float16 scale = as_bf16(softmax_scale_bf16);
     volatile __shared uint16_t *buf =
         reinterpret_cast<volatile __shared uint16_t *>(REDBUF_SMEM) + warp * NT;
+    (void)buf;
+#ifdef FA_SP_SM1FX
+    // ==== FA_SP_SM1FX -- ONE FENCE PER REDUCTION *AND* NO SUBBANK CONFLICT, BIT-EXACT. ==========
+    // FA_SP_SM1F had the right idea (store the 16 per-lane partials, fence ONCE, let every lane
+    // fold all 16 in registers -- no divergence region, no second fence, no store->load hand-off to
+    // race) and MEASURED A LOSS of +1,502 cyc/tile, for one reason: all 16 lanes then read the SAME
+    // halfword of `buf` on each of the fold's 16 steps.  FA_SP_SM1FR broke that with a (k+lane)&15
+    // rotation and paid 70 instructions and 4 registers for the modular arithmetic -- 34 registers
+    // in an all-warps function, over the renamer cliff.
+    // THIS DOES IT WITH XOR AND PAYS NOTHING.  Give each lane a 32-BIT slot instead of a halfword
+    // (per-warp buffer = 16 words = 64 B, base = REDBUF + warp*64, low SIX address bits zero), so
+    // the 16 slots are 16 DISTINCT word-subbanks; then index them by `lane ^ k`.  Because the base
+    // is 64 B aligned and the slot offset occupies exactly bits 5:2, `+` is `^`, and
+    //     addr(lane ^ k) = (base ^ (lane<<2)) ^ (k<<2)
+    // so the lane term folds into the pointer ONCE per row and every one of the 16 reads is a
+    // compile-time-immediate XOR.  At every step the 16 lanes read 16 different words -> ZERO
+    // conflict, and it costs one andi + one xor per row plus one xori per read.
+    // *** WHY IT IS BIT-EXACT FOR *BOTH* REDUCTIONS, INCLUDING l. ***  Reading u[k] = v[lane ^ k]
+    // permutes the 16 partials, and XOR-by-a-constant maps the DYADIC tree onto ITSELF: the pair
+    // {k, k^1} of u-indices is a pair {2i, 2i+1} of v-indices, the pair of pairs {k,k^1},{k^2,k^3}
+    // is the tree's level-2 pair, and so on.  So evaluating warp_tree_reduce's exact 16-leaf
+    // expression over u gives the tree's expression over v with some subtrees' operands SWAPPED --
+    // and bf16 addition is COMMUTATIVE (only associativity fails), so the result is bit-identical.
+    // For the max it is trivially exact (max is associative and commutative).
+    // This is what FA_SP_SM1FL could not claim with a (k+lane)&15 rotation, which is NOT an
+    // automorphism of the tree; it is why the XOR form -- not the modular one -- is the right fix.
+    const uint32_t bufx = (REDBUF_SMEM + warp * (NT * 4u)) ^ (lane * 4u);
+#define FA_RBX_ST(v) (*reinterpret_cast<volatile __shared uint32_t *>(bufx) = \
+                          (uint32_t)__builtin_bit_cast(uint16_t, (v)))
+#define FA_RBX_LD(k) as_bf16((uint16_t)*reinterpret_cast<volatile __shared uint32_t *>( \
+                          bufx ^ (((uint32_t)(k)) << 2)))
+#endif
 #ifdef FA_SP_CBMAX
     volatile __shared uint16_t *bb =
         reinterpret_cast<volatile __shared uint16_t *>(CBMAX_SMEM) + warp * (WPL * NT);
@@ -2639,6 +3299,16 @@ static __attribute__((noinline)) void fa_softmax_coop(
             slo[j] = lo; shi[j] = hi;
             mloc = fmaxf(fmaxf(lo, hi), mloc);
         }
+#ifdef FA_SP_SM1FX
+        FA_RBX_ST(mloc);
+        mu_fence_smem();
+        _Float16 q0 = FA_RBX_LD(0), q1 = FA_RBX_LD(1);
+#pragma unroll
+        for (uint32_t k = 2; k < NT; k += 2) {
+            q0 = fmaxf(q0, FA_RBX_LD(k + 0)); q1 = fmaxf(q1, FA_RBX_LD(k + 1));
+        }
+        const _Float16 m_new = fmaxf(q0, q1);
+#else
         buf[lane] = __builtin_bit_cast(uint16_t, mloc);
 #ifdef FA_SP_SM1F
         // ONE fence instead of two, and NO warp-divergence region.  warp_tree_reduce costs, per
@@ -2685,6 +3355,7 @@ static __attribute__((noinline)) void fa_softmax_coop(
         mu_fence_smem(); warp_tree_reduce<true>(buf, lane); mu_fence_smem();
         const _Float16 m_new = as_bf16(buf[0]);          // first_block => m_new == block max
 #endif
+#endif  // FA_SP_SM1FX
         _Float16 lloc = (_Float16)0;
         for (uint32_t j = 0; j < WPL; j++) {
             const _Float16 a = mu_fexp((_Float16)(slo[j] - m_new));
@@ -2696,10 +3367,15 @@ static __attribute__((noinline)) void fa_softmax_coop(
             bb[j * NT + lane] = __builtin_bit_cast(uint16_t, (_Float16)fmaxf(a, b));
 #endif
         }
+#ifdef FA_SP_SM1FX
+        FA_RBX_ST(lloc);
+        mu_fence_smem();
+#else
         buf[lane] = __builtin_bit_cast(uint16_t, lloc);
         mu_fence_smem();
 #ifndef FA_SP_SM1FL
         warp_tree_reduce<false>(buf, lane);
+#endif
 #endif
 #ifdef FA_SP_CBMAX
         // ...and, behind the SAME fence, lanes 0..WPL-1 each fold one block's 16 partials.
@@ -2718,7 +3394,22 @@ static __attribute__((noinline)) void fa_softmax_coop(
 #else
         (void)scale_scratch;
 #endif
-#ifdef FA_SP_SM1FL
+#ifdef FA_SP_SM1FX
+        // The l reduction, folded in registers behind the SAME single fence, in warp_tree_reduce's
+        // EXACT 16-leaf pairing -- see the FA_SP_SM1FX comment above for why reading u[k]=v[lane^k]
+        // leaves that tree bit-identical (XOR is an automorphism of the dyadic tree; bf16 addition
+        // is commutative even though it is not associative).  Three live temporaries, no array.
+        _Float16 t0 = (_Float16)((_Float16)(FA_RBX_LD(0) + FA_RBX_LD(1))
+                               + (_Float16)(FA_RBX_LD(2) + FA_RBX_LD(3)));
+        _Float16 t1 = (_Float16)((_Float16)(FA_RBX_LD(4) + FA_RBX_LD(5))
+                               + (_Float16)(FA_RBX_LD(6) + FA_RBX_LD(7)));
+        const _Float16 hA = (_Float16)(t0 + t1);
+        t0 = (_Float16)((_Float16)(FA_RBX_LD(8) + FA_RBX_LD(9))
+                      + (_Float16)(FA_RBX_LD(10) + FA_RBX_LD(11)));
+        t1 = (_Float16)((_Float16)(FA_RBX_LD(12) + FA_RBX_LD(13))
+                      + (_Float16)(FA_RBX_LD(14) + FA_RBX_LD(15)));
+        const _Float16 lsum = (_Float16)(hA + (_Float16)(t0 + t1));
+#elif defined(FA_SP_SM1FL)
         // FA_SP_SM1FL -- the same one-fence fold for l.  *** MEASURED A LOSS, kept for the record. ***
         // l MUST keep warp_tree_reduce's exact pairing, because bf16 addition is not associative
         // and every intermediate is rounded to bf16.  The tree is
@@ -2975,7 +3666,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 // FA_SP_ITEM implies the FA_SP_SMBMAX contract -- the E8M0 block scales are produced inside the
 // softmax stage, so the requant pass-A stage is compiled out.
 #  define FA_SP_SOFTMAX(T, N) fa_softmax_item<FA_SQ, FA_SK>(SOFTMAX_SCALE_BF16, (T), (N))
-#elif defined(FA_SP_CBMAX) || defined(FA_SP_SM1F)
+#elif defined(FA_SP_CBMAX) || defined(FA_SP_SM1F) || defined(FA_SP_SM1FX)
 // Cooperative (REFERENCE-numerics) softmax that also produces the E8M0 block scales -> pass A dies.
 #  define FA_SP_SOFTMAX(T, N) fa_softmax_coop<FA_SQ, FA_SK>(                     \
         reinterpret_cast<__shared uint32_t*>(SM_S),                               \
@@ -3052,12 +3743,22 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     fa_cfg<PVF>(/*asel=*/0, /*wsel=*/1, tid);
     fa_mvin_B<PVF>(&V_in[0][0], SP_V_END, FA_D, tid);
     fa_gf(tid);
+#ifdef FA_SP_HSF
+    // FA_SP_HSF: the HOST owns both scale ports -- K -> weight half 0, V -> weight half 1,
+    // Q -> act half 1 -- so the GPU writes NO scale word anywhere, ever.  That is what makes the
+    // act port host-private and removes ScaleFactorMem's shared 2-beat pairing hazard by
+    // construction rather than by scheduling.  Block until they are resident.
+    fa_sp_wait(FA_SPM_READY, FA_SPM_MAGIC, tid);
+#else
     fa_scl(fa_sf_b(0), &QK_B_scales_col[0][0], QKF.SCALE_FACTORS_PER_TILE_B(), tid);
     fa_scl(fa_sf_b(1), &V_scales[0][0], PVF.SCALE_FACTORS_PER_TILE_B(), tid);
+#endif
 #ifdef FA_SP_QOVL
     // tile 0's Q + Q scales: every later tile's are written one stage early (stage S2 below).
     fa_mvin_A<QKF>(&QK_A_in[0][0], SP_Q, FA_D, tid);
+#ifndef FA_SP_HSF
     fa_scl(fa_sf_a(1), &QK_A_scales_row[0][0], QKF.SCALE_FACTORS_PER_TILE(), tid);
+#endif
     // warps 1..5 do the SIMT work while warp 0 is the gemmini agent -> remap their ids so
     // online_softmax_block's row->warp partition covers all SQ rows with nwarps == 5.
     const uint32_t stid = tid - MU_NUM_THREADS;
@@ -3101,6 +3802,290 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 #if defined(FA_SP_CBMAX) && !defined(FA_SP_PKOVL)
 #  error "FA_SP_CBMAX deletes requant pass A, which only exists on the FA_SP_PKOVL path"
 #endif
+// ============================================================================================
+// FA_SP_OPV -- *** OVERLAP THE EXPOSED PV MATMUL WITH THE NEXT TILE'S SOFTMAX. ***
+//
+// THE PROBLEM IT SOLVES.  In FA_SP_QSPLIT the per-tile budget is
+//     S1 acc->S 998 | softmax 12,825 | pass A 3,405 | convert||pack 11,093 | PV 8,889 |
+//     QK(t+1)||finalize(t) 9,562   =  46,772
+// and of the mesh's 16,420 cycles only QK's 8,210 are hidden.  PV's 8,210 are EXPOSED, and for
+// those 8,889 cycles FIVE OF THE SIX WARPS DO NOTHING AT ALL -- 44,000 warp-cycles of idle SIMT
+// per tile.  Header note (c) argued this is structural: the per-tile chain is
+//     QK(t) -> softmax(t) -> pass A(t) -> convert(t) -> PV(t) -> finalize(t),
+// the only SIMT work that does not depend on its own tile's mesh result is finalize, finalize(t)
+// depends on PV(t), so "exactly one of the two matmuls can be covered".
+//
+// THAT ARGUMENT IS TRUE ONLY WITHIN ONE TILE.  Slide the loop by one and PV(t-1) becomes
+// concurrent with softmax(t): softmax(t) needs S(t), which QK(t) produced in the PREVIOUS
+// iteration, and PV(t-1) needs P8(t-1), which convert(t-1) produced there too.  Neither touches
+// the other's data.  What blocked it was the BUFFER, not the dependency -- O(t-1) has to stay
+// alive across tile t's softmax, and note (c) recorded "a second 16 KB O buffer does not exist
+// (V 32K + P8 16K + S/O 32K + scratch 8K + Q 8K + K 32K = 128K, exactly full)".
+//
+// *** THE 16 KB IS ALREADY THERE: IT IS THE P8 REGION. ***  P8(t-1) is DEAD the instant PV(t-1)
+// has read it, and P8(t) is not written until convert(t).  So O(t-1) is put THERE, and the region
+// is used strictly in sequence inside one iteration:
+//     convert(t-1) writes P8(t-1) [prev iter] -> PV(t-1) reads it [stage A] -> acc -> O(t-1)
+//     lands on top of it [stage B] -> finalize(t-1) reads O(t-1) [stage C2] -> convert(t) writes
+//     P8(t) over it [stage D].
+// Only two things have to change to make that legal: PV runs COMPUTE-ONLY into the accumulator
+// (fa_mm_acc, exactly as FA_SP_QKACC already does for QK) so its move-out can be deferred to a
+// SIMT-quiet stage, and l must be DOUBLE-BUFFERED, because finalize(t-1) needs l(t-1) while
+// softmax(t) is overwriting l.  m and corr are write-only in FA_SP (first_block == 1), so they
+// stay single-buffered.
+//
+// THE SIX STAGES, and what each one costs (estimates from the QSPLIT stage table):
+//   A  [mesh] PV(t-1) compute-only  ||  [warps 1-5] softmax(t)          max(8210, ~14.6k)
+//      warp 0 also issues Q(t+1)'s move-in DMA and writes its 64 SF_A-half-1 scale words: the
+//      mesh is reading SF_A half 0 and performs NO move-out, which is the placement FA_SP_QSPLIT
+//      already proved safe.
+//   B  [agent] drain PV(t-1); accumulator -> O(t-1) @ SP_P.  SIMT quiesced.       ~1.0k
+//   C1 [mesh] QK(t+1) compute-only  ||  [warps 1-5] requant pass A(t)   max(8210, ~4.1k)
+//      the leading gemmini_fence is a REAL drain of Q(t+1)'s DMA and, being a load from the
+//      gemmini TL port, also orders the stage-A scale stores ahead of the matmul that reads them
+//      -- the FA_SP_QGF/QSPLIT lesson, applied structurally.
+//   C2 [warps 1-5] finalize(t-1) -> GMEM, still underneath QK(t+1)'s mesh work.   ~9.6k
+//   D  [warp 0] SF pack  ||  [warps 1-5] requant convert(t) -> P8(t)    max(~11.1k, ~8.3k)
+//   E  [agent] drain QK(t+1); accumulator -> S(t+1) @ SP_C.  SIMT quiesced.       ~1.0k
+//   => ~14.6 + 1.0 + 8.2(hidden) + 9.6 + 11.1 + 1.0 ~= 41.3k, and with FA_SP_PAX (pass A) and
+//      FA_SP_CVTX (convert) ~39k = 42%.
+//
+// WHY EVERY VALUE IS BIT-IDENTICAL: nothing is recomputed, reassociated or reduced differently.
+// Every operation is performed by the same code on the same operands; only the STAGE it runs in
+// and the SMEM address O lands at change.  So an FA_SP_OPV build must still score exactly
+// 3.5666% against golden_O_u16.npy, and any deviation is a scheduling bug, not numerics.
+//
+// EVERY MESH SMEM WRITE IS IN A SIMT-QUIET STAGE, WHICH IS STRICTLY SAFER THAN QSPLIT.  The two
+// accumulator->spad move-outs (B and E) are the only mesh SMEM writes in the whole loop and both
+// sit alone between two barriers, so Hazard 2's atomic all-16-subbank grant can never be broken
+// by SIMT traffic or by a prefetch DMA -- the class of bug that cost the third and fourth passes.
+// The two concurrent stages (A and C1) run the mesh COMPUTE-ONLY, i.e. with zero SMEM writes.
+// ============================================================================================
+#if defined(FA_SP_HSF) && !defined(FA_SP_PKOVL)
+#  error "FA_SP_HSF hands off after requant pass A, which only exists on the FA_SP_PKOVL path"
+#endif
+#if defined(FA_SP_HSF) && defined(FA_SP_OPV) && !defined(FA_SP_OPVQ)
+#  error "FA_SP_HSF on FA_SP_OPV needs FA_SP_OPVQ (the hand-off lives in OPVQ's mesh-idle stage C2)"
+#endif
+#ifdef FA_SP_OPV
+#  if !defined(FA_SP_QOVL) || !defined(FA_SP_PKOVL)
+#    error "FA_SP_OPV needs FA_SP_QOVL (warp-0 agent) + FA_SP_PKOVL (split requant: pass A | convert)"
+#  endif
+#  if defined(FA_SP_QSPLIT) || defined(FA_SP_QOVL3) || defined(FA_SP_QOVL4) || defined(FA_SP_QKACC)
+#    error "FA_SP_OPV replaces FA_SP_QSPLIT / QOVL3 / QOVL4 / QKACC -- it is its own loop body"
+#  endif
+#  if defined(FA_SP_FZFLAT) || defined(FA_SP_FUSE) || defined(FA_SP_ITEM)
+#    error "FA_SP_OPV's finalize runs inside a warp-uniform if -- FZFLAT's internal barrier is illegal"
+#  endif
+#  if defined(FA_SP_SMTPR) || defined(FA_SP_CBMAX) || defined(FA_SP_SMBMAX)
+#    error "FA_SP_OPV is the REFERENCE-numerics body (l is uint16, pass A is a separate stage)"
+#  endif
+// l DOUBLE BUFFER: 64 uint16 = 128 B per parity, in the 512 B LS_SMEM..CORR_SMEM window.
+#define FA_OPV_L(par) (LS_SMEM + (par) * 256u)
+#ifdef FA_SP_SM1FX
+#  define FA_OPV_SOFTMAX(T, N, PAR) fa_softmax_coop<FA_SQ, FA_SK>(                 \
+        reinterpret_cast<__shared uint32_t*>(SM_S),                                \
+        reinterpret_cast<__shared uint16_t*>(M_SMEM),                              \
+        reinterpret_cast<__shared uint16_t*>(FA_OPV_L(PAR)),                        \
+        reinterpret_cast<__shared uint32_t*>(SCALE_SMEM),                          \
+        SOFTMAX_SCALE_BF16, (T), (N))
+#else
+#  define FA_OPV_SOFTMAX(T, N, PAR) online_softmax_block<FA_SQ, FA_SK>(            \
+        reinterpret_cast<const __shared uint32_t*>(SM_S),                          \
+        reinterpret_cast<__shared uint32_t*>(SM_S),                                \
+        reinterpret_cast<__shared uint16_t*>(M_SMEM),                              \
+        reinterpret_cast<__shared uint16_t*>(FA_OPV_L(PAR)),                        \
+        reinterpret_cast<__shared uint16_t*>(CORR_SMEM),                           \
+        SOFTMAX_SCALE_BF16, /*first=*/1, (T), (N))
+#endif
+// finalize reads O_unnorm out of the P8 REGION (SM_P8), not SM_S -- see the header comment.
+#define FA_OPV_FINALIZE(T, N, PAR) finalize_O<FA_SQ, FA_D>(                        \
+        reinterpret_cast<const __shared uint32_t*>(SM_P8),                         \
+        reinterpret_cast<const __shared uint16_t*>(FA_OPV_L(PAR)),                  \
+        reinterpret_cast<uint32_t*>(O_GMEM), (T), (N))
+
+    // ---- PRIME: QK(0) -> accumulator -> S(0) @ SP_C, so iteration 0 starts with S resident. ----
+    if (warp == 0) {
+        fa_cfg<QKF>(1, 0, tid);
+        fa_gf(tid);
+        fa_mm_acc<QKF>(SP_Q, SP_K_END, /*asel=*/1, /*wsel=*/0, tid);
+        fa_gfl(tid);
+        fa_store_acc<QKF>(SP_C, tid);
+        fa_gfl(tid);
+    } else { asm volatile("nop"); }
+    FAP_BAR(2);
+
+    // The loop runs ONE EXTRA iteration: iteration t does tile t's softmax/passA/convert and
+    // tile (t-1)'s PV/finalize, so iteration FA_SPTILES drains the last tile.  Both guards are
+    // warp-uniform, and no barrier is ever inside one.
+    for (uint32_t t = 0; t <= (uint32_t)FA_SPTILES; t++) {
+    const uint32_t par = t & 1u;              // l double-buffer parity for tile t
+    MARK();   // s0: TOP of the iteration
+    fa_phase_skew(tid);
+    // ---- STAGE A: [mesh] PV(t-1) COMPUTE-ONLY  ||  [warps 1-5] softmax(t) ------------------
+    if (warp == 0) {
+        if (t > 0) {
+            fa_cfg<PVF>(0, 1, tid);
+            fa_mm_acc<PVF>(SP_P, SP_V_END, /*asel=*/0, /*wsel=*/1, tid);
+        }
+#ifndef FA_SP_OPVQ
+        // Q(t+1) prefetch, split exactly as FA_SP_QSPLIT splits it: the DMA is ROCC issue only
+        // (32 commands) and the 64 SF_A-half-1 scale words ride under the PV mesh, which reads
+        // half 0 and performs no move-out.  Drained/ordered by the gemmini_fence in stage C1.
+        if (t + 1 < (uint32_t)FA_SPTILES) {
+            fa_mvin_A<QKF>(&QK_A_in[0][0], SP_Q, FA_D, tid);
+            fa_scl(fa_sf_a(1), &QK_A_scales_row[0][0], QKF.SCALE_FACTORS_PER_TILE(), tid);
+        }
+#endif
+    } else { asm volatile("nop"); }
+#ifdef FA_SP_OPVQ
+    // FA_SP_OPVQ: warp 0's ENTIRE stage-A duty is the PV issue (~200 cyc), so the softmax runs on
+    // ALL SIX WARPS instead of five -- worth ~1.8k, and it is the reason the Q prefetch moves to
+    // stage C2 (see below).
+    if (t < (uint32_t)FA_SPTILES) FA_OPV_SOFTMAX(tid, thr, par);
+#else
+    if (warp != 0) {
+        if (t < (uint32_t)FA_SPTILES) FA_OPV_SOFTMAX(stid, sthr, par);
+        else asm volatile("nop");
+    } else { asm volatile("nop"); }
+#endif
+    FAP_BAR(3);
+    SMARK();  // s1: softmax(t) done, PV(t-1) still on the mesh
+    // ---- STAGE B: [agent] drain PV(t-1), accumulator -> O(t-1) @ SP_P.  SIMT quiesced. ------
+    if (warp == 0) {
+        if (t > 0) {
+            fa_gfl(tid);                        // mesh drained -> ACC holds O_unnorm(t-1)
+            fa_store_acc<PVF>(SP_P, tid);       // ... on top of the P8(t-1) it just consumed
+            fa_gfl(tid);
+        }
+    } else { asm volatile("nop"); }
+    FAP_BAR(4);
+    SMARK();  // s2: O(t-1) resident in the P8 region
+    // ---- STAGE C1: requant pass A(t).  Under FA_SP_OPVQ the mesh is IDLE (PV drained in B,
+    // ---- QK(t+1) not issued until D), so all six warps take part; otherwise warp 0 issues
+    // ---- QK(t+1) here and pass A runs on warps 1-5 underneath it. --------------------------
+#ifdef FA_SP_OPVQ
+    if (t < (uint32_t)FA_SPTILES)
+        fa_requant_max<FA_SQ, FA_SK>(reinterpret_cast<const __shared uint16_t*>(SM_S),
+                                     reinterpret_cast<__shared uint32_t*>(SCALE_SMEM), tid, thr);
+#else
+    if (warp == 0) {
+        if (t + 1 < (uint32_t)FA_SPTILES) {
+            fa_gf(tid);                         // REAL drain of Q(t+1)'s DMA + orders its SF stores
+            fa_cfg<QKF>(1, 0, tid);
+            fa_mm_acc<QKF>(SP_Q, SP_K_END, /*asel=*/1, /*wsel=*/0, tid);
+        }
+    } else {
+        if (t < (uint32_t)FA_SPTILES)
+            fa_requant_max<FA_SQ, FA_SK>(reinterpret_cast<const __shared uint16_t*>(SM_S),
+                                         reinterpret_cast<__shared uint32_t*>(SCALE_SMEM),
+                                         stid, sthr);
+        else asm volatile("nop");
+    }
+#endif
+    FAP_BAR(5);
+    SMARK();  // s3: pass A done
+    // ---- STAGE C2: [warps 1-5] finalize(t-1) -> GMEM.  Under FA_SP_OPVQ warp 0 spends the
+    // ---- stage on the Q(t+1) prefetch, and THIS IS THE STAGE WITH NO MESH ACTIVITY AT ALL --
+    // ---- PV(t-1) drained in B and QK(t+1) is not issued until D -- so the 64 SF_A-half-1 scale
+    // ---- words cannot race a mesh scale READ and the 8 KB DMA cannot race a move-out.  That is
+    // ---- strictly safer than every placement tried in the third and fourth passes, and it is
+    // ---- free: finalize is ~9.6k and the prefetch is ~4.5k. --------------------------------
+#ifdef FA_SP_HSF
+    // Tell the host that SCALE_SMEM(t) is complete (pass A finished in C1 and FAP_BAR(5) drained
+    // every warp's stores) and that this stage -- the ONE stage of the iteration with no mesh
+    // operation in flight at all -- is its window.  The reply is collected at the top of stage D.
+    if (t < (uint32_t)FA_SPTILES) fa_sp_post(FA_SPM_PACKREQ, t + 1u, tid);
+#endif
+    if (warp == 0) {
+#ifdef FA_SP_OPVQ
+        if (t + 1 < (uint32_t)FA_SPTILES) {
+            fa_mvin_A<QKF>(&QK_A_in[0][0], SP_Q, FA_D, tid);
+            // Drain the 8 KB DMA HERE, inside the stage where the only other traffic to Q's bank is
+            // the DMA itself (finalize reads O, which is a different bank).  Free -- warp 0 has the
+            // whole stage -- and it keeps the DMA from still being in flight when the convert starts
+            // hammering that bank in stage D, which is the shape of the four-entry-queue assert
+            // documented on FA_SP_BANKA.
+            fa_gf(tid);
+#ifndef FA_SP_HSF
+            fa_scl(fa_sf_a(1), &QK_A_scales_row[0][0], QKF.SCALE_FACTORS_PER_TILE(), tid);
+#endif
+        }
+#endif
+#ifdef FA_SP_HSF
+    } else { asm volatile("nop"); }
+    // FA_SP_HSF: warp 0's stage-C2 duty is now just the Q move-in ISSUE plus its drain (~400 cyc)
+    // instead of 64 strictly serial SF stores (~4.2k), so finalize runs on ALL SIX warps.  It is
+    // GMEM-store bound, and the cure for that is more outstanding stores -- unlike FA_SP_FZ6, which
+    // measured +1,330 because there warp 0 entered the stage LATE.
+    if (t > 0) FA_OPV_FINALIZE(tid, thr, par ^ 1u);
+#else
+    } else {
+        if (t > 0) FA_OPV_FINALIZE(stid, sthr, par ^ 1u);
+        else asm volatile("nop");
+    }
+#endif
+    FAP_BAR(6);
+    SMARK();  // s4: O(t-1) written to GMEM -> the P8 region is free again
+    // ---- STAGE D: [warp 0] SF pack  ||  [warps 1-5] requant convert(t) -> P8(t) ------------
+    if (warp == 0) {
+#ifdef FA_SP_OPVQ
+        // QK(t+1) is issued HERE under FA_SP_OPVQ.  Its 8,210 mesh cycles still fit entirely
+        // inside this stage (the convert is ~10-11k) plus stage E, so nothing is exposed, and the
+        // leading gemmini_fence is a REAL drain of the stage-C2 Q move-in that -- being a load
+        // from the same gemmini TL port -- also orders C2's SF scale stores ahead of it.
+#ifdef FA_SP_HSF
+        // Collect the host's reply BEFORE issuing QK(t+1): the host has just rewritten act half 1
+        // (Q) and act half 0 (tile t's packed P scales), and QK(t+1) reads half 1.
+        if (t < (uint32_t)FA_SPTILES) fa_sp_wait(FA_SPM_PACKED, t + 1u, tid);
+#endif
+        if (t + 1 < (uint32_t)FA_SPTILES) {
+            fa_gf(tid);
+            fa_cfg<QKF>(1, 0, tid);
+            fa_mm_acc<QKF>(SP_Q, SP_K_END, /*asel=*/1, /*wsel=*/0, tid);
+        }
+#endif
+#ifndef FA_SP_HSF
+        if (t < (uint32_t)FA_SPTILES)
+            pack_scales_to_sfmem<FA_SQ, FA_SK>(
+                reinterpret_cast<const __shared uint32_t*>(SCALE_SMEM),
+                reinterpret_cast<__shared uint32_t*>(GEMMINI_SF_MEM_A), tid, thr);
+#endif
+#ifdef FA_SP_HSF
+    } else { asm volatile("nop"); }
+    // FA_SP_HSF: the 128-word SF pack is gone from warp 0, so the convert runs on ALL SIX warps.
+    if (t < (uint32_t)FA_SPTILES)
+        fa_requant_cvt<FA_SQ, FA_SK>(reinterpret_cast<const __shared uint16_t*>(SM_S),
+                                     reinterpret_cast<__shared uint32_t*>(SM_P8),
+                                     reinterpret_cast<const __shared uint32_t*>(SCALE_SMEM),
+                                     tid, thr);
+#else
+    } else {
+        if (t < (uint32_t)FA_SPTILES)
+            fa_requant_cvt<FA_SQ, FA_SK>(reinterpret_cast<const __shared uint16_t*>(SM_S),
+                                         reinterpret_cast<__shared uint32_t*>(SM_P8),
+                                         reinterpret_cast<const __shared uint32_t*>(SCALE_SMEM),
+                                         stid, sthr);
+        else asm volatile("nop");
+    }
+#endif
+    mu_fence_smem();
+    FAP_BAR(7);
+    SMARK();  // s5: P8(t) + its packed SF scales ready
+    // ---- STAGE E: [agent] drain QK(t+1), accumulator -> S(t+1) @ SP_C.  SIMT quiesced. -----
+    if (warp == 0) {
+        if (t + 1 < (uint32_t)FA_SPTILES) {
+            fa_gfl(tid);
+            fa_store_acc<QKF>(SP_C, tid);       // over P(t) bf16, which the convert just consumed
+            fa_gfl(tid);
+        }
+    } else { asm volatile("nop"); }
+    FAP_BAR(8);
+    SMARK();  // s6: S(t+1) resident
+    }   // end FA_SP_OPV tile loop
+    MARK();
+    }
+#else   // !FA_SP_OPV -- the FA_SP_QSPLIT / QOVL4 / QKACC body
 #ifdef FA_SP_QKACC
 #  ifndef FA_SP_QOVL
 #    error "FA_SP_QKACC needs FA_SP_QOVL (Q must already be resident when QK is issued)"
@@ -3115,6 +4100,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 
     for (uint32_t t = 0; t < (uint32_t)FA_SPTILES; t++) {
     MARK();   // s0: TOP of the steady-state iteration
+    fa_phase_skew(tid);   // FA_PHASE<k>: measurement-only inter-cluster phase sweep
 #ifndef FA_SP_QOVL
     // ---- S0: [agent] Q(t) move-in + Q(t) scales + QK config ----------------------------
     if (warp == 0) {
@@ -3143,9 +4129,13 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     FAP_PAD();
 #endif
     if (warp == 0) {
-        fa_gf(tid);                                   // mesh drained -> ACC holds S(t)
+#ifdef FA_SP_DUMPWC
+        fa_gfl_probe(tid, t);                         // see fa_gfl_probe: is the busy-fence racing?
+#else
+        fa_gfl(tid);                                  // mesh drained -> ACC holds S(t)   (FA_SP_WCNT)
+#endif
         fa_store_acc<QKF>(SP_C, tid);
-        fa_gf(tid);                                   // drain the accmem->spad store
+        fa_gfl(tid);                                  // drain the accmem->spad store     (FA_SP_WCNT)
     } else { asm volatile("nop"); }
     FAP_BAR(4);
 #else
@@ -3156,7 +4146,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         fa_cfg<QKF>(1, 0, tid);                       // dims/asel for QKF (V's PVF cfg is stale)
 #endif
         fa_mm<QKF>(SP_Q, SP_K_END, SP_C, /*asel=*/1, /*wsel=*/0, tid);
-        fa_gf(tid);                                   // drain matmul + S move-out
+        fa_gfl(tid);                                  // drain matmul + S move-out (FA_SP_WCNT)
     } else { asm volatile("nop"); }
     FAP_BAR(4);
 #endif
@@ -3284,6 +4274,15 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     FAP_BAR(1);
 #endif
     // ---- S4: [warp0] SF pack  ||  [warps1-5] requant PASS B (bf16 -> fp8 @ P8) ---------
+#ifdef FA_SP_HSF
+    // FA_SP_HSF on the QSPLIT body.  SCALE_SMEM(t) is complete (pass A ended at FAP_BAR(6), which
+    // drains every warp's stores), and the mesh is IDLE for the whole of S2+S3+S4 -- QK(t) drained
+    // in S1 and PV(t) is not issued until S5 -- so this stage is a ~10.5k-cycle window in which the
+    // host is the ONLY requestor of either scale port.  It writes act half 0 (tile t's packed P
+    // scales, read by PV in S5) and act half 1 (the next tile's Q scales, read by QK(t+1) in S6);
+    // the GPU collects the reply at the top of S5.
+    if (t < (uint32_t)FA_SPTILES) fa_sp_post(FA_SPM_PACKREQ, t + 1u, tid);
+#endif
     if (warp == 0) {
 #ifdef FA_SP_QSPLIT
         // FA_SP_QSPLIT: Q(t+1)'s 8 KB move-in DMA is issued HERE, first, so it runs under the
@@ -3307,6 +4306,13 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
             reinterpret_cast<const __shared uint32_t*>(SCALE_SMEM),
             reinterpret_cast<__shared uint32_t*>(GEMMINI_SF_MEM_A), tid, thr);
 #endif
+#ifdef FA_SP_HSF
+    } else { asm volatile("nop"); }
+    // FA_SP_HSF: the 128-word SF pack is off warp 0, so the convert runs on ALL SIX warps.
+    fa_requant_cvt<FA_SQ, FA_SK>(reinterpret_cast<const __shared uint16_t*>(SM_S),
+                                 reinterpret_cast<__shared uint32_t*>(SM_P8),
+                                 reinterpret_cast<const __shared uint32_t*>(SCALE_SMEM), tid, thr);
+#else
     } else {
 #ifdef FA_SP_BALC
         fa_requant_cvt_bal<FA_SQ, FA_SK>(reinterpret_cast<const __shared uint16_t*>(SM_S),
@@ -3320,6 +4326,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
                                      tid - MU_NUM_THREADS, thr - MU_NUM_THREADS);
 #endif
     }
+#endif
     mu_fence_smem();
     FAP_BAR(7);
     SMARK();  // s5: pack + convert done
@@ -3361,6 +4368,10 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 #endif
     // ---- S5: [agent] PV matmul: O = P@V -> C dest (mesh 8,210) -------------------------
     if (warp == 0) {
+#ifdef FA_SP_HSF
+        // Collect the host's reply BEFORE issuing PV: it has just rewritten act half 0.
+        if (t < (uint32_t)FA_SPTILES) fa_sp_wait(FA_SPM_PACKED, t + 1u, tid);
+#endif
         fa_cfg<PVF>(0, 1, tid);
 #if defined(FA_SP_QSPLIT)
         // FA_SP_QSPLIT: issue PV, then spend the mesh's 8,210 cycles writing Q(t+1)'s 64 MX scale
@@ -3437,7 +4448,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         // signature: tile 0 Frobenius 3.5666%, every later tile 30-60%.
         // This stage therefore issues NOTHING but the PV matmul and its drain.
         fa_mm<PVF>(SP_P, SP_V_END, SP_C, /*asel=*/0, /*wsel=*/1, tid);
-        fa_gf(tid);
+        fa_gfl(tid);
 #elif defined(FA_SP_QOVL3)
         // Q(t+1)'s move-in and its 64 SF-SRAM scale words are issued UNDER the PV matmul.
         // The mvin is a ROCC command so it queues ahead of the matmul (~200 cyc, and it writes
@@ -3464,10 +4475,10 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         if (t + 1 < (uint32_t)FA_SPTILES)
             fa_scl(fa_sf_b(0), &QK_B_scales_col[0][0], QKF.SCALE_FACTORS_PER_TILE_B(), tid);
 #endif
-        fa_gf(tid);
+        fa_gfl(tid);
 #else
         fa_mm<PVF>(SP_P, SP_V_END, SP_C, /*asel=*/0, /*wsel=*/1, tid);
-        fa_gf(tid);
+        fa_gfl(tid);
 #endif
     } else { asm volatile("nop"); }
     FAP_BAR(8);
@@ -3590,6 +4601,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     }   // end steady-state tile loop
     MARK();   // s7 of the last tile == s0 of the (absent) next one
     }
+#endif  // FA_SP_OPV
 #elif defined(FA_PIPE)
     // ======================= SOFTWARE-PIPELINED BODY (see the header comment) ===============
     // NTILES selection (mirrors the FA_STEADY harness; FA_PIPE always loops).
@@ -3768,6 +4780,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     // before they are read. So the loop body is exactly the single-shot body, unmodified.
     for (uint32_t fa_tile = 0; fa_tile < (uint32_t)FA_NTILES; fa_tile++) {
     MARK();  // T: top of steady-state iteration (per-iteration cost = this stamp -> next iteration's)
+    fa_phase_skew(tid);   // FA_PHASE<k>: measurement-only inter-cluster phase sweep
 #endif
     // QK_full
 #ifdef FA_LANESC

@@ -68,7 +68,7 @@
 // pair up wrongly, silently corrupting the SRAM.  So: host writes them, or the GPU does --
 // never both.
 // ============================================================================================
-#ifdef FA_NOSCALES
+#if defined(FA_NOSCALES) || defined(FA_SP_HSF)
 #define FA_HOST_SCALE_PREFILL 1
 #include "include/fa_data.h"
 #endif
@@ -109,7 +109,7 @@
 #define FA_HOST_MAGIC     0x5CA1E5u
 
 // ---- FA_STEADY tile count (must MATCH the GPU build; /tmp/fa_build.sh forwards the -D list) ----
-#ifdef FA_STEADY
+#if defined(FA_STEADY) || defined(FA_SP)
 #  if   defined(FA_NT1)
 #    define HOST_NTILES 1
 #  elif defined(FA_NT2)
@@ -445,6 +445,107 @@ static inline void diag_publish(void) {
 }
 #endif // FA_HOST_SCALE_PREFILL
 
+// ============================================================================================
+// FA_SP_HSF -- HOST-OWNED MX SCALE SRAM FOR THE *PIPELINED* (FA_SP) KERNEL
+// ============================================================================================
+// This is the composition the fourth pass never tried: the host scale offload on top of the
+// FA_SP_OPV/OPVQ software pipeline rather than on the sequential FULL_ATTN2 body.  It is a
+// different, and much safer, proposition than -DFA_HOSTHS/-DFA_HOSTPACK were:
+//
+// (1) THE GPU IS NO LONGER AN SF REQUESTOR AT ALL.  The FA_SP_HSF GPU build issues ZERO writes to
+//     either scale port -- not the K/V prologue scales, not the per-tile Q scales, and not the
+//     per-tile packed P scales.  That removes, by construction, the one hazard the earlier attempts
+//     kept tripping over: ScaleFactorMem's per-port 2-beat pairing register is SHARED across the
+//     double-buffer halves, so a host `sd` landing between two of the GPU's FlitMergeNode-merged
+//     4-byte beats forms a pair from one GPU beat and one host beat and writes a 16 B SRAM row to
+//     the wrong address.  With one requestor there is no interleaving to form.
+// (2) THE HAND-OFF SITS IN A STAGE WITH NO MESH ACTIVITY.  Under FA_SP_OPVQ the iteration is
+//         A: PV(t-1) mesh || softmax(t)   B: acc->O   C1: pass A   C2: finalize(t-1)   D: QK(t+1)
+//         mesh || convert(t)   E: acc->S
+//     and stage C2 is the one stage where the mesh is idle end to end (PV drained in B, QK not
+//     issued until D).  The GPU publishes PACKREQ at the top of C2 and blocks on PACKED at the top
+//     of D, so the host's ~5.4k cycles of scale traffic land entirely inside C2's ~9.6k of
+//     finalize, with no mesh scale READ anywhere near them.  That is what the fourth pass's 7-of-12
+//     failure was missing -- there the host wrote scales while the GPU's consuming matmul was live.
+// (3) IT PAYS FOR ITSELF TWICE OVER, and not in the way the sequential measurement suggested.  On
+//     FA_SP the per-tile GPU scale traffic is only 192 words (64 Q + 128 P), not 704, so the direct
+//     saving is small.  The win is that those 192 words are the ONLY thing warp 0 does in stages C2
+//     and D -- ~4.2k and ~8.3k of strictly serial, unparallelisable SF stores -- and removing them
+//     lets warp 0 join the SIX-warp finalize and the SIX-warp convert.  Projected -1.6k on C2 and
+//     -1.6k on D.
+// (4) EVERY HOST POLL IS PRECEDED BY A store-to-load `fence`, which mbox_get already does.
+//
+// MAILBOX ADDRESS: the FA_SP SMEM map is completely different from the sequential one and the old
+// HOST_MBOX at device 0x17F00 lands INSIDE FA_SP's Q scratchpad region (0x16000..0x18000), where
+// the Q move-in DMA would overwrite it every tile.  FA_SP_HSF uses 0x14D00 instead -- see the long
+// note at FA_SP_MBOX in flash_attention_mx.cpp for why 0x15F00, the obvious choice, is also taken.
+// It must match FA_SP_MBOX in flash_attention_mx.cpp.
+#ifdef FA_SP_HSF
+// 0x14D00, NOT 0x15F00: FA_SM_2P's pb buffer (0x15680, stride 2*NT+1 = 33 halfwords) writes 0x15F10
+// and 0x15F20 -- the PACKREQ and PACKED words.  See the long note at FA_SP_MBOX in the kernel.
+#define SP_MBOX(cl)        (CLUSTER_BASE(cl) + 0x14D00ull)
+#define SPM_READY          0x00     // host -> GPU: prologue K/V/Q scales are in the SRAM
+#define SPM_PACKREQ        0x10     // GPU  -> host: #tiles whose pass A has published SCALE_SMEM
+#define SPM_PACKED         0x20     // host -> GPU: #tiles whose Q + P scales are in the SRAM
+#define SPM_DIAG           0x40     // host -> GPU: [0]=wait cycles, [1]=(timeouts<<32)|ntiles
+#define SP_P_SCALE_WORDS   128      // (FA_SK/32)*FA_SQ / 4
+
+static inline void sp_mbox_set(unsigned off, uint32_t v) {
+  for (int cl = 0; cl < NUM_CLUSTERS; cl++)
+    *(volatile uint64_t *)(SP_MBOX(cl) + off) = (uint64_t)v;
+}
+static inline uint32_t sp_mbox_get(unsigned cl, unsigned off) {
+  asm volatile("fence" ::: "memory");          // store-to-load: never poll behind our own stores
+  return (uint32_t)*(volatile uint64_t *)(SP_MBOX(cl) + off);
+}
+
+// *** THROTTLE THE POLL.  A TIGHT HOST POLL LOOP KILLS THE FABRIC. ***  MEASURED: the maximal stack
+// (FA_SP_HSF + FA_SM_2P + FA_SM_2PBM + FA_SP_SMBMAX + FA_SM_2PRAW) $finished at 164,937,000 ps
+// (~82.5k cycles) with
+//     TLMonitor xbar_3 (RadianceCluster.scala:112, the host->cluster extReqXbar):
+//     "'D' channel contains improper response size"
+// and the where matters: 82.5k is inside the SOFTMAX of iteration 0, i.e. a window in which the host
+// has ALREADY finished every scale write and is doing nothing but reading the mailbox.  So this is
+// not the host-vs-GPU scale-port hazard that killed FA_HOSTCFG -- with FA_SP_HSF the GPU writes no
+// scale word at all -- it is the POLL ITSELF: an unthrottled stream of uncached 8-byte Gets into
+// cluster SMEM, concurrent with a softmax that is saturating that SMEM, and the shared-SMEM slave
+// path answers one of them with the wrong size.  The same build minus FA_SM_2PBM (a lighter softmax)
+// got 40k cycles further without tripping it, which is what "timing window" looks like.
+// THE FIX IS FREE: the host has nothing else to do, and the windows it is waiting for are ~9,500
+// cycles wide, so polling every ~256 cycles instead of every ~20 cuts the request rate by an order
+// of magnitude and costs nothing measurable.  Poll cluster 0 first and only look at cluster 1 once
+// cluster 0 is satisfied, which halves the requests again.
+static inline void sp_backoff(void) {
+  for (int i = 0; i < 256; i++) asm volatile("nop");
+}
+// Both clusters run the same tile redundantly, so "both have reached seq" is the condition; testing
+// them in sequence rather than every iteration keeps the Get rate down.
+static inline int sp_both_reached(unsigned off, uint32_t seq) {
+  if (sp_mbox_get(0, off) < seq) return 0;
+  return sp_mbox_get(1, off) >= seq;
+}
+
+// Pack the 512 E8M0 scale words requant pass A left in SCALE_SMEM (one scale in the low byte of
+// each 32-bit word) into the 128 contiguous words SF_MEM_A wants (4 scales per word, low byte
+// first), and push them to ACT half 0 on both clusters.  Both clusters compute the same tile
+// redundantly, so one cluster's SCALE_SMEM is authoritative.
+static void sp_pack_p_scales(void) {
+  static uint32_t buf[SP_P_SCALE_WORDS];
+  asm volatile("fence" ::: "memory");
+  const volatile uint64_t *src = (const volatile uint64_t *)SCALE_SMEM_HOST(0);
+  for (unsigned w = 0; w < SP_P_SCALE_WORDS; w++) {
+    const uint64_t a = src[2u * w + 0u];       // scale words 4w+0 (low half), 4w+1 (high half)
+    const uint64_t b = src[2u * w + 1u];       // scale words 4w+2, 4w+3
+    buf[w] = ((uint32_t)(a & 0xffu))
+           | ((uint32_t)((a >> 32) & 0xffu) << 8)
+           | ((uint32_t)(b & 0xffu) << 16)
+           | ((uint32_t)((b >> 32) & 0xffu) << 24);
+  }
+  for (int cl = 0; cl < NUM_CLUSTERS; cl++)
+    sf_write(SF_MEM_A(cl), buf, 4u * SP_P_SCALE_WORDS);            // ACT half 0
+}
+#endif // FA_SP_HSF
+
 int main() {
 #ifdef FA_HOST_SCALE_PREFILL
   const uint64_t t_enter = rdcycle();
@@ -459,6 +560,58 @@ int main() {
   host_mmio_probe();            // MMIO read/write cost microbenchmark (diag[10..13])
 #endif
 
+#ifdef FA_SP_HSF
+  // ---- FA_SP_HSF: the host owns the whole MX scale SRAM for the FA_SP pipeline. --------------
+  sp_mbox_set(SPM_READY, 0);
+  sp_mbox_set(SPM_PACKREQ, 0);
+  sp_mbox_set(SPM_PACKED, 0);
+  asm volatile("fence" ::: "memory");
+  // Prologue: everything the GPU used to write in its own prologue plus tile 0's Q scales.
+  // K -> weight half 0, V -> weight half 1, Q -> act half 1.  The GPU blocks on SPM_READY before
+  // its first matmul, so there is no race with the mesh.
+  write_qk_b_scales();                                     // K  -> WEIGHT half 0
+  write_v_scales();                                        // V  -> WEIGHT half 1
+  write_qk_a_scales();                                     // Q  -> ACT    half 1
+  asm volatile("fence" ::: "memory");
+  sp_mbox_set(SPM_READY, FA_HOST_MAGIC);
+  {
+    const uint64_t WAIT_LIMIT = 400000ull;                 // finite: a broken poll must not hang
+    uint64_t waited = 0; uint32_t timeouts = 0;
+    for (uint32_t t = 1; t <= (uint32_t)HOST_NTILES; t++) {
+      const uint64_t t0 = rdcycle();
+      for (;;) {
+        if (sp_both_reached(SPM_PACKREQ, t)) break;
+        if (rdcycle() - t0 > WAIT_LIMIT) { timeouts++; break; }
+        sp_backoff();
+      }
+      waited += rdcycle() - t0;
+      // Both halves of the act port, in the stage where the mesh is idle: the runtime P scales for
+      // tile t-1 (act half 0, read by PV(t-1) in stage A of the next iteration) and the Q scales
+      // for the next tile (act half 1, read by QK, issued in stage D right after the GPU sees
+      // SPM_PACKED).  The Q push is redundant in this harness -- Q is loop-invariant -- but it is
+      // kept so the per-tile cost accounting stays honest against the GPU build it replaces.
+      sp_pack_p_scales();
+      write_qk_a_scales();
+      asm volatile("fence" ::: "memory");
+      sp_mbox_set(SPM_PACKED, t);
+    }
+    // Report through the FA_SP mailbox, NOT diag_publish(): that writes HOST_MBOX+0x80 = device
+    // 0x17F80, which is inside Q's scratchpad under the FA_SP map.
+    for (int cl = 0; cl < NUM_CLUSTERS; cl++) {
+      *(volatile uint64_t *)(SP_MBOX(cl) + SPM_DIAG + 0) = waited;
+      *(volatile uint64_t *)(SP_MBOX(cl) + SPM_DIAG + 8) =
+          ((uint64_t)timeouts << 32) | (uint64_t)(uint32_t)HOST_NTILES;
+    }
+  }
+#endif
+
+#ifndef FA_SP_HSF
+  // ---- SEQUENTIAL-KERNEL PREFILL.  Skipped entirely under FA_SP_HSF: its mailbox lives at device
+  // 0x17F00, which in the FA_SP SMEM map is INSIDE Q's scratchpad (0x16000..0x18000), so every
+  // mbox_set/diag_publish here writes into Q.  The pre-zeroing at the top of main() is harmless
+  // (~2.3k cyc, long before the GPU's Q move-in overwrites it) but this tail is not: it runs while
+  // the GPU is still in its last tiles.  FA_SP_HSF has already done all of the scale work above and
+  // reports through SP_MBOX + SPM_DIAG, so there is nothing here it needs.
   // Phase 1: QK^T scales (deadline = the QK matmul, ~34k cyc) for BOTH clusters, then publish.
   write_qk_scales();
   asm volatile("fence" ::: "memory");
@@ -483,6 +636,7 @@ int main() {
   g_diag[4] = (uint32_t)(t_done - t_enter);   // cycles spent actually pushing scale bytes
   diag_publish();
 
+#endif  // !FA_SP_HSF
 #ifdef FA_HOSTHS
   // ============================================================================================
   // PER-TILE SCALE REFILL (the thing that makes host offload work at STEADY STATE).
