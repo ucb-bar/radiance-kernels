@@ -1537,9 +1537,20 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //       whose correctness rests on a MECHANISM rather than on the schedule missing the window: the
 //       same two bit-exact speedups without FA_SP_WCNT score 5 of 8 and 6 of 8.  WCNT itself is free
 //       (fill tile 67,927 with it vs 68,095 without).                                          53
-//   WCNT + PAX + CVTX + CVTSWAR + HSF + FA_SM_2P                (in flight)                    53
-//   ... + FZ6                                                   (in flight)                    50
-//   ... + FZ6 + FA_SM_2PBM + FA_SP_SMBMAX + FA_SM_2PRAW          (in flight)                   51
+//   -- the HSF (host-offload) branch, all retired: see (G8).  Every unthrottled-poll build dies on
+//      TLMonitor xbar_3, and throttling to one Get per ~256 cycles does not save it either.
+//   WCNT + PAX + CVTX + CVTSWAR + HSF + FA_SM_2P (+FZ6)     --     --   fabric assert, 82.5k-247k cyc
+//   -- the register-band probes.  *** THESE ARE THE ROWS THAT CLOSED THE BAND, and their cycle
+//      numbers are meaningless: each aborted inside the FIRST TILE at Rename.sv. ***  fa_regs3.py's
+//      per-core figure is in the last column, and it is the number to screen on, not the union.
+//   WCNT + PAX + CVTX + CVTSWAR              --  --  RENAMER ABORT 244,403,000 ps    core1 231
+//   SQ32 + QEARLY + CVTX + CVTSWAR (no 2P)   --  --  RENAMER ABORT 210,565,000 ps    core1 246
+//   SQ32 + FA_SM_2P + FA_SM_2PRAW        27,380/half  29.92%  killed: build inputs not provably
+//                                        (=8192/27380) post-fd722ac, so NOT scored -- see (G11)
+//   -- and the three that are in flight, all from provably post-fd722ac inputs, all register-safe:
+//   WCNT PAX CVTX + 2P + 2PRAW + CVTSWAR + FZ6                  (in flight)          core1 168
+//   ... + FA_SM_2PBM + FA_SP_SMBMAX                              (in flight)          core1 174
+//   SQ32 + QEARLY + 2P + 2PRAW + CVTX + CVTSWAR                  (in flight)          core1 186
 //   PAX + CVTX + HSF (no WCNT; isolates the host offload) 44,063  37.27%  6 of 6 correct before it
 //                                                         $finished on the fabric assert at 247k    52
 //      and its stage table against the same base WITHOUT the host, which is the honest reading of
@@ -1762,6 +1773,21 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //      reachable in about one day of work (the body is written; what is left is validating the four
 //      strided Q-scale chunks and one round of correctness).  If it aborts, Sq=32 needs (a) first and
 //      should be the recommendation for AFTER this sprint rather than a target inside it.
+//
+// (G11) *** A BUILD-INPUT RULE, BECAUSE THE FIX FOR SOMEONE ELSE'S BUG LANDED MID-FLIGHT. ***
+//       FA_SM_2P's pb overrun was fixed in fd722ac (2026-07-27 19:27:15) with compile-time
+//       static_asserts, and 489ff35 / 6ff6e07 followed within half an hour, both touching pass A's
+//       reduction chains.  Three of my runs were built inside that churn.  Timestamps SAID they were
+//       post-fix (19:32 / 19:53 / 19:55 against 19:27:15) but a timestamp is not an input check, so I
+//       byte-compared each running ELF against a rebuild from the then-current source: both DIFFERED,
+//       i.e. the inputs could not be proven.  All three were KILLED AND REBUILT rather than scored.
+//       That is the right default here and not pedantry: a pre-fix build either fails outright or
+//       "passes" because the Q re-fetch happens to overwrite the damage, and this file has already
+//       recorded three separate cases of the second outcome (the QSPLIT 12-of-12 coincidence, the
+//       CVTX+PREPK row, and the pb overrun itself).  It matters doubly for FA_SP_SQ32, whose whole
+//       point is a different stage layout -- so whether anything covers the overrun at all is exactly
+//       what changed.  RULE: before scoring any run whose config includes code you do not own, check
+//       `git log --oneline -1 -- <that file>` against the build, or byte-compare the ELF to a rebuild.
 //
 // (G4) FLAG CATALOGUE FOR THIS PASS (all default OFF; the plain build and the plain FULL_ATTN2
 //      build stay byte-for-byte the pre-existing kernel, and the published FA_SP_QSPLIT reference
@@ -2109,7 +2135,25 @@ static __attribute__((noinline)) void fa_gf(uint32_t tid) {
 // repaired before use.  That is luck, not design; STR should be NT+1 = 17 as its comment says. ***
 // The host writes these words with 8-byte stores (a 4-byte host store is silently dropped) and the
 // GPU reads/writes the low 32-bit word of each.
+#ifdef FA_SP_HSF_PB
+// ---- FA_SP_HSF_PB: put the mailbox in printBuf instead of SMEM. -----------------------------
+// printBuf is a real TLRAM the cluster already instantiates and NOTHING uses:
+//   RadianceCluster.scala:96-103  TLRAM(AddressSet(baseAddr + peripheralAddrOffset, 0x100*nTiles-1),
+//                                      cacheable = false, atomics = true, beatBytes = 8)
+//                                printBuf := clcbus.outwardNode
+// Verified from the tree rather than taken on trust: there are exactly TWO references to `printBuf`
+// in all of radiance -- that declaration and that connection -- so it has no RTL writer, and no
+// software symbol resolves into it.  512 B at device 0x80000 with 1..8 B transfers and ATOMICS.
+// *** IT IS ALSO THE DISCRIMINATOR THE SMEM FAILURE NEEDS. ***  printBuf and the SMEM subbanks hang
+// off the SAME clcbus, and the kernel already reaches 0x84000 / 0x8a000 through that leg, so the
+// host route and RWSplitterNode are COMMON to both.  If an 8-byte host Get works here and fails at
+// 0x14D00, the fault is in the SMEM leg specifically (prealignBuffer -> alignmentXbar ->
+// smemFanoutXbar -> 4-byte subbanks).  If it fails here too, the common path is implicated and
+// RWSplitterNode's `// FIXME: check truncation` on d.source/d.size is the live suspect.
+static constexpr uint32_t FA_SP_MBOX     = 0x80000;
+#else
 static constexpr uint32_t FA_SP_MBOX     = 0x14D00;
+#endif
 static constexpr uint32_t FA_SPM_READY   = 0x00;   // host -> GPU: K/V/Q scales resident
 static constexpr uint32_t FA_SPM_PACKREQ = 0x10;   // GPU  -> host: SCALE_SMEM(t) is published
 static constexpr uint32_t FA_SPM_PACKED  = 0x20;   // host -> GPU: Q + P scales resident

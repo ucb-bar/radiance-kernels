@@ -483,7 +483,14 @@ static inline void diag_publish(void) {
 #ifdef FA_SP_HSF
 // 0x14D00, NOT 0x15F00: FA_SM_2P's pb buffer (0x15680, stride 2*NT+1 = 33 halfwords) writes 0x15F10
 // and 0x15F20 -- the PACKREQ and PACKED words.  See the long note at FA_SP_MBOX in the kernel.
+#ifdef FA_SP_HSF_PB
+// printBuf (RadianceCluster.scala:96-103): an unused 512 B TLRAM at baseAddr + peripheralAddrOffset,
+// beatBytes 8, atomics = true, behind the SAME clcbus the SMEM leg hangs off.  See the long note at
+// FA_SP_MBOX in flash_attention_mx.cpp for why this is the discriminator and not just a workaround.
+#define SP_MBOX(cl)        (CLUSTER_BASE(cl) + 0x80000ull)
+#else
 #define SP_MBOX(cl)        (CLUSTER_BASE(cl) + 0x14D00ull)
+#endif
 #define SPM_READY          0x00     // host -> GPU: prologue K/V/Q scales are in the SRAM
 #define SPM_PACKREQ        0x10     // GPU  -> host: #tiles whose pass A has published SCALE_SMEM
 #define SPM_PACKED         0x20     // host -> GPU: #tiles whose Q + P scales are in the SRAM
@@ -496,7 +503,26 @@ static inline void sp_mbox_set(unsigned off, uint32_t v) {
 }
 static inline uint32_t sp_mbox_get(unsigned cl, unsigned off) {
   asm volatile("fence" ::: "memory");          // store-to-load: never poll behind our own stores
+#ifdef FA_SP_HSF_RD4
+  // ---- EXPERIMENT: 4-BYTE (size=2) Get instead of 8-byte (size=3). --------------------------
+  // The host-read failure is TLMonitor xbar_3 "'D' channel contains improper response size", and
+  // xbar_3 = extReqXbar is UPSTREAM of everything that could resize a beat.  Between it and the
+  // SMEM word SRAMs the request passes TLSourceShrinker, TLFragmenter(8,128,alwaysMin=true)
+  // (RadianceCluster.scala:107), TLFragmenter(wordSize=4,128) for extClients
+  // (RadianceSharedMemComponents.scala:78) and RWSplitterNode -- whose D path does
+  //     arb_in.bits.size := trim(r.bits.size, 1 << in_node.d.bits.size.getWidth)  // FIXME: check
+  //                                                                               // truncation
+  // and whose generated inbound size field really is [1:0] against a [3:0] outbound.
+  // The SMEM subbanks are wordSize = 4 BYTES, so a 4-byte Get is the one width that needs no
+  // fragmentation and no reassembly anywhere on this path.  If the mechanism is width-related this
+  // just works; if it still fails, width is exonerated and the source/size TRIMMING is the suspect.
+  // NOTE the asymmetry that makes this worth testing rather than assuming: host 4-byte WRITES into
+  // the cluster are silently DROPPED (measured), but that is the write path -- PutPartial with a
+  // sub-beat mask -- and says nothing about Gets.
+  return *(volatile uint32_t *)(SP_MBOX(cl) + off);
+#else
   return (uint32_t)*(volatile uint64_t *)(SP_MBOX(cl) + off);
+#endif
 }
 
 // *** THROTTLE THE POLL.  A TIGHT HOST POLL LOOP KILLS THE FABRIC. ***  MEASURED: the maximal stack
