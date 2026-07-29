@@ -107,6 +107,31 @@ struct GemmConfig {
 #define MXGEMM_SF_ILP 16
 #endif
 
+#define MXGEMM_SF_LINE_WORDS 16  // L0d blockBytes(64) / sizeof(uint32_t)
+
+// DIAGNOSTIC ONLY -- produces NUMERICALLY WRONG results. Pins every scale-factor load to the
+// first L0d line of the tile, so the loads always hit and the copy is left store-bound. The
+// store stream (count, addresses, ascending order) and the instruction mix are unchanged, so
+// this separates GMEM-load cost from SF-store cost. Every k-tile then reuses the same scale
+// factors, hence golden fails by construction; only the timing is meaningful.
+//
+// Deliberately NOT reusing ZERO_STRIDE_K: that also pins the A/B operand addresses, which
+// changes DMA traffic and would contaminate the isolation.
+#ifndef MXGEMM_SF_PIN_LOADS
+#define MXGEMM_SF_PIN_LOADS 0
+#endif
+
+static inline uint32_t sf_load(const uint8_t *base, size_t idx) {
+#if MXGEMM_SF_PIN_LOADS
+    // volatile so each load is still emitted; otherwise the addresses become loop-invariant
+    // and LLVM hoists all of them out, which would measure stores alone rather than
+    // stores + hitting loads (the latter is what SMEM staging would actually leave us).
+    return reinterpret_cast<const volatile uint32_t *>(base)[idx & (MXGEMM_SF_LINE_WORDS - 1)];
+#else
+    return reinterpret_cast<const uint32_t *>(base)[idx];
+#endif
+}
+
 // Gemmini constants -----------------------------------------------------------
 
 // GUARD: the scratchpad geometry must match the silicon we target.
@@ -282,7 +307,6 @@ static void __attribute__((noinline))
 load_scale_factors(volatile __shared uint32_t *sf_mem, const uint8_t *scale_factors,
                    const int n) {
     // asm volatile ("load_scale_factors_start_%=:" :: );
-    auto word_scale_factors = reinterpret_cast<const uint32_t *>(scale_factors);
 
     // Runs under the `tid_in_threadblock != 0` gate, so ONE lane: GMEM-load-latency bound,
     // and the only lever is how many lw.global are in flight (0.31 B/clk at ILP=8, 0.39 at
@@ -296,7 +320,7 @@ load_scale_factors(volatile __shared uint32_t *sf_mem, const uint8_t *scale_fact
         #pragma unroll
         for (int j = 0; j < ILP; j++) {
             // do full-word stores instead of 1-byte stores
-            unrolled[j] = word_scale_factors[i + j];
+            unrolled[j] = sf_load(scale_factors, i + j);
         }
         #pragma unroll
         for (int j = 0; j < ILP; j++) {
@@ -304,7 +328,7 @@ load_scale_factors(volatile __shared uint32_t *sf_mem, const uint8_t *scale_fact
         }
     }
     for (; i < words; i++) {
-        sf_mem[i] = word_scale_factors[i];
+        sf_mem[i] = sf_load(scale_factors, i);
     }
     // asm volatile ("load_scale_factors_end_%=:" :: );
 }
