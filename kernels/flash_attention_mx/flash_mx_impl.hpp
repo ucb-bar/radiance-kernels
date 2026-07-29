@@ -457,6 +457,115 @@ static inline uint32_t e4m3_pack4_swar(uint32_t wlo, uint32_t whi, uint32_t D2,
 //     sequential 8-lane stores on ONE warp -- the same single-thread-serial-port wall as the SF
 //     pack, against a convert that runs on five warps in parallel.
 //
+// ============================================================================================
+// SIXTH-PASS RESULTS (2026-07-29).  All on FA_SP_WCNT, which is MANDATORY; every configuration
+// scored per cluster per tile with fa_verify_tiles.py, cycles from fa_marks3.py with an explicit
+// --mesh 16420, and every ELF's .text byte-compared against a rebuild from the source it was
+// measured on (see the provenance note below -- a whole-file compare does NOT work here).
+//
+//   configuration (+ FA_SP QOVL LEANCFG QKACC PKOVL QSPLIT WCNT)  cyc/tile  util   tile-images
+//   PAX + CVTX                          (banked tag)                45,582  36.02%  12/12 NT6
+//   PAX + CVTX + FA_SM_2P                                           43,808  37.53%  7 ok, 5 WRONG
+//   PAX + CVTX + FA_SM_2P + FA_SM_2PRAW            (E1)             42,846  38.32%  12/12 NT6
+//   ... the same config at FA_NT8                  (E2)             42,814  38.35%  15 ok, 1 WRONG
+//   ... + FA_SP_PREPK                              (E3)             42,666  38.48%  9 ok, 3 WRONG
+//   PAX + CVTX + FA_SP_PREPK                       (isoA)           45,575  36.03%  8 ok, 4 WRONG
+//   PAX + CVTXS + FA_SM_2P + FA_SM_2PRAW           (zw2)            47,702  34.42%  12/12 NT6
+//   ... the same config at FA_NT8                  (ybk3)           47,844  34.32%  16/16 NT8
+//   PAX + CVTX + FA_SP_BANKA                       (ybk1)           45,278  36.26%  9 ok, 3 WRONG
+//   FA_SM_2P + FA_SM_2PRAW + FA_SM_2PBM + SMBMAX   (pbm2)           50,692  32.39%  10 ok, 2 WRONG
+//   FA_SP_OPV + OPVQ + BANKA (+/- FA_SM_2P)        (G1/G2)              --      --  HANG, 0 images
+//
+// VERDICTS:
+//   FA_SM_2P + FA_SM_2PRAW  the fastest thing measured in this campaign, 42,846 = 38.32%, and it
+//       does NOT BANK: 12/12 at NT6 but 15-of-16 at NT8.  The softmax stage really does go
+//       12,825 -> 10,050 (-2,775) and that part is solid; the tile is simply not correct.
+//   FA_SP_CVTXS  *** A LOSS, +4,766 ON STAGE S4, AND I SHOULD NOT HAVE SHIPPED IT INTO A STACK. ***
+//       The SWAR packer is 56 FEWER static instructions per item and still much slower, because its
+//       27-instruction inline-asm chain is one serial dependency where e4m3_pack4's per-element form
+//       has ILP.  This stage is latency-bound, not issue-bound.  A static instruction count is not a
+//       cost model.  (It is also what made my zw2 "headline" 2,120 cycles worse than the baseline
+//       while I was attributing the gap to FA_SM_2P.)
+//   FA_SP_PREPK   flips correctness at a SEVEN-CYCLE change in tile time (45,575 vs the banked
+//       45,582).  See the hazard note below -- this is the cleanest evidence in the whole campaign
+//       that what we are looking at is a data race whose window is being moved, not a schedule.
+//   FA_SP_BANKA / FA_SM_2PBM / FA_SP_FZ6 / FA_SP_OPV   all LOSSES or WRONG; see the individual notes.
+//
+// *** THE NT8 METHODOLOGY POINT, AND IT INVALIDATES A TEST WE HAVE BEEN RELYING ON: A SLOWER
+// CONFIGURATION PASSING NT8 SAYS NOTHING ABOUT A FASTER ONE. ***  zw2 (with CVTXS, 47,844) passes
+// NT8 16-of-16; E1/E2 (identical except CVTXS, 42,814) fails NT8 15-of-16.  CVTXS's +4,766 cycles
+// were MASKING the race.  So "it passed NT8" is only evidence for the exact binary tested, and a
+// correctness result may not be carried from a slow build to a fast one -- which is the direction we
+// always want to carry it.
+//
+// *** WHERE THE SURVIVING HAZARD IS, LOCALISED BY THE CONVEX-HULL TEST RATHER THAN GUESSED. ***
+// O = (P @ V) / l with P >= 0 and (P/l) summing to 1 across a row, so EVERY row of a correct O is a
+// convex combination of V's 256 rows -- componentwise inside [min_k V[k][n], max_k V[k][n]].
+// Decoding V from include/fa_data.h (e4m3 x 2^(E8M0-127)) and testing the WRONG images:
+//     isoA cluster 1 tiles 2 and 5, and E2 cluster 0 tile 7:  0 of 8192 cells outside the hull.
+// The garbage is still a convex combination of V.  That EXONERATES the PV matmul, its operand spad,
+// the V scales and finalize -- every one of which would push cells out of the hull -- and it says P
+// and l are still CONSISTENT WITH EACH OTHER.  So the fault is in S: Q, K^T, their MX scales, the QK
+// matmul, or the accumulator->spad store.  Note this is the SAME localisation the fourth pass
+// reached, now reproduced on the FA_SP_WCNT baseline -- i.e. WCNT fixed one drain in that chain and
+// something else in the same chain survives it.
+// AND THE FAILURE LATCHES AND WORSENS, which narrows it further:
+//     isoA cluster 1:  tile 0,1 correct then 89.79%, 113.96%, 118.15%, 119.37%
+//     E3   cluster 0:  tile 0,1,2 correct then 91.09%, 121.20%, 119.05%
+// Once a cluster goes wrong it NEVER recovers, and the error GROWS.  But S must be bit-identical on
+// every tile (Q, K^T, V and their scales are loop-invariant in FA_SP), so a permanent, accumulating
+// corruption of S means a RESIDENT input to S is being progressively damaged.  The only inputs to S
+// written once and never rewritten are K^T's spad (rows 6144..8192 = 0x18000..0x20000) and the K
+// scales in SF_B half 0.  Q and the P scales are rewritten every tile and cannot latch.  The ratio
+// got/golden is neither per-column nor per-row constant (within-line std 12..18), so it is not a
+// single corrupted scale factor either -- consistent with a few damaged K^T words or K scale words
+// spreading through the QK contraction.  *** THE NEXT STEP IS THE WAVEFORM, NOT ANOTHER A/B: an A/B
+// cannot distinguish "fixed the race" from "moved the window", which is exactly the trap this file
+// has fallen into four times.  An FSDB window over cluster 1's tile-1 stage S6 through tile-2 stage
+// S1 (mcycle 191,000..204,000 on the isoA build) is where the first damaging write must be. ***
+//
+// *** CONSEQUENCE FOR THE BANKED TAG, STATED PLAINLY BECAUSE IT IS BETTER SAID THAN DISCOVERED:
+// THE BANKED 45,582 / 36.02% CONFIGURATION IS IN THIS HAZARD'S FAMILY AND ITS "12 of 12" IS
+// "12 of 12 AS BUILT AT FA_NT6", NOT A PROOF OF CORRECTNESS. ***  Three independent reasons:
+//   * it is ONE bit-exact flag and SEVEN CYCLES away from isoA, which fails 4 of 12;
+//   * the hazard's exposure grows with tile count -- E1 is 12/12 at NT6 and fails at tile 7 of 8 --
+//     and the banked config had only ever been run at NT6 when it was tagged;
+//   * every fix in this chain so far (the fourth pass's gemmini_fence, FA_SP_WCNT) removed one drain
+//     and left the family alive, so there is no basis for assuming this one is closed.
+// The tag is still the right thing to ship -- it is the best VERIFIED-AS-BUILT number -- but it
+// should carry that qualifier until the waveform closes the mechanism.
+//
+// PROVENANCE, because the obvious check gives FALSE FAILURES on this build system: two consecutive
+// builds of IDENTICAL defines from IDENTICAL source differ in 776 bytes, all at file offset
+// >= 120,671 (tail metadata), while .text is bit-identical.  So a whole-file `cmp` reports every ELF
+// as stale and tells you nothing.  Compare .text only:
+//     llvm-objdump -s -j .text <elf> | grep -v "file format"
+// Verified that way, all of the measured ELFs above match the source they were measured on.
+//
+// CLUSTER RAM INVENTORY (asked because SMEM being exactly full is what kills FA_SP_OPV).  TLPrintf
+// (radiance/memory/Coalescing.scala:1266-1292) is NOT storage -- it is an empty class whose apply()
+// emits a Chisel printf, zero RAM.  But `printBuf` (cluster/RadianceCluster.scala:96-103) IS a real,
+// readable, writable, byte-maskable TLRAM: 512 B at device offset 0x80000, 1..8 B transfers, atomics
+// supported, reached through the SAME clcbus leg the kernel already uses for GEMMINI_CTRL 0x84000
+// and BUSY 0x84020 -- and completely unused by any RTL or software.  Free clcbus windows exist at
+// 0x82000 (8 KB), 0x85000 (12 KB) and 0x8C000 (208 KB) where a second TLRAM would need NO change to
+// the Muon-side address decode.  *** BUT IT IS A MAILBOX, NOT COMPUTE SCRATCH, AND THE REASON IS
+// BANDWIDTH RATHER THAN CAPACITY: *** clcbus sits behind a cluster-wide TLSourceShrinker capped at
+// 16 outstanding requests and a single-ported 8-byte SRAM, i.e. roughly one access per TENS of
+// cycles, against the cooperative reduce scratch's measured 0.4..0.8 accesses per cycle.  That is
+// one to two orders of magnitude short, so relocating REDBUF there does not rescue FA_SP_OPV.
+// (I also have to correct a number I asserted: FA_SM_2P cuts REDBUF traffic 2.0x, not 31x --
+// 10,164 -> 5,184 lane-accesses per tile, 0.79 -> 0.40 per cycle.  I had conflated warp-instructions
+// with lane-accesses.  Whether 0.40 is under the four-entry dma_q's threshold is untested, because
+// FA_SP_OPV now HANGS for an unrelated reason: G1 and G2 both ran 900,000 cycles producing ZERO
+// tile-images, and G2 contains no FA_SM_2P at all, so the hang is OPV's own.)
+// Explicit negatives so the search is not repeated: the requantizer window (0x40000-0x7FFFF) and the
+// SF scale mem (0x88000-0x8BFFF) are WRITE-ONLY -- a load on the latter trips a $fatal; the 2,304 B
+// of Gemmini LUT flops are RegField.w and unreadable; the 32 KB accumulator is hard tied off with no
+// TL address; no Muon core exposes a DTIM/ITIM/spill aperture; the 16 KB contingent spad sits above
+// the Muon's 31-bit global address cap; and NO SMEM subbank escapes the mesh, because the Gemmini
+// spad read client is attached to all 64 (RadianceSharedMemComponents.scala:154-157, 202-204).
+// ============================================================================================
 // WHERE THE TILE'S TIME ACTUALLY GOES ONCE FA_SM_2P HAS LANDED (cluster 0, steady, the 12-of-12
 // 43,896 configuration), and therefore what the FLOOR of this pipeline shape is:
 //     S1 acc->S            998   agent-serial, 5 warps idle
