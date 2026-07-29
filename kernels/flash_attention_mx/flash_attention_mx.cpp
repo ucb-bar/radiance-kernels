@@ -4485,6 +4485,35 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 #else
         fa_gfl(tid);                                  // mesh drained -> ACC holds S(t)   (FA_SP_WCNT)
 #endif
+#ifdef FA_SP_ACCPAD
+        // ==== FA_SP_ACCPAD -- WAIT FOR THE MESH *PIPELINE*, NOT JUST THE COMMAND FSM. =============
+        // *** A TEST OF WHY FA_SP_WCNT IS NECESSARY BUT NOT SUFFICIENT. ***  WCNT polls MMIO 0x28
+        // (runningLoops) then MMIO 0x20 (io.busy), and argues runningLoops "cannot lie" because it is
+        // raised in the same cycle as the LOOP_WS command write.  That makes it a true drain OF THE
+        // LOOP FSM.  But what stage S1 needs is that THE MESH has finished accumulating into accmem,
+        // and both registers track the reservation station / loop FSM: completionCount rises when the
+        // loop's last command retires, not when the last MAC has propagated through a 16x16 systolic
+        // array and been written to the accumulator.  If so both polls pass with MACs still in
+        // flight, and fa_store_acc reads a MID-ACCUMULATION accumulator.
+        // THE EVIDENCE THAT THIS IS STILL HAPPENING ON TOP OF FA_SP_WCNT (isoA at NT6, E2 at NT8):
+        //   * the fault is in S -- 0 of 8192 cells of every wrong image fall outside V's per-column
+        //     convex hull, so P and l are still consistent with each other;
+        //   * ALL 64 rows and ALL 128 columns differ from a KNOWN-CORRECT TILE OF THE SAME RUN
+        //     (methodology check: two correct tiles are bit-identical, 8192/8192 halfwords);
+        //   * successive wrong tiles share 0 of 4096 words -- a FRESH partial-sum snapshot every
+        //     tile, not one damaged resident operand;
+        //   * it never recovers once it starts, and +4,766 cycles of unrelated slack (FA_SP_CVTXS)
+        //     masks it completely.
+        // That is exactly the "partial sums -- wrong, finite, of plausible magnitude, self-consistent
+        // enough that P and l still agree" fingerprint FA_SP_WCNT's own comment predicts for it.
+        // So: after the drain, burn a bounded number of cycles covering the mesh's pipeline depth.
+        // 128 is generous for a 16x16 array plus the accmem write, and it runs on warp 0 only in a
+        // stage where the other five warps are already at the barrier: ~128 cyc/tile, ~0.3% of 43k.
+        // *** IF THIS CLOSES THE HAZARD THE FIX IS NOT THIS PAD -- it is that the drain must observe
+        // the MESH.  The pad only proves where to look.  If it does NOT close it, the accumulator
+        // race is exonerated and the search moves to Q, K^T and their scale words. ***
+        { volatile int _d = 0; for (int _i = 0; _i < 128; _i++) asm volatile("addi %0,%0,1" : "+r"(_d)); }
+#endif
         fa_store_acc<QKF>(SP_C, tid);
         fa_gfl(tid);                                  // drain the accmem->spad store     (FA_SP_WCNT)
     } else { asm volatile("nop"); }
