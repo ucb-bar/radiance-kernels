@@ -1,0 +1,154 @@
+# flash_attention_mx
+
+Software-pipelined **MX-FP8 flash attention** on the Radiance cluster + mxGemmini mesh.
+Sq=64, Sk=256, d=128, Bk=64; e4m3 values with E8M0 per-32-block scales.
+
+```
+Q,K,V (mvin) --[mesh: QK^T]--> S (accmem -> SMEM)
+  --[SIMT: online softmax -> requantize -> pack scales]--> P (e4m3) + P scales
+  --[mesh: PV]--> O (accmem) --[SIMT: finalize]--> O (bf16)
+```
+
+The point of this kernel is **steady-state mesh utilization**, not a single tile. Three
+stages are overlapped across tiles so that `T_tile = max(stages)` rather than their sum:
+mesh `QK(i)`/`PV(i)`, SIMT softmax/requant/pack `(i-1)`, DMA mvin `(i+1)`. The mesh reads
+its operands through its own scratchpad read ports (~2/cycle, no SMEM writes during
+compute), so it does not consume Muon SMEM line-slots and genuinely runs underneath the
+SIMT work.
+
+## Numbers
+
+Mesh-busy is **fixed at 16,420 cycles/tile** (2 matmuls x 8,210; 4.19M MAC / 256 MAC per
+cycle, matching the 8,192 theoretical exactly). So **util = 16420 / (cycles per tile)**.
+
+| config | cyc/tile | util | correctness |
+|---|---|---|---|
+| single-shot baseline (no pipelining) | 195,044 | 8.4% | -- |
+| `FA_SP FA_SP_QSPLIT FA_SP_WCNT FA_SP_PAX FA_SP_CVTX` (**default**) | **45,582** | **36.02%** | 12/12 tile-images at NT6 |
+| `+ FA_SM_2P FA_SM_2PRAW` | 42,846 | 38.32% | 12/12 at NT6 but **15/16 at NT8 -- does not bank** |
+
+**Read the correctness column literally.** The default config is *"12 of 12 as built at
+NT6"*, which is not the same as proven correct -- see the hazard section below. The 38.32%
+row is faster and is **not** a usable result: it fails at tile 7 of 8.
+
+## Building and running
+
+```sh
+make                      # builds kernel.cpp (GPU) + host.cpp (rv64 host)
+python3 gen_data.py       # regenerates include/fa_data.h
+python3 fa_gen_goldens.py # regenerates the golden_*.npy references
+```
+
+Config is selected by `-D` flags forwarded to both compiles (see `FA_HOST_DEFS` in the
+Makefile -- the host and GPU scale-prefill paths **must** agree, because the scale SRAM
+write port has a single shared 2-beat pairing counter).
+
+`FA_STEADY` builds the multi-tile steady-state harness; tile count comes from
+`FA_NT1/2/3/4/6/8`.
+
+## Verifying -- please use these tools, they exist because of specific traps
+
+* **`fa_verify_tiles.py <trace>` is the only sound scorer.** Every tile writes the *same*
+  GMEM O buffer, so a whole-file Frobenius scores only whichever generation landed last.
+  This tool groups by cluster and then by address-repeat, and self-validates with a
+  4096-words-per-image count. Reference value is **3.5666%** (`golden_O_u16.npy`).
+* **Use `golden_O_u16.npy`.** The default path is non-streaming;
+  `golden_O_flash_u16.npy` is the streaming reference and scores the same *correct* output
+  as 4.5954%.
+* **`NT6` is the minimum for any steady-state or correctness claim.** NT2/NT4 have passed
+  configurations that later failed 3-of-12. Quote the *converged* interval, not the
+  minimum -- intervals fall and then rise.
+* **A wrong tile also has wrong timing** (~28% steady-interval spread vs ~3% when clean),
+  so a run that is not fully correct has *no usable cycle number* either.
+* **Wait for the trace to stop growing.** VCS exits before `spike-dasm` drains its stderr
+  pipe; a truncated trace scores uncovered cells as zero, which looks like a real error.
+* **`TIMEOUT_CYCLES=N` yields only N/2 cycles** (`$finish` at `N*1000+500` ps, 2000 ps
+  clock). A budget below the kernel length looks exactly like a hang.
+* **`fa_regs3.py` is the register check; run it before every sim.** `Rename.scala`
+  allocates a physical register on a warp's *first write* to an architectural register and
+  never reclaims it, from one 255-entry counter per core, so the binding quantity is the
+  **per-warp** sum over a core's resident warps -- *not* a whole-file union of register
+  names. A union is not even monotone in the real figure (a config with a *higher* union
+  ran while a lower one aborted), so it silently vetoes legal builds. Measured bracket on
+  the real figure: **runs at <=216, aborts at >=231**.
+* **`fa_baraudit.py`** catches `vx_bar` inside a divergent region: llvm duplicates it into
+  both paths and the Synchronizer never releases, which hangs. Fix with an
+  `else { asm volatile("nop"); }`.
+
+## Known hazard family -- read before trusting a result
+
+There is a **latent, timing-sensitive correctness hazard** that this kernel has not fully
+escaped. What is established:
+
+* `FA_SP_WCNT` fixed one real drain bug: `gemmini_fence()` polls `io.busy`, which rises
+  several cycles *after* the command store, so the fence can fall through. Polling MMIO
+  `0x28` (`runningLoops`), which rises in the *same* cycle as the `LOOP_WS` write, closes
+  it, at no cost. Without `WCNT`, otherwise-identical builds score 5-of-8 and 6-of-8.
+* **Something survives `WCNT`.** `FA_SP_PREPK` flips correctness to 4-wrong-of-12 at
+  *identical* cycle counts, and `FA_SM_2P` alone fails while `2P+2PRAW` passes. A flag that
+  changes correctness without changing timing is a data race whose window moved.
+* The corruption fingerprint localizes it to **S**: every wrong cell lies inside V's
+  per-column convex hull (0 of 8192 outside), so P and l stay consistent with each other,
+  which exonerates PV, its operand spad, V's scales and finalize. Successive wrong tiles
+  share 0 of 4096 words, so it is a *fresh* corruption each tile, not one damaged resident
+  operand.
+* Leading hypothesis: `runningLoops` and `io.busy` both track the reservation-station/loop
+  FSM, and `completionCount` rises when the loop's last command *retires* -- not when the
+  last MAC has propagated through the 16x16 array into accmem. Both polls can then pass
+  with MACs still in flight. `FA_SP_ACCPAD` is the bounded test of exactly that.
+* **Slack masks it.** `FA_SP_CVTXS` costs +4,766 cycles and is otherwise useless, and its
+  presence turns a 15/16 NT8 failure into 16/16. So **an NT8 pass on a slower config
+  carries no information about a faster one.**
+
+Practical consequence: the default config is the fastest one measured that is clean at
+NT6, and it sits one bit-exact flag and **seven cycles** away from a config that fails 4
+of 12. Treat it as a benchmarking artifact, and re-verify at NT6 (ideally NT8) after any
+change, however "obviously bit-exact" it looks.
+
+## Structural limits found (do not re-derive these)
+
+* **No matmul here can be split along M, N or K.** The mesh's scale-SRAM read row is a
+  fixed function of the `CONFIG_SCALE_MEM` loop bounds and all four scale slots are
+  occupied. This kills the whole "split the mesh op to hide SIMT underneath it" family, and
+  it is why PV's 8,882 cycles stay exposed with 5 of 6 warps idle -- which in turn sets the
+  ~40% ceiling of this pipeline shape. Store-only `loop_ws` is the one exception.
+* **No SMEM subbank escapes the mesh** -- the Gemmini read client is attached to all 64.
+* **`FA_SP_OPV`** (hiding all 16,420 mesh cycles) dies on `Scratchpad.scala:220`, a 4-entry
+  un-backpressured spad read queue: the mesh may not read an operand from a bank SIMT is
+  reading, SMEM is exactly full, and there is no lane-shuffle instruction to relocate the
+  reduce scratch.
+* **The HW MxRequantizer cannot be fed from Muon software** on its GPU-input path (needs
+  exactly-32-byte transactions; the fabric is word-strided). The mesh-output path works.
+* **No GMEM->SF_MEM DMA exists** (`scale_mem_mvin_base_addr_*` are declared but never
+  assigned).
+* **The host (rv64) can prefill the scale SRAMs concurrently with the GPU** using 8-byte
+  `sd` stores -- 6.4x faster per byte than the GPU path. 4-byte host writes are *silently
+  dropped*. But the whole offload is worth only ~1,000 cyc/tile here, because both scale
+  bursts were already hidden by the pipeline.
+* **The host cannot read cluster SMEM 8 bytes at a time.** Every SMEM subbank advertises
+  `get = TransferSizes(wordSize, wordSize)` -- *exactly* 4 -- with `beatBytes = 4`, so an
+  8-byte Get must be fragmented and reassembled and trips
+  `TLMonitor ... 'D' channel improper response size`. A 4-byte `lw` does not. `clcbus`
+  itself is fine: the unused 512 B `printBuf` TLRAM at device `0x80000` (`beatBytes=8`,
+  atomics) hangs off the *same* bus and 8-byte host reads of it work, which is also a
+  usable host<->GPU mailbox.
+* Barriers are cheap: `mu_barrier` = 3 cycles, `fence.s` ~22 cycles (and it waits only on
+  the Muon per-warp shared queues -- not GMEM, not the Gemmini mvout).
+* TLP beats ILP here, and **instruction count does not predict cycles**: a 27-instruction
+  SWAR pack block is one serial dependency chain and loses to four independent 7-op chains
+  by 4,766 cycles/tile.
+
+## Files
+
+| file | role |
+|---|---|
+| `kernel.cpp` | GPU kernel: pipelined body, `FA_STEADY` harness, all `FA_SP_*`/`FA_SM_*` flags |
+| `flash_mx_impl.hpp` | SIMT stages: online softmax, requantize, pack scales, finalize |
+| `mxgemm_core.hpp` | mesh configuration, mvin/prefetch, scale loading, `mxgemm_compute_tile` |
+| `host.cpp` | rv64 host: MX scale prefill into both clusters' SF SRAMs via 8-byte stores |
+| `gen_data.py` | generates `include/fa_data.h` |
+| `fa_gen_goldens.py` | generates the `golden_*.npy` references |
+| `fa_verify_tiles.py` | **the sound per-tile scorer** |
+| `fa_regs3.py` | per-warp register-budget check (run before every sim) |
+| `fa_baraudit.py` | per-function `vx_bar`-in-divergent-region audit |
+| `fa_marks3.py` | MARK-stamp parser; **`--mesh` is required** (16420 per tile; 8192 if an iteration is a half-tile) |
