@@ -4556,7 +4556,37 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         // *** IF THIS CLOSES THE HAZARD THE FIX IS NOT THIS PAD -- it is that the drain must observe
         // the MESH.  The pad only proves where to look.  If it does NOT close it, the accumulator
         // race is exonerated and the search moves to Q, K^T and their scale words. ***
-        { volatile int _d = 0; for (int _i = 0; _i < 128; _i++) asm volatile("addi %0,%0,1" : "+r"(_d)); }
+        // *** AND THE PAD ITSELF HAD THE BUG THIS FILE ALREADY DOCUMENTS AT THE TOP. ***  Written
+        // `volatile int _d`, the counter gets a STACK SLOT -- and the stack is in GMEM/DRAM -- so the
+        // loop compiled to
+        //     .LBB0_17: lw.global a1,12(sp) / addi a1,a1,1 / addi a0,a0,-1 / sw.global a1,12(sp) / bnez
+        // i.e. 128 iterations x a DRAM load AND a DRAM store, ~265 cyc per round trip = +68,000
+        // cyc/tile instead of the intended 128.  That is EXACTLY the BAR_PAD `volatile int _p` trap
+        // recorded in the header (FSDB-confirmed 2026-07-25), reintroduced verbatim.  Dropping
+        // `volatile` on the VARIABLE while keeping `asm volatile` on the instruction keeps the counter
+        // in a register and makes each iteration one retiring ALU op.
+        // *** MEASUREMENT CONSEQUENCE THAT MATTERS: H1/H2 proved correctness with an EFFECTIVE delay
+        // of ~68,000 cycles, not 128.  So the working experiment does NOT establish that 128 cycles
+        // is enough -- it establishes only that ~68,000 is.  FA_SP_ACCPAD_N sweeps the real
+        // requirement instead of assuming it. ***
+// Pad length.  Discrete flags rather than -DFA_SP_ACCPAD_N=<n>, because fa_build.sh prepends
+// `#define <flag> 1` and a valued define does not survive that.
+#ifndef FA_SP_ACCPAD_N
+#  if   defined(FA_SP_ACCPAD_N8K)
+#    define FA_SP_ACCPAD_N 8192
+#  elif defined(FA_SP_ACCPAD_N2K)
+#    define FA_SP_ACCPAD_N 2048
+#  elif defined(FA_SP_ACCPAD_N512)
+#    define FA_SP_ACCPAD_N 512
+#  elif defined(FA_SP_ACCPAD_N32)
+#    define FA_SP_ACCPAD_N 32
+#  else
+#    define FA_SP_ACCPAD_N 128
+#  endif
+#endif
+        { int _d = 0;
+          for (int _i = 0; _i < (FA_SP_ACCPAD_N); _i++) asm volatile("addi %0,%0,1" : "+r"(_d));
+          asm volatile("" :: "r"(_d)); }
 #endif
         fa_store_acc<QKF>(SP_C, tid);
         fa_gfl(tid);                                  // drain the accmem->spad store     (FA_SP_WCNT)
