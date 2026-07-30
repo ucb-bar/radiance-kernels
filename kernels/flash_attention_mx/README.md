@@ -24,12 +24,30 @@ cycle, matching the 8,192 theoretical exactly). So **util = 16420 / (cycles per 
 | config | cyc/tile | util | correctness |
 |---|---|---|---|
 | single-shot baseline (no pipelining) | 195,044 | 8.4% | -- |
-| `FA_SP FA_SP_QSPLIT FA_SP_WCNT FA_SP_PAX FA_SP_CVTX` (**default**) | **45,582** | **36.02%** | **16/16 at NT8** (and 12/12 at NT6) |
+| `FA_SP FA_SP_QSPLIT FA_SP_WCNT FA_SP_PAX FA_SP_CVTX` (**default**) | **45,582** | **36.02%** | 12/12 NT6, 16/16 NT8, **but 10/12 under FA_PHASE1 -- NOT correct** |
 | `+ FA_SM_2P FA_SM_2PRAW` | 42,846 | 38.32% | 12/12 at NT6 but **15/16 at NT8 -- does not bank** |
 
-**Read the correctness column literally.** The default config is NT8-confirmed (16 of 16, 45,598 cyc/tile), which is stronger than the
-NT6-only claim this README first shipped with. It is still not *proven* correct -- see the hazard section. The 38.32%
-row is faster and is **not** a usable result: it fails at tile 7 of 8.
+**NO CONFIGURATION IN THIS KERNEL IS KNOWN CORRECT, INCLUDING THE DEFAULT. Treat every number
+here as a benchmarking artifact, not a verified result.** The default passes NT6 (12/12) and NT8
+(16/16) and **still fails under `FA_PHASE1`: 10 of 12, cluster 0 tiles 4 and 5 at 93.32% /
+121.14%**, with full 4096/4096 word coverage and the familiar latching shape. `FA_PHASE<k>`
+(below) perturbs the schedule with a **read-only MMIO delay that computes nothing**, so a config
+that fails it was never correct -- it was drawing from a lottery whose base rate is ~74%.
+
+**`FA_PHASE` strictly dominates NT8; NT8 is NOT a sufficient gate.** Measured across five
+configurations -- every one fails somewhere:
+
+| config | cyc/tile | unperturbed | NT8 | P1 | P2 | P3 |
+|---|---|---|---|---|---|---|
+| default (tagged 36.02%) | 45,582 | 12/12 | 16/16 | **10/12** | -- | 12/12 |
+| `+ FA_SP_PREPK` | 43,982 | 12/12 | **16/16** | **7/12** | **5/12** | **10/12** |
+| `+ FA_SP_ACCPAD` (N=128) | 44,565 | 12/12 | 16/16 | **7/12** | **7/12** | **4/12** |
+| `+ FA_SP_ACCRS` | 42,650 | 12/12 | **15/16** | **8/12** | **5/12** | **10/12** |
+| `+ FA_SP_ACCPAD` (N=4) | 43,273 | **9/12** | **11/16** | -- | 9/12 | -- |
+
+`PREPK` is the cautionary row: 37.33% and **16/16 at NT8**, clearing every gate this project used
+for weeks, and it fails the sweep three ways. Do not add a flag to this kernel and report NT6 or
+NT8 alone.
 
 ## Building and running
 
@@ -146,10 +164,30 @@ escaped. What is established:
   presence turns a 15/16 NT8 failure into 16/16. So **an NT8 pass on a slower config
   carries no information about a faster one.**
 
-Practical consequence: the default config is the fastest one measured that is clean at
-NT6, and it sits one bit-exact flag and **seven cycles** away from a config that fails 4
-of 12. Treat it as a benchmarking artifact, and re-verify at NT6 (ideally NT8) after any
-change, however "obviously bit-exact" it looks.
+Practical consequence: **the default is the fastest config measured that is clean at NT6+NT8, and
+it is still not correct.** Re-verify with the `FA_PHASE<k>` sweep after any change, however
+"obviously bit-exact" it looks -- NT6 and NT8 are both insufficient.
+
+**What is closed off, by elimination rather than by A/B** -- the accumulator store is NOT where
+this bug lives, so do not spend more time on drain/pad fixes:
+* `ReservationStation.scala`'s STORE branch already implements the needed ordering (`deps_ex` for
+  an `opa_is_dst` entry includes *"raw for st b <- ex a"* -- the store's accumulator source
+  against the compute's accumulator destination), and the failure survives it.
+* `AccumulatorMem.scala:619-624` adds a same-row RAW interlock across all three write-pipeline
+  stages, live in silicon and honored on both consumers.
+* A pad at the RTL-derived bound (4 cycles; `io.busy` falls +3) gives **9/12** -- if 4 were the
+  true drain, 4 would suffice. A pad 424x the bound passes unperturbed and dies under phase.
+* Measured drain gap is real but not the bug: `runningLoops` goes idle **141 cycles** before the
+  last `acc_mems_0.io_write_valid` (cycles 91,180 vs 91,321 on an 8,113-cycle QK).
+* Sharpest single datum: `qmax` 2/12 vs `ymax` 12/12 -- *same flag set*, differing only in pad
+  length, opposite verdicts.
+
+**And inter-cluster relative phase is NOT the trigger.** `FA_PHASE_BOTH` (identical delay in both
+clusters, restoring relative phase to ~0) still fails 10/12. Asymmetry makes it worse but is not
+necessary, so a two-cluster contest is not required to explain this bug. The harness itself is
+exonerated independently: an ALU-only, MMIO-free, warp-0-only pad sweep breaks it too
+(N=2048 -> 7/11, N=8192 -> 6/10), and exactly one cluster fails per run with *which* one flipping
+between k=1 and k=2 under symmetric code -- a loop that corrupted whoever ran it would hit both.
 
 ## Structural limits found (do not re-derive these)
 
