@@ -538,8 +538,13 @@ static inline uint32_t e4m3_pack4_swar(uint32_t wlo, uint32_t whi, uint32_t D2,
 // PROVENANCE, because the obvious check gives FALSE FAILURES on this build system: two consecutive
 // builds of IDENTICAL defines from IDENTICAL source differ in 776 bytes, all at file offset
 // >= 120,671 (tail metadata), while .text is bit-identical.  So a whole-file `cmp` reports every ELF
-// as stale and tells you nothing.  Compare .text only:
-//     llvm-objdump -s -j .text <elf> | grep -v "file format"
+// as stale and tells you nothing.  And do NOT compare .text either: /tmp/flash_<tag>.elf is the
+// FUSED soc image, so .text is the RV64 HOST and the GPU code lives in .rv32.seg0..seg4.  A
+// .text hash is VACUOUS for a GPU build -- two builds with wildly different flag sets share
+// .text 07daffadb184d09f and differ only in rv32, so the check passes every pair and can never
+// fail.  Hash the RV32 SEGMENTS:
+//     readelf -x .rv32.seg0 -x .rv32.seg1 -x .rv32.seg2 -x .rv32.seg3 -x .rv32.seg4 <elf> \
+//       | sha256sum      # non-vacuous: distinguishes all 52 builds measured
 // Verified that way, all of the measured ELFs above match the source they were measured on.
 //
 // CLUSTER RAM INVENTORY (asked because SMEM being exactly full is what kills FA_SP_OPV).  TLPrintf

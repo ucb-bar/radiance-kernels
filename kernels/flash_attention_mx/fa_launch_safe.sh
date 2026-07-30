@@ -52,11 +52,18 @@ printf 'TAG=%s SEED=%s TMO=%s (=%s cycles) LAUNCHED=%s\n' \
     printf 'DEFINES (no build log at %s)\n' "$BLOG"
   fi
   printf 'ENV FA_DEFS=%s FA_HOST_DEFS=%s\n' "${FA_DEFS:-}" "${FA_HOST_DEFS:-}"
-  for E in "/tmp/flash_$TAG.elf" "/tmp/rad_$TAG.elf" "$KDIR/kernel.radiance.elf"; do
+  # Hash the RV32 GPU SEGMENTS, not `.text`.
+  # `/tmp/flash_<tag>.elf` is the FUSED soc image: `.text` is the RV64 HOST and the GPU code
+  # lives in `.rv32.seg0..seg4`. A `.text` hash is therefore VACUOUS for attributing a
+  # GPU-side build -- verified: flash_ypk.elf and flash_vrR1.elf (wildly different flag sets)
+  # share .text 07daffadb184d09f and differ only in rv32. A check that passes every pair of
+  # builds can never fail, which is worse than no check.
+  for E in "/tmp/flash_$TAG.elf" "/tmp/rad_$TAG.elf" "$KDIR/kernel.soc.elf"; do
     if [ -r "$E" ]; then
-      OD=$(command -v llvm-objdump || echo /scratch/yrh/radiance-kernels/llvm/llvm-muon/bin/llvm-objdump)
-      printf 'ELF %s\nTEXT_SHA %s\n' "$E" \
-        "$("$OD" -s -j .text "$E" 2>/dev/null | grep -v 'file format' | sha256sum | cut -c1-16)"
+      printf 'ELF %s\nRV32_SHA %s\nHOST_TEXT_SHA %s\n' "$E" \
+        "$(readelf -x .rv32.seg0 -x .rv32.seg1 -x .rv32.seg2 -x .rv32.seg3 -x .rv32.seg4 \
+             "$E" 2>/dev/null | sha256sum | cut -c1-16)" \
+        "$(readelf -x .text "$E" 2>/dev/null | sha256sum | cut -c1-16)"
       break
     fi
   done
