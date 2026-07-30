@@ -4526,10 +4526,108 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     if (warp == 0) {
 #ifdef FA_SP_DUMPWC
         fa_gfl_probe(tid, t);                         // see fa_gfl_probe: is the busy-fence racing?
+#elif defined(FA_SP_ACCRS)
+        // ==== FA_SP_ACCRS -- *** DELETE THE PRE-STORE DRAIN AND LET THE RESERVATION STATION DO IT.
+        // ==== THE OPPOSITE MOVE TO EVERY OTHER FIX IN THIS CHAIN, AND IT IS FREE IF IT WORKS. ====
+        // Read out of the RTL (ReservationStation.scala, the `otherwise` = STORE branch, deps_ex):
+        //     Mux(new_entry.opa_is_dst,
+        //       (opa overlaps e.opa && e.opa.valid) || (opa overlaps e.opb && e.opb.valid) ||
+        //       // additionally if ex writes, raw for st b <- ex a
+        //         (e.opa.valid && e.opa_is_dst && new_entry.opb overlaps e.opa),
+        //       ...)
+        // fa_store_acc issues STORE_SPAD_CMD, for which dst.valid is true (line 266) so
+        // opa_is_dst == 1, opa = the SPAD destination and opb = the ACCUMULATOR source.  The third
+        // clause is therefore exactly the RAW we need: the store's accumulator SOURCE against the
+        // QK compute's accumulator DESTINATION.  *** SO THE HARDWARE ALREADY ORDERS THIS PAIR
+        // EXACTLY -- but only if BOTH commands are in the reservation station at the same time. ***
+        // The pre-store fa_gfl drains the station to empty first, which DESTROYS the dependency and
+        // hands the ordering job to a software MMIO poll; every fix in this chain (the fourth pass's
+        // gemmini_fence, FA_SP_WCNT, now FA_SP_ACCPAD) has been an attempt to make that software
+        // poll as good as the hardware interlock it replaced.  This flag stops replacing it.
+        // WHAT IT PREDICTS, so it can be killed rather than confirmed: correct at NT6 AND NT8 AND
+        // at every FA_PHASE k, with the ~1,694 cyc/tile of FA_SP_ACCPAD *and* the drain's own MMIO
+        // round trips both removed.  If it is WRONG, the RAW clause above is not doing what I read
+        // it as doing, and the next step is the waveform (does the ST entry's deps_ex bit for the
+        // QK EX entry ever get set?), not another A/B.
+        // NOTE the trailing fa_gfl after the store is KEPT: stage S2's SIMT reads S out of the spad
+        // and nothing in the reservation station orders a *Muon* SMEM read against a gemmini write.
 #else
         fa_gfl(tid);                                  // mesh drained -> ACC holds S(t)   (FA_SP_WCNT)
 #endif
 #ifdef FA_SP_ACCPAD
+        // *** READ THIS FIRST: THE MECHANISM THE BLOCK BELOW ARGUES FOR IS REFUTED BY THE RTL, AND
+        // THE PAD-LENGTH DATA IS NON-MONOTONE.  FA_SP_ACCPAD IS A SCHEDULE PERTURBATION UNTIL SOMEONE
+        // SHOWS OTHERWISE. ***  (2026-07-30, from the generated Chisel sources, not the waveform.)
+        //  (1) *** THERE ARE TWO DIFFERENT SIGNALS CALLED "COMPLETION" AND THIS COMMENT ORIGINALLY
+        //      CONFLATED THEM.  I FIRST WROTE THE OPPOSITE OF (1a) INTO THIS FILE AND IT WAS WRONG;
+        //      IT IS RECORDED HERE SO THE NEXT READER DOES NOT REDERIVE THE MISTAKE. ***
+        //      (1a) MMIO 0x28 (runningLoops) COUNTS *LOOP* COMPLETIONS AND IS ISSUE-BASED.
+        //           GemminiTile.scala:410-412 decrements it on completion_io.completed, which is
+        //           Controller.scala:619 loop_completed, which LoopMatmul.scala:1374 raises on
+        //           head_loop.all_completed().  ex_completed is set by LoopMatmul.scala:1357
+        //               when (ex.io.idle && loops(ex.io.loop_id).running && ... ex_started)
+        //           and the EX unroller's `idle` (:497) is reached when the LAST COMPUTE COMMAND HAS
+        //           BEEN ACCEPTED DOWNSTREAM -- into the reservation station -- not when it executed.
+        //           For a compute-only loop (fa_mm_acc, skip_stc=1) st_completed is pre-set from
+        //           rs2(7) at config time (:1178), so all_completed fires immediately after that.
+        //           => runningLoops can read 0 with up to a reservation station's worth of COMPUTEs
+        //           still queued.  FA_SP_WCNT's argument -- "runningLoops cannot lie, it is raised in
+        //           the same cycle as the LOOP_WS write" -- is about the RAISING edge.  The edge that
+        //           matters here is the FALL, and the fall is issue-based.  A residual measured at
+        //           >=164 cycles and formally unbounded, which no fixed pad can cover.
+        //      (1b) MMIO 0x20 (io.busy) IS THE STRONGER OF THE TWO AND IS THE ONE THIS PAD SITS
+        //           BEHIND.  Controller.scala:786 has
+        //               io.busy := raw_cmd.valid || loop_conv_unroller_busy ||
+        //                          loop_matmul_unroller_busy || reservation_station.io.busy ||
+        //                          spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid ||
+        //                          conv_cmd.valid
+        //           There is NO MESH TERM in that list, but reservation_station.io.busy covers the
+        //           mesh INDIRECTLY, because an EX entry is not retired at issue --
+        //           ReservationStation.scala:383 complete_on_issue := is_config && q =/= exqu, so only
+        //           non-EX CONFIGs complete on issue -- and its retirement comes from
+        //           ExecuteController.scala:1171-1177,
+        //               when (mesh.io.resp.fire && tag.rob_id.valid) {
+        //                 when (mesh.io.resp.bits.last) { io.completed.valid := true.B ... }
+        //           i.e. THE LAST RESULT ROW LEAVING THE 16x16 ARRAY.  So 0x20 == 0 does imply the
+        //           array is done; what it does NOT cover is the write path behind it.
+        //      (1c) TWO WAYS 0x20 CAN STILL LIE, both worth designing around:
+        //           ReservationStation.scala:140 io.busy := !empty && !(utilization === 1.U &&
+        //           solitary_preload) -- A LONE PRELOAD IN THE STATION READS AS NOT BUSY; and the
+        //           missing mesh term means anything that reaches the mesh without a live RS entry is
+        //           invisible.  "+4" bounds the drain AFTER busy is honest; it does not make it honest.
+        //  (2) THE WRITE PATH BEHIND 0x20 IS SHORT AND BOUNDED, WHICH IS WHY 4 IS THE RIGHT NUMBER.
+        //      The last accmem datum is readable 3 cycles after io.busy falls (structural drain of 35
+        //      register stages, readable at +36, established by flop-counting in a parallel audit), so
+        //      FOUR straight-line cycles is a bound.  For orientation on the same path,
+        //      AccumulatorMem.scala:225-241 holds writes in `pipelined_writes`, a shift register of
+        //      depth acc_latency with require(acc_latency >= 2), and this design sets acc_latency = 3
+        //      (radiance/subsystem/Configs.scala:273, :367).
+        //  (3) AND THE ORIGINAL HYPOTHESIS -- "fa_store_acc reads a MID-ACCUMULATION accumulator" --
+        //      IS REFUTED AT THE READ PORT.  AccumulatorMem.scala:619-624 implements a full SAME-ROW
+        //      RAW interlock across all three write-pipeline stages, honoured on both the mvout and ex
+        //      consumers and live in silicon.  A read of the same accumulator row cannot return a
+        //      partially accumulated value.  So whatever FA_SP_ACCPAD is doing, it is NOT closing a
+        //      same-row accmem race at the accumulator read port.  The candidates left are SMEM-side
+        //      visibility AFTER the mvout, the requantizer path, and cross-ROW ordering.
+        //  (4) THE PAD-LENGTH DATA IS NOT MONOTONE, WHICH NO DRAIN-DEPTH STORY CAN PRODUCE
+        //      (all FA_NT6, same base = PAX CVTX FA_SM_2P FA_SM_2PRAW on FA_SP_WCNT):
+        //          pad cost ~1,694 (N=128, register loop)   P128   44,565   12 of 12 CORRECT
+        //          pad cost ~24,700 (N=2048)                P2K    69,273    7 of 11, onset tile 2
+        //          pad cost ~69,300 (the DRAM-loop pad)     H2    113,863   12 of 12 CORRECT
+        //          ... the same DRAM pad at FA_NT8          H1    113,809   16 of 16 CORRECT
+        //          pad cost ~106,000 (N=8192)               P8K   150,511    6 of 10, onset tile 1
+        //      Correct, wrong, correct, wrong as the delay increases monotonically.  A pipeline that
+        //      needs N cycles to drain cannot be fixed by 1,694, broken by 24,700 and fixed again by
+        //      69,300.  (The pad's marginal cost is a consistent ~12.9 cyc per iteration across all
+        //      three register-pad points, so the delays themselves are measured, not assumed.)
+        //  (5) AND THE PRIOR ON A SINGLE "12 of 12" IS ALREADY DOCUMENTED AS WEAK: mxgemm_core.hpp's
+        //      FA_PHASE block records that 14 of 19 arbitrary perturbations score 12 of 12 with no
+        //      correlation to the flag set, i.e. ~74% by chance.  P128 is one such run.
+        // SO: keep the flag (it is cheap and it is the currently-fastest correct-as-built NT6 point),
+        // but do NOT describe it as a drain fix, and do not carry its correctness to a neighbour.
+        // The instrument that can actually settle it is FA_PHASE<k>, which had never been run.
+        //
+        // ==== ORIGINAL RATIONALE, KEPT BECAUSE (1) AND (2) ABOVE ARE ITS REFUTATION ================
         // ==== FA_SP_ACCPAD -- WAIT FOR THE MESH *PIPELINE*, NOT JUST THE COMMAND FSM. =============
         // *** A TEST OF WHY FA_SP_WCNT IS NECESSARY BUT NOT SUFFICIENT. ***  WCNT polls MMIO 0x28
         // (runningLoops) then MMIO 0x20 (io.busy), and argues runningLoops "cannot lie" because it is
@@ -4580,13 +4678,55 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 #    define FA_SP_ACCPAD_N 512
 #  elif defined(FA_SP_ACCPAD_N32)
 #    define FA_SP_ACCPAD_N 32
+#  elif defined(FA_SP_ACCPAD_N4)
+#    define FA_SP_ACCPAD_N 4
+#    define FA_SP_ACCPAD_FLAT 1     /* see below: at N=4 the LOOP is 3x the delay it is padding */
 #  else
 #    define FA_SP_ACCPAD_N 128
 #  endif
 #endif
+#ifdef FA_SP_ACCPAD_FLAT
+        // ==== "0x20 + 4": THE ONE PAD LENGTH WITH AN RTL ARGUMENT BEHIND IT. ======================
+        // fa_gfl ends on gemmini_fence(), i.e. `while (load32_shared(GEMMINI_BUSY_ADDR) != 0) nop;`
+        // == MMIO 0x20 == io.busy.  Per the RTL audit that landed 2026-07-30, io.busy falls exactly
+        // THREE cycles before the last accmem datum is readable (the structural drain is 35 register
+        // stages, readable at +36, established by flop-counting), so FOUR cycles after 0x20 reads 0
+        // is a BOUND rather than a guess.  Contrast MMIO 0x28 (runningLoops), which FA_SP_WCNT polls
+        // FIRST: LoopMatmul.scala:497 returns to `idle` the cycle the last COMPUTE is ACCEPTED INTO
+        // THE RESERVATION STATION, with up to 16 ex commands still queued behind it -- a residual of
+        // >=164 cycles and formally unbounded, which NO fixed pad can cover.  It is only safe here
+        // because fa_gfl polls 0x28 and THEN 0x20, so the 0x20 poll is the operative one and this pad
+        // sits directly behind it.
+        // *** WHY THIS IS FLAT AND NOT A LOOP. ***  The N=128 form is a 3-instruction loop measured at
+        // ~12.9 cyc/iteration (consistent across N=128/2048/8192, i.e. 1,694 / 24,700 / 105,900
+        // cyc/tile), so a 4-ITERATION loop would deliver ~52 cycles -- thirteen times the bound, and
+        // the branch would dominate what it is supposed to be measuring.  Four straight-line retiring
+        // ALU ops deliver 4 cycles.  `_d` is deliberately NOT volatile: a volatile local gets a stack
+        // slot, the stack is in GMEM/DRAM, and that is exactly the trap that turned a nominal
+        // 128-cycle pad into ~68,000 (verified in the disassembly for this build: the pad is four
+        // `addi a0,a0,0x1` with no lw.global/sw.global anywhere in the region).
+        // TWO CAVEATS THIS PAD CANNOT FIX, recorded so nobody reads it as a proof:
+        //   * io.busy has NO MESH TERM AT ALL (Controller.scala:786), and
+        //   * a lone PRELOAD resident in the reservation station makes io.busy read 0
+        //     (ReservationStation.scala:140),
+        // so the 0x20 poll can itself fall through; "+4" bounds the drain AFTER busy is honest, not
+        // the honesty of busy.
+        // AND THE HYPOTHESIS THIS FLAG WAS BUILT ON IS NOW SUPERSEDED: AccumulatorMem.scala:619-624
+        // implements a full SAME-ROW RAW interlock across all three write-pipeline stages, honoured on
+        // both the mvout and ex consumers, so a read of the same accumulator row CANNOT return a
+        // mid-accumulation value.  Whatever ACCPAD is doing is not a same-row accmem race at the
+        // accumulator read port.  Treat it as an empirically effective delay of unpinned mechanism.
+        { int _d = 0;
+          asm volatile("addi %0,%0,1" : "+r"(_d));
+          asm volatile("addi %0,%0,1" : "+r"(_d));
+          asm volatile("addi %0,%0,1" : "+r"(_d));
+          asm volatile("addi %0,%0,1" : "+r"(_d));
+          asm volatile("" :: "r"(_d)); }
+#else
         { int _d = 0;
           for (int _i = 0; _i < (FA_SP_ACCPAD_N); _i++) asm volatile("addi %0,%0,1" : "+r"(_d));
           asm volatile("" :: "r"(_d)); }
+#endif
 #endif
         fa_store_acc<QKF>(SP_C, tid);
         fa_gfl(tid);                                  // drain the accmem->spad store     (FA_SP_WCNT)
