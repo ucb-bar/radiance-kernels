@@ -37,6 +37,31 @@ fi
 printf 'TAG=%s SEED=%s TMO=%s (=%s cycles) LAUNCHED=%s\n' \
        "$TAG" "$SEED" "$TMO" "$((TMO/2))" "$(date '+%F %T')" > "$META"
 
+# ---- RECORD THE CONFIGURATION, or the scored result is unattributable. ----
+# A .score file that says "37.21%, 12/12" and cannot be tied to a flag set is nearly useless:
+# it happened, and the run could not be credited to any lever without the launching agent's
+# context still being alive. That defeats the point of on-disk results. Record, in order of
+# reliability: the -D list from the build log, the relevant env, and a .text hash for provenance
+# (the build is NOT byte-reproducible -- ~776 tail-metadata bytes differ -- so .text is the only
+# sound identity).
+{
+  BLOG="/tmp/fa_build_$TAG.log"
+  if [ -r "$BLOG" ]; then
+    printf 'DEFINES %s\n' "$(grep -ohE '[-]D[A-Za-z_][A-Za-z0-9_]*(=[^ ]*)?' "$BLOG" | sort -u | tr '\n' ' ')"
+  else
+    printf 'DEFINES (no build log at %s)\n' "$BLOG"
+  fi
+  printf 'ENV FA_DEFS=%s FA_HOST_DEFS=%s\n' "${FA_DEFS:-}" "${FA_HOST_DEFS:-}"
+  for E in "/tmp/flash_$TAG.elf" "/tmp/rad_$TAG.elf" "$KDIR/kernel.radiance.elf"; do
+    if [ -r "$E" ]; then
+      OD=$(command -v llvm-objdump || echo /scratch/yrh/radiance-kernels/llvm/llvm-muon/bin/llvm-objdump)
+      printf 'ELF %s\nTEXT_SHA %s\n' "$E" \
+        "$("$OD" -s -j .text "$E" 2>/dev/null | grep -v 'file format' | sha256sum | cut -c1-16)"
+      break
+    fi
+  done
+} >> "$META" 2>/dev/null
+
 # setsid => new session, immune to the agent's process-group teardown.
 setsid nohup bash -c '
   cd "$1" || exit 97
