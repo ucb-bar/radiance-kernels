@@ -95,19 +95,53 @@ escaped. What is established:
 * Leading hypothesis: `runningLoops` and `io.busy` both track the reservation-station/loop
   FSM, and `completionCount` rises when the loop's last command *retires* -- not when the
   last MAC has propagated through the 16x16 array into accmem. Both polls can then pass
-  with MACs still in flight. **`FA_SP_ACCPAD` confirms this: with a delay before
-  `fa_store_acc`, the otherwise-failing config goes 16/16 at NT8 and 12/12 at NT6.** So the
-  mechanism is supported by a fix that works, not just by a fingerprint. The remaining work is
-  to replace the pad with a poll of something that reflects *actual* accmem completion.
-  Caution when you do: the first ACCPAD run was accidentally ~68,000 cycles, not the nominal
-  128, because a `volatile int` counter put the loop variable in a stack slot and **the stack
-  is in GMEM/DRAM** (128 x 2 DRAM round-trips x ~265 cyc). So that result establishes only
-  that ~68,000 suffices -- it says nothing about 128, and "fixing" the cost without
-  re-verifying correctness would silently discard the finding. Drop `volatile` from the
-  variable, keep `asm volatile` on the instruction, and sweep the delay to find the smallest
-  value that stays correct: that value *is* the drain latency. (This is the same `BAR_PAD`
-  bug documented in `kernel.cpp`, reintroduced three days after it was first found -- the
-  reflex worth keeping is that `volatile` on a local means DRAM here.)
+  with MACs still in flight. **THIS HYPOTHESIS IS REFUTED at the accumulator read port, and
+  `FA_SP_ACCPAD` -- a delay before `fa_store_acc` -- is NOT a fix. Do not ship it.** Two
+  independent results kill it:
+  - `AccumulatorMem.scala:619-624` implements a complete **same-row RAW interlock** across all
+    three write-pipeline stages, confirmed live in silicon (`AccumulatorMem.sv:1128`) and
+    honored on *both* consumers (mvout `Scratchpad.scala:917`, ex `:890`). A read of the same
+    accumulator row therefore cannot return a mid-accumulation value -- there was never a
+    drain for a pad to cover.
+  - **The pad sweep is NON-MONOTONIC**, which is decisive: 128 -> 12/12 correct (44,565
+    cyc/tile), 2,048 -> 4 wrong (onset tile 2), 8,192 -> 4 wrong (onset tile 1). If the pad
+    were covering a fixed latency, correctness would be monotone in pad length -- more delay
+    could never hurt. It is not. The pad **relocates the schedule**, and some lengths happen
+    to land outside the race window. A passing pad length is green-by-accident, exactly like
+    the other four such results in this campaign.
+  The failures keep the same fingerprint (all-rows/all-cols, S-localised, latching), so it is
+  the same hazard throughout, not one introduced by a long pad.
+* **What software can actually observe, and why it is not enough** (all flop-counted in
+  generated Verilog): the readable MMIO surface is exactly three fields -- `0x08` cmd-ready,
+  `0x20 io.busy`, `0x28 runningLoops`; every other offset is `RegField.w` and reads back
+  constant zero with a normal ack. Structural drain is **35 register stages** (readable at
+  +36): input skew *c* + 16 row hops + 1 output capture + (15-*c*) de-skew = 32 uniform to
+  `io.resp.valid`, then +3 in `AccumulatorMem`; the PE accumulate path is combinational
+  (`MacUnit.sv`/`MxFpMul.sv` have no clock port).
+  - `0x28` (what `FA_SP_WCNT` polls) is **issue-based, not retire-based**: `LoopMatmul.scala:497`
+    goes `idle` inside `.elsewhen (io.cmd.fire)`, i.e. the cycle the last COMPUTE is *accepted
+    into the reservation station*, with up to 16 ex commands still queued. Residual is **>=164
+    cycles and formally unbounded** (`Scratchpad.scala:220`'s 4-entry un-backpressured queue can
+    stall feeding arbitrarily). **No fixed pad can make `0x28` safe.**
+  - `0x20` falls exactly **3 cycles** early, so `0x20` + 4 is the ceiling of what software can
+    do. Caveats: `io.busy` has **no mesh term at all** (`Controller.scala:786`, 8 terms), and per
+    `ReservationStation.scala:140` **a lone PRELOAD in the RS makes `io.busy` read 0**.
+  - The signal you would want, `matmul_in_progress` off the mesh tag queue
+    (`ExecuteController.scala:313-315`), **exists in Chisel but was dead-code-eliminated** by
+    `num_counter = 0` (`grep -c busy ExecuteController.sv` -> 0), and would still have been 3
+    cycles short.
+  So the racing pair is **not** at the accumulator read port and cannot be fixed by waiting
+  longer there. Open candidates: SMEM-side visibility after the mvout, the requantizer path,
+  and ordering across *different* rows.
+* **A "free" ALU pad on warp 0 in a quiesced stage costs ~13x its instruction count.** Measured
+  13.4 / 12.9 / 13.1 cyc per iteration across three pad sizes for a 3-instruction register-only
+  loop -- that is the single-warp dependent-issue latency with no other warp resident on the
+  core to hide it (the other five warps are already at the barrier). Budget accordingly.
+* **`volatile` on a local means DRAM here.** A `volatile int` pad counter put the loop variable
+  in a stack slot, and the stack is in GMEM/DRAM: a nominal 128-cycle pad cost ~68,000
+  (128 x 2 DRAM round-trips x ~265 cyc). Same `BAR_PAD` bug documented in `kernel.cpp`,
+  reintroduced three days after it was first found. Keep `asm volatile` on the instruction,
+  never `volatile` on the variable, and check the disassembly for `lw.global`/`sw.global`.
 * **Slack masks it.** `FA_SP_CVTXS` costs +4,766 cycles and is otherwise useless, and its
   presence turns a 15/16 NT8 failure into 16/16. So **an NT8 pass on a slower config
   carries no information about a faster one.**
