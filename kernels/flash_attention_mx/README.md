@@ -24,11 +24,11 @@ cycle, matching the 8,192 theoretical exactly). So **util = 16420 / (cycles per 
 | config | cyc/tile | util | correctness |
 |---|---|---|---|
 | single-shot baseline (no pipelining) | 195,044 | 8.4% | -- |
-| `FA_SP FA_SP_QSPLIT FA_SP_WCNT FA_SP_PAX FA_SP_CVTX` (**default**) | **45,582** | **36.02%** | 12/12 tile-images at NT6 |
+| `FA_SP FA_SP_QSPLIT FA_SP_WCNT FA_SP_PAX FA_SP_CVTX` (**default**) | **45,582** | **36.02%** | **16/16 at NT8** (and 12/12 at NT6) |
 | `+ FA_SM_2P FA_SM_2PRAW` | 42,846 | 38.32% | 12/12 at NT6 but **15/16 at NT8 -- does not bank** |
 
-**Read the correctness column literally.** The default config is *"12 of 12 as built at
-NT6"*, which is not the same as proven correct -- see the hazard section below. The 38.32%
+**Read the correctness column literally.** The default config is NT8-confirmed (16 of 16, 45,598 cyc/tile), which is stronger than the
+NT6-only claim this README first shipped with. It is still not *proven* correct -- see the hazard section. The 38.32%
 row is faster and is **not** a usable result: it fails at tile 7 of 8.
 
 ## Building and running
@@ -95,7 +95,19 @@ escaped. What is established:
 * Leading hypothesis: `runningLoops` and `io.busy` both track the reservation-station/loop
   FSM, and `completionCount` rises when the loop's last command *retires* -- not when the
   last MAC has propagated through the 16x16 array into accmem. Both polls can then pass
-  with MACs still in flight. `FA_SP_ACCPAD` is the bounded test of exactly that.
+  with MACs still in flight. **`FA_SP_ACCPAD` confirms this: with a delay before
+  `fa_store_acc`, the otherwise-failing config goes 16/16 at NT8 and 12/12 at NT6.** So the
+  mechanism is supported by a fix that works, not just by a fingerprint. The remaining work is
+  to replace the pad with a poll of something that reflects *actual* accmem completion.
+  Caution when you do: the first ACCPAD run was accidentally ~68,000 cycles, not the nominal
+  128, because a `volatile int` counter put the loop variable in a stack slot and **the stack
+  is in GMEM/DRAM** (128 x 2 DRAM round-trips x ~265 cyc). So that result establishes only
+  that ~68,000 suffices -- it says nothing about 128, and "fixing" the cost without
+  re-verifying correctness would silently discard the finding. Drop `volatile` from the
+  variable, keep `asm volatile` on the instruction, and sweep the delay to find the smallest
+  value that stays correct: that value *is* the drain latency. (This is the same `BAR_PAD`
+  bug documented in `kernel.cpp`, reintroduced three days after it was first found -- the
+  reflex worth keeping is that `volatile` on a local means DRAM here.)
 * **Slack masks it.** `FA_SP_CVTXS` costs +4,766 cycles and is otherwise useless, and its
   presence turns a 15/16 NT8 failure into 16/16. So **an NT8 pass on a slower config
   carries no information about a faster one.**
@@ -125,13 +137,28 @@ change, however "obviously bit-exact" it looks.
   `sd` stores -- 6.4x faster per byte than the GPU path. 4-byte host writes are *silently
   dropped*. But the whole offload is worth only ~1,000 cyc/tile here, because both scale
   bursts were already hidden by the pipeline.
-* **The host cannot read cluster SMEM 8 bytes at a time.** Every SMEM subbank advertises
-  `get = TransferSizes(wordSize, wordSize)` -- *exactly* 4 -- with `beatBytes = 4`, so an
-  8-byte Get must be fragmented and reassembled and trips
-  `TLMonitor ... 'D' channel improper response size`. A 4-byte `lw` does not. `clcbus`
-  itself is fine: the unused 512 B `printBuf` TLRAM at device `0x80000` (`beatBytes=8`,
-  atomics) hangs off the *same* bus and 8-byte host reads of it work, which is also a
-  usable host<->GPU mailbox.
+* **Host reads of cluster SMEM trip `TLMonitor ... 'D' channel improper response size`, and
+  the mechanism is NOT yet established.** Use `printBuf` instead (below). Two mechanisms have
+  been proposed and *both refuted by measurement* -- do not propose a third without the
+  offending A/D beat pair from a waveform:
+  - `FlitMergeNode`'s per-source `wasMerged` bit: **refuted**, that node has exactly one
+    instantiation (`GemminiTile.scala:188`, the Gemmini scale SRAM) and is not on the SMEM path.
+  - request width: **refuted**. Subbanks really do advertise
+    `get = TransferSizes(wordSize, wordSize)` -- *exactly* 4, `beatBytes = 4` -- but a 4-byte
+    `lw`, which is precisely what that allows, **still asserts**. Width only moves *when*:
+    82,468 cyc (8-byte, heavy softmax) -> 290,934 (8-byte) -> 343,604 (4-byte). An
+    occupancy/rate-dependent window, not an illegal request.
+  Current suspect, untested: `RWSplitterNode` trims `source` *and* `size`
+  (`// FIXME: check truncation` in its source, on exactly the field the monitor reports) and
+  is on the failing path **only** -- SMEM goes `clcbus -> extClients -> TLFragmenter(4,128) ->
+  RWSplitterNode -> subbanks`, whereas `printBuf := clcbus.outwardNode` is direct. A trimmed
+  `source` colliding once enough requests are outstanding would mis-deliver a D beat whose
+  size then cannot match, which also fits the assert arriving earlier the harder the GPU
+  hammers SMEM.
+* **`clcbus` itself is fine, and `printBuf` is a working host<->GPU mailbox.** The unused
+  512 B `printBuf` TLRAM at device `0x80000` (`beatBytes=8`, atomics, no RTL writer and no
+  software symbol) hangs off the *same* `clcbus`, and 8-byte host reads of it work: 12/12
+  correct, no assert.
 * Barriers are cheap: `mu_barrier` = 3 cycles, `fence.s` ~22 cycles (and it waits only on
   the Muon per-warp shared queues -- not GMEM, not the Gemmini mvout).
 * TLP beats ILP here, and **instruction count does not predict cycles**: a 27-instruction
