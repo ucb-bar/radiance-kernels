@@ -106,8 +106,14 @@ write port has a single shared 2-beat pairing counter).
   so a run that is not fully correct has *no usable cycle number* either.
 * **Wait for the trace to stop growing.** VCS exits before `spike-dasm` drains its stderr
   pipe; a truncated trace scores uncovered cells as zero, which looks like a real error.
-* **`TIMEOUT_CYCLES=N` yields only N/2 cycles** (`$finish` at `N*1000+500` ps, 2000 ps
-  clock). A budget below the kernel length looks exactly like a hang.
+* **Check your cycle budget empirically -- the two knobs differ, and getting it wrong looks
+  exactly like a hang.** `fa_run.sh`'s `BUDGET` argument (3rd arg of `fa_launch_safe.sh`) is
+  **1:1**: it sets `MC=BUDGET*2` and `+max-cycles` counts half-cycles, so the run stops at
+  `BUDGET` cycles exactly -- verified on three completed runs (`BUDGET=900000` -> `$finish` at
+  1,800,000,500 ps = 900,000 cycles at 2000 ps/cycle). A raw `TIMEOUT_CYCLES=N` passed straight
+  to VCS is the one that yields **N/2** (`$finish` at `N*1000+500` ps). Confirm which path you are
+  on by dividing the `$finish` time by 2000 -- do not trust either rule from memory. Applying the
+  N/2 rule to `BUDGET` wastes 2x; applying the 1:1 rule to `TIMEOUT_CYCLES` truncates the run.
 * **`fa_regs3.py` is the register check; run it before every sim.** `Rename.scala`
   allocates a physical register on a warp's *first write* to an architectural register and
   never reclaims it, from one 255-entry counter per core, so the binding quantity is the
