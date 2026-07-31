@@ -321,6 +321,22 @@ in a `gemmini_fence()` and is followed by the move-in and the scale stores -- wh
 standing**, together with the one documented way `io.busy` can lie (`ReservationStation.scala:140`:
 a solitary PRELOAD reads as not-busy).
 
+## "The non-pipelined FULL_ATTN2 path" is not actually serialized -- check before assuming
+
+The plan names the non-pipelined `FULL_ATTN2 FA_STEADY` body as the de-overlapped option. It has
+**three** barriers per tile (`bar2` after QK, `bar3` after pack, `bar4` after PV) against the
+`FA_SP` bodies' seven, and -- read off the preprocessed body -- **there is no barrier at the tile
+boundary at all**. So in that body:
+
+* `finalize_O(t)` (all six warps: SMEM reads + 4,096 GMEM stores) runs concurrently with tile
+  `t+1`'s Q/K move-in DMA, its 320 SF-SRAM scale words, **and the QK matmul together with its
+  accumulator -> SMEM move-out**;
+* the PVF prefetch's V move-in DMA runs concurrently with requant and pack.
+
+That is *more* mesh-versus-SIMT overlap at the tile boundary than `FA_SP_QSPLIT` has, not less.
+It is still worth phase-testing (it is a completely different schedule, and it is verified correct
+unperturbed), but it is not the serialized baseline, and `FA_ST_NOOVL` is closer to one.
+
 ## Suggested approach
 
 **De-overlap deliberately, then bisect.** The hazard is a race, so serializing should close it:
