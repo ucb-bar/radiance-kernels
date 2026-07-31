@@ -478,15 +478,15 @@ static inline void diag_publish(void) {
 // MAILBOX ADDRESS: the FA_SP SMEM map is completely different from the sequential one and the old
 // HOST_MBOX at device 0x17F00 lands INSIDE FA_SP's Q scratchpad region (0x16000..0x18000), where
 // the Q move-in DMA would overwrite it every tile.  FA_SP_HSF uses 0x14D00 instead -- see the long
-// note at FA_SP_MBOX in kernel.cpp for why 0x15F00, the obvious choice, is also taken.
-// It must match FA_SP_MBOX in kernel.cpp.
+// note at FA_SP_MBOX in flash_attention_mx.cpp for why 0x15F00, the obvious choice, is also taken.
+// It must match FA_SP_MBOX in flash_attention_mx.cpp.
 #ifdef FA_SP_HSF
 // 0x14D00, NOT 0x15F00: FA_SM_2P's pb buffer (0x15680, stride 2*NT+1 = 33 halfwords) writes 0x15F10
 // and 0x15F20 -- the PACKREQ and PACKED words.  See the long note at FA_SP_MBOX in the kernel.
 #ifdef FA_SP_HSF_PB
 // printBuf (RadianceCluster.scala:96-103): an unused 512 B TLRAM at baseAddr + peripheralAddrOffset,
 // beatBytes 8, atomics = true, behind the SAME clcbus the SMEM leg hangs off.  See the long note at
-// FA_SP_MBOX in kernel.cpp for why this is the discriminator and not just a workaround.
+// FA_SP_MBOX in flash_attention_mx.cpp for why this is the discriminator and not just a workaround.
 #define SP_MBOX(cl)        (CLUSTER_BASE(cl) + 0x80000ull)
 #else
 #define SP_MBOX(cl)        (CLUSTER_BASE(cl) + 0x14D00ull)
