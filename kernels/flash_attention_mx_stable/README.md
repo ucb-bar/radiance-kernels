@@ -83,8 +83,10 @@ Established by measurement, several by refuting our own hypotheses:
   `RegField.w` and reads back constant zero with a normal ack. `0x28` is **issue-based** --
   `LoopMatmul.scala:497` goes idle when the last COMPUTE is *accepted into the reservation
   station* -- so no fixed pad can make it safe. `matmul_in_progress` off the mesh tag queue
-  (`ExecuteController.scala:313-315`) is the signal one would want, and it was dead-code
-  eliminated by `num_counter = 0`.
+  (`ExecuteController.scala:313-315`) is the signal one would want, and it is a **live 6-input OR** in the taped-out
+  netlist -- an earlier claim here that it was dead-code eliminated by `num_counter = 0` is
+  RETRACTED (that was read from Chisel; the netlist disagrees). It is still not MMIO-reachable,
+  which is the operative limitation.
 
 ## Corruption fingerprint
 
