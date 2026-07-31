@@ -149,8 +149,30 @@ All on `FULL_ATTN2 FA_SP FA_SP_WCNT`, seed 12345, cluster 0 / cluster 1 tile 0:
 
 So `PKOVL`, `QOVL`, `QKACC` and `QSPLIT` -- the four overlap flags -- do not affect tile 0 at all,
 and every rung's steady state is bit-exact. The only difference from the verified-correct
-configuration is `FA_SP_LEANCFG` + `FA_SP_PAX` + `FA_SP_CVTX`. `stN6` (`LEANCFG` only) and `stN7`
-(`PAX`+`CVTX` only) split those; both in flight.
+configuration is `FA_SP_LEANCFG` + `FA_SP_PAX` + `FA_SP_CVTX`, and **the split is clean**:
+
+| build | flags on `QOVL QKACC PKOVL QSPLIT WCNT` | cl0 t0 | cl1 t0 |
+|---|---|---|---|
+| `stN7` | `PAX` + `CVTX` | **153.879%, 24 NaN rows** | **79.026%, 1 NaN row** |
+| `stN6` | `LEANCFG` | **CORRECT 3.5666%** | **CORRECT 3.5666%** |
+
+**`FA_SP_LEANCFG` is a tile-0 correctness flag, not just the performance flag it is documented as.**
+`PAX`/`CVTX` are irrelevant to tile 0, exactly as their bit-exactness-by-construction predicts.
+`LEANCFG`'s only effect is to stop calling `configure_mxgemmini` per gemm, so **calling
+`configure_mxgemmini` at all in this body is what breaks tile 0** -- and it does so identically
+whether or not any overlap flag is set.
+
+Two candidate sub-mechanisms, both inside `configure_mxgemmini`, neither yet pinned:
+
+* it issues an extra `CONFIG_SCALE_MEM` per gemm -- the netlist defect above; and
+* it issues a **pair of `gemmini_loop_ws_config_bounds` commands outside any
+  `gemmini_loop_ws_spad` sequence**, and `LoopMatmul.scala:1122` writes those bounds into the
+  `loop_being_configured` slot *without* setting its `configured` bit (`LoopMatmul.scala:1162`
+  is what sets it) -- so a stray pair lands in the slot the next real `LOOP_WS` will use.
+  Those two calls are redundant anyway: `gemmini_loop_ws_spad` re-issues the bounds itself.
+
+`FA_ST_PROLOGF` (`stP2`) tests the drain hypothesis. If a drain does not fix tile 0, deleting the two
+stray `loop_ws_config_bounds` calls is the next thing to try, and it is free.
 
 **Note the shape of the inference, because it is the interesting part.** All three of those flags
 are *per-tile* changes, so none of them can *cause* a tile-0-only failure by its own semantics --
@@ -170,6 +192,10 @@ defect behind it, and it is **still not a sufficient fix**. Measured on the 36% 
 | build | flags added | verdict |
 |---|---|---|
 | `stE6p2` | `FA_ST_CFGPRE` + `FA_PHASE2` | **cluster 1 tile 1 = 119.367% WRONG** |
+| `stE6p1` | `FA_ST_CFGPRE` + `FA_PHASE1` | **cluster 1 tile 3 = 91.435% WRONG** |
+
+It fails at **two different `k`**, at different tiles, in the delayed cluster -- so it is not a
+single unlucky alignment.
 
 119.367% is the *same value* the pre-existing `FA_PHASE2` record reports for this hazard
 (`mxgemm_core.hpp`: `... 118.1504% 119.3714% 119.3714%`), so it is the same failure, not a new one.
