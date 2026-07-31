@@ -370,6 +370,11 @@ PV compute in three different stages each separated by a real drain.
 
 `FA_ST_NOOVL` adds a stage, so it emits **8** marks per tile, not 7.
 
+**It computes correctly** -- `stV2` (`FA_NT2`) is 3.5666% in both clusters at tile 0, so the
+restructuring is bit-exact as intended and the register budget (UPPER 219, in the unresolved
+`(216, 246]` band) does not trip the renamer. Its `FA_NT6` phase sweep (`stV6`, `stV6p1`, `stV6p2`,
+and the built-but-unlaunched `stV6p3` / `stV6b1` / `stV6b2` / `stV8` / `stV24`) is the gate run.
+
 ## "The non-pipelined FULL_ATTN2 path" is not actually serialized -- check before assuming
 
 The plan names the non-pipelined `FULL_ATTN2 FA_STEADY` body as the de-overlapped option. It has
