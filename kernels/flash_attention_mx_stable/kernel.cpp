@@ -5305,6 +5305,8 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 #if defined(FA_ST_NOOVL) && (defined(FA_SP_QEARLY) || defined(FA_SP_QOVL3) || defined(FA_SP_QOVL4))
 #  error "FA_ST_NOOVL owns the Q(t+1) prefetch placement; the QEARLY/QOVL3/QOVL4 variants conflict"
 #endif
+// Barrier id for the extra S6a/S6b split.  MUST be < 16 -- see the note at the FAP_BAR below.
+#define FA_ST_NOOVL_BAR 3u
     // ---- S6: [agent] QK(t+1) COMPUTE-ONLY -> ACC  ||  [warps1-5] finalize(t) -> GMEM ----
     // The mesh touches only its own spad read ports and the private accumulator, so it issues
     // ZERO SMEM writes and cannot collide with finalize's SMEM reads / GMEM stores.  No drain
@@ -5376,7 +5378,16 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         fa_gfl(tid);        // *** DRAIN QK(t+1) HERE.  This is what removes overlap (1): finalize
                             // in S6b below can no longer run underneath the mesh. ***
     } else { asm volatile("nop"); }     // the `else` is MANDATORY (unbalanced warp-uniform region)
-    FAP_BAR(16);            // end of S6a -- warps 1-5 were parked for all of it
+    // *** BARRIER IDS ARE FOUR BITS WIDE.  MuonCore.scala:55 has barrierBits = 4, Synchronizer.scala
+    // :68 allocates `1 << barrierBits` = 16 barrier registers, and the elaborated
+    // Synchronizer.sv's `auto_in_req_bits_id` is `[3:0]` -- so a `vx_bar` with id 16 SILENTLY
+    // TRUNCATES TO 0.  (Written as 16 first; it happened to be harmless in this build only because
+    // nothing else here uses id 0.)  Reuse id 3, which the FA_SP body only uses in its !FA_SP_QOVL
+    // S0 stage -- and FA_ST_NOOVL requires FA_SP_QSPLIT, which requires FA_SP_QOVL, so that stage
+    // is compiled out whenever this line exists.  The static_assert below makes that a build error
+    // rather than a comment. ***
+    static_assert(FA_ST_NOOVL_BAR < 16, "vx_bar ids are 4 bits (barrierBits=4): id must be 0..15");
+    FAP_BAR(FA_ST_NOOVL_BAR);   // end of S6a -- warps 1-5 were parked for all of it
     SMARK();                // s7: QK(t+1) resident in the accumulator, mesh idle
     // ---- S6b: [ALL SIX warps] finalize(t) -> GMEM, with NOTHING else in flight ----------
     FA_SP_FINALIZE(tid, thr);

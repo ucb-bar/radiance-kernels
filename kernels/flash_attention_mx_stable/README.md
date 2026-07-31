@@ -105,6 +105,45 @@ configuration rather than reached by clearing flags, and the first job is to fin
 un-overlapped path needs in order to compute correctly at all. That is an `FA_NT2` question (the
 defect is at tile 0), i.e. ~20 minutes per point rather than ~75.
 
+### The upward ladder, at NT2 (the defect is at tile 0, so NT2 is enough)
+
+All on `FULL_ATTN2 FA_SP FA_SP_WCNT`, seed 12345, cluster 0 / cluster 1 tile 0:
+
+| rung | added | cl0 t0 | cl1 t0 |
+|---|---|---|---|
+| `stN0` | -- | 153.879%, 24 NaN | 79.026%, 1 NaN |
+| `stN1` | `PKOVL` | **153.879%, same 24** | **79.026%, same 1** |
+| `stN2` | `+ QOVL` | **153.879%, same 24** | **79.026%, same 1** |
+| `stN3` | `+ QKACC` | same NaN rows | same |
+| `stN4` | `+ QSPLIT` | **153.879%, same 24** | **79.026%, same 1** |
+| `stN5` | `+ LEANCFG PAX CVTX` (= the 36% config) | *in flight* | *in flight* |
+
+So `PKOVL`, `QOVL`, `QKACC` and `QSPLIT` -- the four overlap flags -- are **not** what makes the
+kernel compute correctly. The only remaining difference from the verified-correct configuration is
+`FA_SP_LEANCFG` + `FA_SP_PAX` + `FA_SP_CVTX`, and `PAX`/`CVTX` are bit-exact by construction (both
+are XOR permutations of a load/store index; `PAX`'s reduction is an order-independent `fmax`). That
+points at **`FA_SP_LEANCFG`**, i.e. at `configure_mxgemmini` being *present* in the steady-state
+loop -- which would make `LEANCFG` a **correctness** flag, not the performance flag it is
+documented as. `stN6` (`LEANCFG` only) and `stN7` (`PAX`+`CVTX` only) split it; both in flight.
+
+`fa_rowdiag.py` in this directory is the tool these rows came from.
+
+### FA_ST_CFGPRE is REFUTED -- by its own experiment
+
+The `CONFIG_SCALE_MEM`-ordering mechanism below predicts the whole fingerprint and has a netlist
+defect behind it, and it is **still not a sufficient fix**. Measured on the 36% config at NT6:
+
+| build | flags added | verdict |
+|---|---|---|
+| `stE6p2` | `FA_ST_CFGPRE` + `FA_PHASE2` | **cluster 1 tile 1 = 119.367% WRONG** |
+
+119.367% is the *same value* the pre-existing `FA_PHASE2` record reports for this hazard
+(`mxgemm_core.hpp`: `... 118.1504% 119.3714% 119.3714%`), so it is the same failure, not a new one.
+A `gemmini_fence()` immediately before the `CONFIG_SCALE_MEM` **and** one between it and the
+`LOOP_WS` -- which together satisfy both halves of the ordering argument -- do not close it. That
+is a fifth refuted mechanism for this campaign. The netlist finding stays on the record because it
+is a true defect and it is the reason `FA_SP_LEANCFG` matters, but it is **not** this bug.
+
 ## What is already ruled out -- do not re-derive
 
 Established by measurement, several by refuting our own hypotheses:
