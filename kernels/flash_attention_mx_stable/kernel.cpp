@@ -4135,6 +4135,34 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 #else
     fa_scl(fa_sf_b(0), &QK_B_scales_col[0][0], QKF.SCALE_FACTORS_PER_TILE_B(), tid);
     fa_scl(fa_sf_b(1), &V_scales[0][0], PVF.SCALE_FACTORS_PER_TILE_B(), tid);
+    // ==== FA_ST_PROLOGF -- PUBLISH THE PROLOGUE'S SF-SRAM SCALE WORDS AT THE GEMMINI PORT. =======
+    // *** THE MEASUREMENT THAT MOTIVATES THIS IS A TILE-0-ONLY FAILURE, WHICH IS NOT WHAT IT LOOKED
+    // LIKE AT FIRST. ***  On FULL_ATTN2 FA_SP FA_SP_WCNT at FA_NT2, and at every rung of the
+    // ladder that adds PKOVL / QOVL / QKACC / QSPLIT, the scored result is
+    //     cluster 0 tile 0  WRONG (24 NaN rows)      cluster 0 tile 1  CORRECT 3.5666%
+    //     cluster 1 tile 0  WRONG (1 NaN row)        cluster 1 tile 1  CORRECT 3.5666%
+    // bit-identically under no skew, FA_PHASE1, FA_PHASE2, FA_PHASE3, FA_PHASE_BOTH and FA_NT8.
+    // The STEADY STATE of the un-overlapped body is therefore BIT-EXACT and only its FIRST tile is
+    // wrong -- so this is a warm-up/ordering bug in the PROLOGUE, not a defect in the body, and it
+    // is a different bug from the timing hazard this directory chases (that one is phase-sensitive
+    // and starts at a later tile).
+    // WHY THE PROLOGUE IS THE SUSPECT.  The two fa_scl calls above are ordinary Muon SIMT STORES to
+    // the gemmini's scale-SRAM TL slave.  The only thing between them and tile 0's QK matmul -- which
+    // READS those weight scales -- is FAP_BAR(2), i.e. mu_fence_smem() + vx_bar.  This file already
+    // documents, twice (FA_SP_QGF and the 1cce749 fix), that mu_fence_smem() drains only the warp's
+    // own Muon LSU queues and is NOT a drain for an SF-SRAM scale write or a gemmini DMA, and that
+    // the working primitive is gemmini_fence(): being a LOAD from the same gemmini TL port, it orders
+    // every preceding store to that port.  The configurations that DO get tile 0 right all happen to
+    // have a gemmini_fence() between the prologue's scale stores and the first matmul -- FA_SP_QKACC's
+    // priming fa_gf() -- which is exactly the accidental-slack pattern this campaign keeps finding.
+    // So: make it explicit and unconditional.  Cost is one MMIO round trip (~37 cyc) ONCE per kernel.
+    // *** IF THIS DOES NOT FIX TILE 0, the prologue hand-off is not the site and the next step is the
+    // K/V OPERANDS rather than their scales (fa_gf above drains the B DMAs, so that would mean the
+    // drain itself is unsound -- ReservationStation.scala:140's solitary-preload case). ***
+#ifdef FA_ST_PROLOGF
+    mu_fence_smem();   // this warp's stores leave its own LSU queues ...
+    fa_gf(tid);        // ... and a load from the gemmini TL port orders them at the scale SRAM
+#endif
 #endif
 #ifdef FA_SP_QOVL
     // tile 0's Q + Q scales: every later tile's are written one stage early (stage S2 below).

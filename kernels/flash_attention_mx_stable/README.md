@@ -63,7 +63,17 @@ time), and any single trace can be re-diagnosed with `fa_verify_tiles.py` (the v
 **this** directory only. Marks per tile: 7 for the `FA_SP` bodies, **8** with `FA_ST_NOOVL` (it adds
 a stage), 11 for the sequential `FULL_ATTN2 FA_STEADY` body.
 
-### The de-overlap plan has a prerequisite nobody knew about: the un-overlapped path is BROKEN
+### The de-overlap plan has a prerequisite: the un-overlapped path gets TILE 0 wrong
+
+> **CORRECTION, and it is mine.** This section first said "the un-overlapped path is BROKEN". It is
+> not. Once the `FA_NT2` runs *completed*, the scored result is **tile 0 wrong, tile 1 CORRECT at
+> 3.5666%** -- at every rung of the ladder. The steady state of the un-overlapped body is bit-exact;
+> only its **first** tile is wrong. The stronger claim came from reading a *partial* trace, whose
+> first (and only) complete group is tile 0 -- so a tile-0-only defect is indistinguishable from a
+> total failure until the run finishes. I killed seven NT6/NT8 runs on that partial evidence; their
+> tiles 1-5 would have shown the steady state immediately. **Do not score a growing trace and act on
+> it: `fa_verify_tiles.py` reports later groups as INCOMPLETE for exactly this reason, and the fix is
+> to wait, not to reason around it.**
 
 The first thing the suggested approach asks for -- *"no `(i+1)` prefetch, no `(i-1)` overlap"* -- is
 reachable by simply **not** setting `FA_SP_QOVL` / `FA_SP_QKACC` / `FA_SP_QSPLIT` / `FA_SP_PKOVL`.
@@ -82,20 +92,19 @@ for t:  MARK
   S6 [all] finalize_O -> GMEM                              BAR(9)
 ```
 
-**It does not compute the right answer, at tile 0, deterministically.** Measured (2026-07-31,
-seed 12345, `fa_verify_tiles.py` against `golden_O_u16.npy`), on four builds -- no skew,
-`FA_PHASE1`, `FA_PHASE2`, and `FA_NT8`:
+**It does not compute the right answer at tile 0, deterministically -- and it is right from tile 1
+on.** Measured (2026-07-31, seed 12345, `fa_verify_tiles.py` against `golden_O_u16.npy`):
 
-| build | cluster 0 tile 0 | cluster 1 tile 0 |
-|---|---|---|
-| `stB6` (no skew) | 153.879%, 24 NaN rows (4-15, 20-31) | 79.026%, 1 NaN row (31) |
-| `stB6p1` (`FA_PHASE1`) | **153.879%, same 24 rows** | **79.026%, same row** |
-| `stB6p2` (`FA_PHASE2`) | **153.879%** | **79.026%** |
-| `stB8` (`FA_NT8`) | **153.879%** | **79.026%** |
+| build | cl0 t0 | cl0 t1 | cl1 t0 | cl1 t1 |
+|---|---|---|---|---|
+| `stN0` (`FA_NT2`, completed) | 24 NaN rows | **CORRECT 3.5666%** | 1 NaN row | **CORRECT 3.5666%** |
+| `stN1`..`stN4` (each rung) | same | **CORRECT** | same | **CORRECT** |
+| `stB6` / `stB6p1` / `stB6p2` / `stB6p3` / `stB8` | 153.879%, same 24 rows | -- | 79.026%, same row | -- |
 
-Bit-identical across all four, including across a 2.4k- and 4.8k-cycle skew of cluster 1. So this
-is **not** the race -- it is a functional defect in the un-overlapped code path, and it is
-*separate from* the hazard this directory exists to chase. Two further facts that narrow it:
+Tile 0 is bit-identical across no skew, `FA_PHASE1`, `FA_PHASE2`, `FA_PHASE3`, `FA_PHASE_BOTH` and
+`FA_NT8`, i.e. across a 2.4k-, 4.8k- and 7.2k-cycle skew of cluster 1. So this is **not** the race
+-- it is a **prologue / warm-up** bug, and it is *separate from* the hazard this directory exists to
+chase (that one is phase-sensitive and starts at a *later* tile). Two further facts that narrow it:
 
 * **It is not `l`.** Fitting each non-NaN row to the best scalar multiple of golden leaves a
   **median 78% residual** (max 93%), so `O_unnorm` itself is wrong, not the softmax denominator.
@@ -109,31 +118,47 @@ The NaN rows are bf16 `0x7FC0` and the shape is *"first 4 of 16 rows fine, last 
 row-tiles 0 and 1, with row-tiles 2 and 3 clean -- worth keeping in view, because
 `PE_TILES_I() == 4`.
 
-**Consequence for the plan:** the de-overlap ladder has to be walked *upward* from a working
-configuration rather than reached by clearing flags, and the first job is to find which flag the
-un-overlapped path needs in order to compute correctly at all. That is an `FA_NT2` question (the
-defect is at tile 0), i.e. ~20 minutes per point rather than ~75.
+**Consequence for the plan:** the fully de-overlapped body is *usable* -- its steady state is
+bit-exact -- but it cannot pass a gate that scores every tile-image until tile 0 is fixed. Because
+the defect is at tile 0, every experiment about it is an `FA_NT2` question: ~20 minutes per point
+rather than ~75.
+
+**The prologue is the suspect, and `FA_ST_PROLOGF` is the bounded test.** The prologue's K and V
+weight-scale words are written by `fa_scl`, i.e. ordinary Muon SIMT stores to the gemmini's
+scale-SRAM TL slave, and the only thing between them and tile 0's QK matmul -- which *reads* those
+weight scales -- is `FAP_BAR(2)` = `mu_fence_smem()` + `vx_bar`. This file documents twice
+(`FA_SP_QGF`, and the `1cce749` fix) that `mu_fence_smem()` is **not** a drain for an SF-SRAM scale
+write, and that the working primitive is `gemmini_fence()` -- a load from the same gemmini TL port,
+which orders every preceding store to it. Every configuration that gets tile 0 *right* happens to
+have such a fence there already: `FA_SP_QKACC`'s priming `fa_gf()`. That is the accidental-slack
+pattern this campaign keeps finding. `FA_ST_PROLOGF` makes it explicit and unconditional for one
+MMIO round trip (~37 cyc) **once per kernel**.
 
 ### The upward ladder, at NT2 (the defect is at tile 0, so NT2 is enough)
 
 All on `FULL_ATTN2 FA_SP FA_SP_WCNT`, seed 12345, cluster 0 / cluster 1 tile 0:
 
-| rung | added | cl0 t0 | cl1 t0 |
-|---|---|---|---|
-| `stN0` | -- | 153.879%, 24 NaN | 79.026%, 1 NaN |
-| `stN1` | `PKOVL` | **153.879%, same 24** | **79.026%, same 1** |
-| `stN2` | `+ QOVL` | **153.879%, same 24** | **79.026%, same 1** |
-| `stN3` | `+ QKACC` | same NaN rows | same |
-| `stN4` | `+ QSPLIT` | **153.879%, same 24** | **79.026%, same 1** |
-| `stN5` | `+ LEANCFG PAX CVTX` (= the 36% config) | *in flight* | *in flight* |
+| rung | added | tile 0 | tile 1 | verdict |
+|---|---|---|---|---|
+| `stN0` | -- | WRONG (24 / 1 NaN rows) | CORRECT | 2 of 4 |
+| `stN1` | `PKOVL` | WRONG, **same rows** | CORRECT | 2 of 4 |
+| `stN2` | `+ QOVL` | WRONG, **same rows** | CORRECT | 2 of 4 |
+| `stN3` | `+ QKACC` | WRONG, **same rows** | CORRECT | 2 of 4 |
+| `stN4` | `+ QSPLIT` | WRONG, **same rows** | CORRECT | 2 of 4 |
+| `stN5` | `+ LEANCFG PAX CVTX` (= the 36% config) | **CORRECT** | **CORRECT** | **4 of 4** |
 
-So `PKOVL`, `QOVL`, `QKACC` and `QSPLIT` -- the four overlap flags -- are **not** what makes the
-kernel compute correctly. The only remaining difference from the verified-correct configuration is
-`FA_SP_LEANCFG` + `FA_SP_PAX` + `FA_SP_CVTX`, and `PAX`/`CVTX` are bit-exact by construction (both
-are XOR permutations of a load/store index; `PAX`'s reduction is an order-independent `fmax`). That
-points at **`FA_SP_LEANCFG`**, i.e. at `configure_mxgemmini` being *present* in the steady-state
-loop -- which would make `LEANCFG` a **correctness** flag, not the performance flag it is
-documented as. `stN6` (`LEANCFG` only) and `stN7` (`PAX`+`CVTX` only) split it; both in flight.
+So `PKOVL`, `QOVL`, `QKACC` and `QSPLIT` -- the four overlap flags -- do not affect tile 0 at all,
+and every rung's steady state is bit-exact. The only difference from the verified-correct
+configuration is `FA_SP_LEANCFG` + `FA_SP_PAX` + `FA_SP_CVTX`. `stN6` (`LEANCFG` only) and `stN7`
+(`PAX`+`CVTX` only) split those; both in flight.
+
+**Note the shape of the inference, because it is the interesting part.** All three of those flags
+are *per-tile* changes, so none of them can *cause* a tile-0-only failure by its own semantics --
+`PAX` and `CVTX` are XOR permutations of an index (`PAX`'s reduction is an order-independent `fmax`),
+and `LEANCFG` only deletes a redundant `configure_mxgemmini`. What they can do is move the *timing*
+of the prologue-to-tile-0 hand-off. So the expected reading of `stN6`/`stN7` is **not** "flag X is
+broken" but "flag X shifts a prologue race", which is why the fix under test is a drain
+(`FA_ST_PROLOGF`) and not a flag.
 
 `fa_rowdiag.py` in this directory is the tool these rows came from.
 
