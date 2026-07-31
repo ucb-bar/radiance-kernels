@@ -31,8 +31,11 @@ cycle, matching the 8,192 theoretical exactly). So **util = 16420 / (cycles per 
 | config | cyc/tile | util | correctness |
 |---|---|---|---|
 | single-shot baseline (no pipelining) | 195,044 | 8.4% | -- |
-| `FA_SP FA_SP_QSPLIT FA_SP_WCNT FA_SP_PAX FA_SP_CVTX` (**default**) | **45,582** | **36.02%** | 12/12 NT6, 16/16 NT8, **but 10/12 under FA_PHASE1 -- NOT correct** |
-| `+ FA_SM_2P FA_SM_2PRAW` | 42,846 | 38.32% | 12/12 at NT6 but **15/16 at NT8 -- does not bank** |
+| `FA_SP FA_SP_QSPLIT FA_SP_WCNT FA_SP_PAX FA_SP_CVTX` | 45,582 | 36.02% | 12/12 NT6, 16/16 NT8; 10/12 under FA_PHASE1 |
+| **+ `FA_SM_2P FA_SM_2PRAW FA_SP_ACCRS FA_SP_PREPK`** (**peak**) | **42,364** | **38.76%** | **12/12 NT6 and 16/16 NT8**; phase sweep pending |
+| + `FA_SP_ACCRS` alone | 42,644 | 38.50% | 12/12 NT6, **15/16 NT8** |
+| + `FA_SP_ACCPAD FA_SP_PREPK` | 43,982 | 37.33% | 16/16 NT8, but the pad costs +1,694 for nothing |
+| + `FA_SP_PREPK`, pad simply removed | ~~43,899~~ | -- | **11/16 -- timing void** |
 
 **These utilization numbers are real results, and the correctness caveat is scoped -- read both.**
 
@@ -70,8 +73,22 @@ configurations -- every one fails somewhere:
 | `+ FA_SP_ACCRS` | 42,650 | 12/12 | **15/16** | **8/12** | **5/12** | **10/12** |
 | `+ FA_SP_ACCPAD` (N=4) | 43,273 | **9/12** | **11/16** | -- | 9/12 | -- |
 
-`PREPK` is the cautionary row: 37.33% and **16/16 at NT8**, clearing every gate this project used
-for weeks, and it fails the sweep three ways. Do not add a flag to this kernel and report NT6 or
+**The peak config's mechanism is worth understanding before changing it.** `FA_SP_ACCPAD` padded
+the pre-store window with slack; removing the pad and putting *nothing* in its place gives
+**11/16** (cluster 0 tiles 3-7 at 91-122%, spread 29.1%). What works is `FA_SP_ACCRS`: delete the
+pre-store `fa_gfl` drain entirely and let `ReservationStation.scala`'s STORE branch enforce the
+ordering it already implements (`deps_ex` for an `opa_is_dst` entry covers *"raw for st b <- ex a"*,
+the store's accumulator source against the compute's accumulator destination). The `fa_gfl` was
+*destroying* that interlock by emptying the station before the store was allocated. Same 1,694
+cycles recovered as bare removal -- but 16/16 instead of 11/16, because the ordering is handed to
+hardware rather than to slack.
+
+Unexplained observation, recorded as such: `FA_SP_PREPK` appears to help *correctness* at NT8, not
+only cycles -- `ACCRS` alone is 15/16 (fails cluster 1 tile 7) while `ACCRS`+`PREPK` is 16/16. One
+run each and no mechanism, so do not rely on it.
+
+`PREPK` is also the cautionary row on the older `ACCPAD` base: 37.33% and **16/16 at NT8**, clearing
+every gate this project used for weeks, and it fails the phase sweep three ways. Do not add a flag to this kernel and report NT6 or
 NT8 alone -- but equally, do not read a `FA_PHASE` failure as invalidating the cycle count of a run
 whose tiles verified. It means the config is schedule-fragile, not that its measurement was wrong.
 
