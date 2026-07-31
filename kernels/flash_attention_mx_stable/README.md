@@ -277,9 +277,27 @@ in a `gemmini_fence()` and is followed by the move-in and the scale stores -- wh
    kernel**. (Which also means `CONFIG_SCALE_MEM`'s `rs1[62]` -- the only counter-reset bit that
    exists -- resets a counter in a block this kernel never uses: `MxRequantizer.scala:559`. It does
    **not** reach `ScaleFactorMem`'s odometer; independently re-verified.)
-4. An intra-cluster race decided by **GMEM-return timing** through the 4-entry un-backpressured
-   spad read queue at `Scratchpad.scala:220` -- still untested, and now the strongest of the
-   original four.
+4. **The 4-entry un-backpressured spad read queue at `Scratchpad.scala:220` -- RULED OUT, twice
+   over.** *Structurally:* `Scratchpad.scala:213` is
+   `io.read.req.ready := q_will_be_empty && ext_mem.read_req.ready`, elaborated as
+   `ScratchpadBank.sv:122`, so the bank accepts a new SMEM read **only when the response queue will
+   be empty** -- at most one outstanding read per bank. A 4-entry `dma_q` cannot overflow behind a
+   window of one. *Empirically:* the overflow assertion is **live in the taped-out netlist** --
+   `ScratchpadBank.sv:123-130`, guarded only by `` `ifndef SYNTHESIS ``, emitting
+   `$error("Assertion failed: DMA queue does not have enough entries")` plus `$fatal` -- and it has
+   **never fired in any run in this directory, including every run that produced a corrupt tile**
+   (`stE6p2`, `stN0`-`stN4`, `stB6`*). The `// TODO: do backpressure` comment is real but the
+   hazard it warns about is unreachable at this issue rate.
+
+   *Methodology note, because it nearly invalidated this check:* `fa_run.sh` uses
+   `cmd 2>&1 > $T.log | grep ... > $T.out`. Bash applies those left to right, so **stderr goes to
+   the grep and stdout goes to the `.log`** -- which is why the `[ISSUE]` trace (stderr) is what
+   gets filtered, and why a VCS `$error` (stdout) lands in the `.log`. Grepping the `.out` for an
+   assertion would silently find nothing forever.
+
+**So of the four candidates, only #2 -- ordering across *different* accumulator rows -- is still
+standing**, together with the one documented way `io.busy` can lie (`ReservationStation.scala:140`:
+a solitary PRELOAD reads as not-busy).
 
 ## Suggested approach
 
