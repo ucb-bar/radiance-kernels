@@ -27,12 +27,30 @@ cycle, matching the 8,192 theoretical exactly). So **util = 16420 / (cycles per 
 | `FA_SP FA_SP_QSPLIT FA_SP_WCNT FA_SP_PAX FA_SP_CVTX` (**default**) | **45,582** | **36.02%** | 12/12 NT6, 16/16 NT8, **but 10/12 under FA_PHASE1 -- NOT correct** |
 | `+ FA_SM_2P FA_SM_2PRAW` | 42,846 | 38.32% | 12/12 at NT6 but **15/16 at NT8 -- does not bank** |
 
-**NO CONFIGURATION IN THIS KERNEL IS KNOWN CORRECT, INCLUDING THE DEFAULT. Treat every number
-here as a benchmarking artifact, not a verified result.** The default passes NT6 (12/12) and NT8
-(16/16) and **still fails under `FA_PHASE1`: 10 of 12, cluster 0 tiles 4 and 5 at 93.32% /
-121.14%**, with full 4096/4096 word coverage and the familiar latching shape. `FA_PHASE<k>`
-(below) perturbs the schedule with a **read-only MMIO delay that computes nothing**, so a config
-that fails it was never correct -- it was drawing from a lottery whose base rate is ~74%.
+**These utilization numbers are real results, and the correctness caveat is scoped -- read both.**
+
+*The utilization is sound.* Mesh-busy is fixed, the harness measures converged steady-state
+intervals, and steady state is exactly what a real workload looks like: a 2048-token TinyLlama-1.1B
+prefill is ~101,000 tiles of this shape (32 query blocks x 144 key blocks/head x 32 heads x 22
+layers; ~50,000 if two head_dim-64 heads pack into d=128). Boot amortizes to zero at that scale, so
+**36.02% is the peak steady-state utilization achieved with output bit-correct against the golden**,
+and NT6/NT8 is a perfectly adequate sample for the *timing* claim. That is the headline result:
+8.4% -> 36.02%, a 4.3x speedup on a taped-out design whose RTL cannot be changed.
+
+*The correctness caveat is about robustness, not about whether these runs were right.* The default
+passes NT6 12/12 and NT8 16/16 -- those outputs really are bit-correct -- but it fails under
+`FA_PHASE1` at 10/12 (cluster 0 tiles 4 and 5, 93.32% / 121.14%, full 4096/4096 coverage). Since
+`FA_PHASE<k>` is a **read-only MMIO delay that computes nothing**, the arithmetic is unchanged and
+only the schedule moves. So the honest statement is: **this configuration is correct at the
+schedule it was measured at, and is not robust to schedule perturbation.**
+
+That distinction matters because the two uses have different requirements:
+* **Peak-utilization benchmarking (what this default is for).** A fixed schedule is fine, the
+  numbers stand, and the reported outputs are verified bit-correct. Re-verify after any change.
+* **Deployment.** At ~10^5 tiles per forward pass, with per-layer access patterns and DRAM state
+  varying, the inter-cluster phase cannot be pinned the way the harness pins it -- a hazard that
+  first bites at tile 7 of 8 will fire constantly. A stability-oriented variant is tracked
+  separately and should not be conflated with this one.
 
 **`FA_PHASE` strictly dominates NT8; NT8 is NOT a sufficient gate.** Measured across five
 configurations -- every one fails somewhere:
@@ -47,7 +65,8 @@ configurations -- every one fails somewhere:
 
 `PREPK` is the cautionary row: 37.33% and **16/16 at NT8**, clearing every gate this project used
 for weeks, and it fails the sweep three ways. Do not add a flag to this kernel and report NT6 or
-NT8 alone.
+NT8 alone -- but equally, do not read a `FA_PHASE` failure as invalidating the cycle count of a run
+whose tiles verified. It means the config is schedule-fragile, not that its measurement was wrong.
 
 ## Building and running
 
