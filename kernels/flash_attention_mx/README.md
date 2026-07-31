@@ -1,5 +1,12 @@
 # flash_attention_mx
 
+> **This is the PEAK-UTILIZATION variant.** It maximizes steady-state mesh utilization and is
+> **not robust to schedule perturbation** -- see the correctness note below. If you need a
+> configuration that stays correct under perturbation, use
+> [`../flash_attention_mx_stable`](../flash_attention_mx_stable/README.md) instead. The two goals
+> conflict (the overlap that produces the utilization is what exposes the race), which is why they
+> are separate directories.
+
 Software-pipelined **MX-FP8 flash attention** on the Radiance cluster + mxGemmini mesh.
 Sq=64, Sk=256, d=128, Bk=64; e4m3 values with E8M0 per-32-block scales.
 
