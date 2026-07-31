@@ -54,6 +54,15 @@ Target -- bit-correct on **all** of:
 | NT72 (~1 TinyLlama head) | **not yet measured** (~3.3M cycles, ~10 h sim) |
 | `FA_PHASE1/2/3` | **none** -- every config measured fails at least one k |
 
+Everything below was measured with the scripts and tools in this directory; the run set is
+reconstructible from disk with **`./fa_runtable.sh /tmp/struns`** (tag, whether the sim reached
+`$finish`, correct/wrong tile-image counts, and the flag set + RV32-segment sha recorded at build
+time), and any single trace can be re-diagnosed with `fa_verify_tiles.py` (the verdict) or
+`fa_rowdiag.py` (which stage). `/tmp/st_build.sh <tag> "<DEFINES>"` and
+`/tmp/st_go.sh <tag> <elftag> <seed> <budget_cycles> 16420 <marks_per_tile>` build and launch in
+**this** directory only. Marks per tile: 7 for the `FA_SP` bodies, **8** with `FA_ST_NOOVL` (it adds
+a stage), 11 for the sequential `FULL_ATTN2 FA_STEADY` body.
+
 ### The de-overlap plan has a prerequisite nobody knew about: the un-overlapped path is BROKEN
 
 The first thing the suggested approach asks for -- *"no `(i+1)` prefetch, no `(i-1)` overlap"* -- is
