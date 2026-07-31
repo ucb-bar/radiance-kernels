@@ -144,6 +144,19 @@ A `gemmini_fence()` immediately before the `CONFIG_SCALE_MEM` **and** one betwee
 is a fifth refuted mechanism for this campaign. The netlist finding stays on the record because it
 is a true defect and it is the reason `FA_SP_LEANCFG` matters, but it is **not** this bug.
 
+**The fences were verified to exist in the binary before the refutation was believed** -- this file
+already records one "settle" that clang folded into 16 independent pipelined loads that guaranteed
+nothing (`FA_CFGSETTLE2`'s note). Static `lw.shared` count over the linked GPU ELF:
+
+| build | added | `lw.shared` |
+|---|---|---|
+| `stD6p1` | -- (control) | 56 |
+| `stC6p1` | `FA_ST_CFGFENCE` (1 fence per matmul) | **60** |
+| `stE6p1` | `FA_ST_CFGPRE` (2 fences per matmul) | **64** |
+
+Monotone +4 per added fence pair, i.e. both fences are really emitted in both `fa_mm` and
+`fa_mm_acc`. The refutation is of the mechanism, not of a fence that silently vanished.
+
 ## What is already ruled out -- do not re-derive
 
 Established by measurement, several by refuting our own hypotheses:
