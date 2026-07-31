@@ -321,6 +321,30 @@ in a `gemmini_fence()` and is followed by the move-in and the scale stores -- wh
 standing**, together with the one documented way `io.busy` can lie (`ReservationStation.scala:140`:
 a solitary PRELOAD reads as not-busy).
 
+## The current stability candidate: `FA_ST_NOOVL`
+
+Since clearing the overlap flags lands on a broken path, the de-overlap is done by **subtracting the
+overlap from the fully-featured `FA_SP_QSPLIT` body** -- the body every verified 12/12 in this
+campaign was measured on. `FA_ST_NOOVL` (see the block above `fa_mm` in `kernel.cpp`) removes the
+three things that straddle a stage boundary in `FA_SP_QSPLIT`:
+
+1. QK(t+1)'s 8,210 mesh cycles running underneath `finalize(t)` (stage S6);
+2. Q(t+1)'s 8 KB move-in DMA, issued in S4 and transferring on into S5/S6;
+3. Q(t+1)'s 64 SF-SRAM scale stores running underneath the PV matmul (stage S5).
+
+Stage S6 splits into **S6a** (warp 0 alone, everyone else parked: Q mvin -> *drain* -> Q scales ->
+fence -> cfg QKF -> QK issue -> *drain*) and **S6b** (all six warps: finalize). Verified in the
+preprocessed body: after the flag, the only concurrency left anywhere in the tile is the warp-0 SF
+pack against the warps-1-5 requant convert in S4, which is SIMT-vs-SIMT and touches no mesh, no DMA
+and no gemmini port. Every mesh operation is issued and drained inside one barrier-bracketed stage
+with the other five warps at a barrier. It costs roughly +12k cyc/tile; that is the point.
+
+It also happens to be the right experiment for the **one remaining** candidate (ordering across
+different accumulator rows), because it puts the QK compute, the accumulator -> spad store and the
+PV compute in three different stages each separated by a real drain.
+
+`FA_ST_NOOVL` adds a stage, so it emits **8** marks per tile, not 7.
+
 ## "The non-pipelined FULL_ATTN2 path" is not actually serialized -- check before assuming
 
 The plan names the non-pipelined `FULL_ATTN2 FA_STEADY` body as the de-overlapped option. It has
