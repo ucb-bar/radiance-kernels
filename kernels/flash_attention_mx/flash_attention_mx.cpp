@@ -3898,6 +3898,31 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 #    define FA_SPTILES 6
 #  elif defined(FA_NT8)
 #    define FA_SPTILES 8
+// ==== TILE COUNTS THAT MATCH A REAL INVOCATION, WHICH IS THE GATE THAT ACTUALLY MATTERS. =========
+// The corruption onset in this family is at a SPECIFIC tile (measured: 4, 5, 7 in different builds),
+// not scattered, and it LATCHES once it starts -- so a configuration whose onset is at tile 12 or 30
+// passes every gate this campaign has and still fails every real kernel invocation.  The relevant
+// count is per FA-KERNEL INVOCATION (the GPU is reset between kernels), NOT per model forward pass.
+// TinyLlama-1.1B, one head, S=2048 causal, Sq=64 / Sk=256:  sum_{m=1..32} ceil(m/4) = 144 tiles.
+// This harness counts tiles PER CLUSTER across 2 clusters, so 144 tiles == 72 tiles/cluster == NT72,
+// which makes the real gate exactly measurable rather than a statistical extrapolation.
+// COST, so nobody under-budgets it: ~44k cyc/tile x 72 + ~67k boot ~= 3.24M cycles, and VCS runs
+// this design at ~91-95 cycles/sec => ~10 HOURS of wall clock.  It is the long pole; start it first.
+// AND THE BUDGET RULE IS 1:1, NOT N/2 -- fa_launch_safe.sh's header comment is STALE.  Its third
+// argument is passed straight through as fa_run.sh's BUDGET, and fa_run.sh sets MC=BUDGET*2 with
+// +max-cycles counting HALF cycles, so the run stops at BUDGET cycles exactly.  Verified: P2K and
+// P8K were launched with BUDGET=900000 and both $finish at 1,800,000,500 ps = 900,000 cycles at
+// 2000 ps/cycle.  So NT72 wants BUDGET ~= 4,200,000 (30% headroom), not 7,000,000.
+#  elif defined(FA_NT12)
+#    define FA_SPTILES 12
+#  elif defined(FA_NT16)
+#    define FA_SPTILES 16
+#  elif defined(FA_NT24)
+#    define FA_SPTILES 24
+#  elif defined(FA_NT36)
+#    define FA_SPTILES 36
+#  elif defined(FA_NT72)
+#    define FA_SPTILES 72
 #  else
 #    define FA_SPTILES 4
 #  endif
