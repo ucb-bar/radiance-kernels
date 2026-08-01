@@ -259,6 +259,51 @@ exonerated independently: an ALU-only, MMIO-free, warp-0-only pad sweep breaks i
 (N=2048 -> 7/11, N=8192 -> 6/10), and exactly one cluster fails per run with *which* one flipping
 between k=1 and k=2 under symmetric code -- a loop that corrupted whoever ran it would hit both.
 
+## The accumulator drain is CORRECTLY covered already -- measured, not argued
+
+From the waveform, on the banked config: **MMIO `0x20` (`io_busy`) falls in the *same cycle* as the
+last accumulator write**, while `0x28` (`runningLoops`) falls 141 cycles earlier.
+
+| signal | ps | cycle | |
+|---|---|---|---|
+| `runningLoops` 1->0 | 182,361,000 | 91,180 | MMIO `0x28` -- what `WCNT` waits on |
+| last `acc_mems_0.io_write_valid` | 182,643,000 | 91,321 | data actually final |
+| **`io_busy` 1->0** | **182,643,000** | **91,321** | MMIO `0x20` -- coincides **exactly** |
+
+Confirmed on the second drain (the `fa_store_acc` `loop_ws`): `runningLoops` falls at 184,415,000,
+`io_busy` at 184,705,000 -- a 145-cycle gap, same shape.
+
+This resolves what looked like a contradiction in the `FA_SP_WCNT` note. Both claims were true but
+about opposite ends: **`io_busy` can false-negative at the START** (it has not risen yet if polled
+immediately after issue), while **`runningLoops` cannot, but false-negatives at the END by ~141
+cycles**. The correct drain is therefore *both, in order* -- `waitcount(0)` then `busy` -- which is
+exactly what `fa_gfl` already does.
+
+**Load-bearing consequence: the accumulator drain is already correctly covered on the `WCNT` path,
+so it is NOT the surviving hazard.** That is independent support for the different-accumulator-rows
+candidate over anything drain-shaped, and it explains why `FA_SP_ACCPAD`'s +1,694 buys nothing
+`fa_gfl` does not already provide. A correctly-sized pad would be ~141 x 2 drains = 282 cyc/tile
+(0.62%) -- nearly free if a drain cost were the answer. It is not the answer.
+
+Caveat on the measurement: `io_busy` shows two 3-cycle glitch pulses between the matmul drain and
+the store. Benign for `fa_gfl` (a poll landing in a gap correctly reads "not busy"), but any future
+code that polls `busy` **without** the preceding `waitcount` could latch on a glitch.
+
+## Onset periodicity -- the narrowest live clue
+
+The onset is **not uniformly distributed across tiles**. Over eleven independent failing configs,
+**cluster 1 tile 7 recurs three times** (`yrs8`, `nA16`, `nP24`) with cluster 0 at tiles 9 and 12,
+while phase-perturbed runs move onset to tile 1 and pad-length variants to tile 3. A structureless
+race would scatter; **a resource turning over on a period of ~8 tiles produces exactly this.** That
+fits the one surviving candidate -- ordering across *different* accumulator rows, where a row-index
+or bank wrap turns over periodically and the per-row interlock would be insufficient.
+
+Next capture, recipe ready: cluster 1 (`cluster_prci_domain_1...radiance_gemmini_tile_6`), the tile
+6->7 boundary, narrow `+dump-start` window (a full dump is ~310 MB per 100k cycles, so size the
+window from the mark stamps first). Trace `acc_mems_0.io_write_bits_addr` against `io_write_valid`
+looking for writes to **different rows** completing out of order across the boundary, with
+`runningLoops` bracketing each matmul.
+
 ## Structural limits found (do not re-derive these)
 
 * **No matmul here can be split along M, N or K.** The mesh's scale-SRAM read row is a
