@@ -208,8 +208,8 @@ escaped. What is established:
   (`MacUnit.sv`/`MxFpMul.sv` have no clock port).
   - `0x28` (what `FA_SP_WCNT` polls) is **issue-based, not retire-based**: `LoopMatmul.scala:497`
     goes `idle` inside `.elsewhen (io.cmd.fire)`, i.e. the cycle the last COMPUTE is *accepted
-    into the reservation station*, with up to 16 ex commands still queued. Residual is **>=164
-    cycles and formally unbounded** (`Scratchpad.scala:220`'s 4-entry un-backpressured queue can
+    into the reservation station*, with up to 16 ex commands still queued. Residual is **unbounded and
+    occupancy-dependent** (`Scratchpad.scala:220`'s 4-entry un-backpressured queue can
     stall feeding arbitrarily). **No fixed pad can make `0x28` safe.**
   - `0x20` falls exactly **3 cycles** early, so `0x20` + 4 is the ceiling of what software can
     do. Caveats: `io.busy` has **no mesh term at all** (`Controller.scala:786`, 8 terms), and per
