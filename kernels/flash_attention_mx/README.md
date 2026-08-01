@@ -279,9 +279,26 @@ beyond the tile count you tested -- **not** a per-run probability. Concretely, N
 *where the onset sits*, not by luck of the draw: `ACCPAD`+`PREPK` is 16/16 at NT8 with onset at tile
 9, and `ACCRS` alone is 15/16 with onset at tile 7 -- one tile of margin each.
 
-**Consequence, stated plainly: no configuration measured here survives a real invocation.** A
-144-tile invocation (72/cluster) reaches every onset ever measured; even the frontier's tile-17
-onset would corrupt ~55 of 72 tiles per cluster. The utilization numbers are real and the reported
+**A full real invocation HAS been completed correctly -- on one cluster.** `mAP72` runs the frontier
+config for 72 tiles: **cluster 1 is clean for all 72**, a complete one-head TinyLlama workload
+uncorrupted. Cluster 0 fails at tile 17. So the accurate statement is *"`ACCRS`+`PREPK` completes a
+full invocation correctly on one cluster and fails at tile 17 on the other"* -- not the earlier
+blanket claim that no configuration survives a real invocation, which is **retracted**.
+
+```
+cluster 1:  0 .. 71   ALL CORRECT     <- a full 72-tile invocation, clean
+cluster 0:  0 .. 16 correct, 17-21 WRONG (then cut off by the budget wall)
+```
+
+**That asymmetry is itself a clue, and a strong one.** Both clusters run the *same binary* and the
+*same code*; only their position in the system differs (base addresses, fabric position, L2 set
+mapping). A bug that is code-dependent cannot produce clean-72 on one cluster and onset-17 on the
+other. So the remaining defect in this config is **cluster-position-dependent**, which is a much
+narrower target than "somewhere in S" and is consistent with the ~8-tile turnover periodicity.
+
+This is also the fifth exact onset confirmation (`mAP24` c0=17 matches `mAP72` c0=17), with pooled
+timing bit-identical between the two runs -- the expected behaviour of a timing-deterministic
+simulator on one binary, and a useful cross-check that the harness is sound. The utilization numbers are real and the reported
 tiles really were bit-correct -- but they are **fixed-schedule, short-run benchmarks**, and this
 kernel is not yet deployable. That is why the stability track is a separate directory.
 
