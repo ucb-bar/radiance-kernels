@@ -259,6 +259,38 @@ exonerated independently: an ALU-only, MMIO-free, warp-0-only pad sweep breaks i
 (N=2048 -> 7/11, N=8192 -> 6/10), and exactly one cluster fails per run with *which* one flipping
 between k=1 and k=2 under symmetric code -- a loop that corrupted whoever ran it would hit both.
 
+## Final frontier, and what each number is evidence of
+
+| frontier | config | cyc/tile | util | evidence |
+|---|---|---|---|---|
+| fastest at NT6 | `ACCRS`+`PREPK` | **42,344** | **38.78%** | 12/12 bit-exact, spread 6.7% |
+| fastest at NT8 | `ACCRS`+`PREPK` | **42,364** | **38.76%** | 16/16 bit-exact, spread 7.0% |
+| largest tile survived | `ACCRS`+`PREPK` | -- | -- | clean through tile **16** (c0) / **23** (c1) |
+
+`ACCRS`+`PREPK` reaches **2.4x the exposure of any other configuration** (its neighbours break at
+tiles 7-12), so it genuinely *mitigates* rather than merely reshuffling the schedule. Its onset is
+cluster 0 tile 17.
+
+**THE ONSET IS DETERMINISTIC, NOT A COIN FLIP -- this corrects an earlier "lottery" framing here.**
+`nA16` and `nA24` are the *same binary* at different tile counts and agree **exactly**: c0 = 12,
+c1 = 7. So a given build has a fixed onset tile, and rerunning it changes nothing. The observed
+"~74% of variants pass" is therefore the fraction of *configurations* whose onset happens to fall
+beyond the tile count you tested -- **not** a per-run probability. Concretely, NT8 passes by luck of
+*where the onset sits*, not by luck of the draw: `ACCPAD`+`PREPK` is 16/16 at NT8 with onset at tile
+9, and `ACCRS` alone is 15/16 with onset at tile 7 -- one tile of margin each.
+
+**Consequence, stated plainly: no configuration measured here survives a real invocation.** A
+144-tile invocation (72/cluster) reaches every onset ever measured; even the frontier's tile-17
+onset would corrupt ~55 of 72 tiles per cluster. The utilization numbers are real and the reported
+tiles really were bit-correct -- but they are **fixed-schedule, short-run benchmarks**, and this
+kernel is not yet deployable. That is why the stability track is a separate directory.
+
+**A cycle number from a corrupt run is not a measurement -- treat it as a class of error.** Three
+lever verdicts in this tree traced to exactly that: `BANKA` -304 (from a 9-ok/3-wrong run; actually
+-10 at NT6, **+28** at NT8, and 10/12 on its own), `FZ6` +1,330 (vs **+179** measured on a clean
+run), and the `2PBM` row from the unscored F6 sweep. One of them silently broke a projection: the
+39.18% forecast failed by exactly `BANKA`'s phantom -304.
+
 ## The accumulator drain is CORRECTLY covered already -- measured, not argued
 
 From the waveform, on the banked config: **MMIO `0x20` (`io_busy`) falls in the *same cycle* as the
