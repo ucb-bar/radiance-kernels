@@ -1774,6 +1774,73 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //      strided Q-scale chunks and one round of correctness).  If it aborts, Sq=32 needs (a) first and
 //      should be the recommendation for AFTER this sprint rather than a target inside it.
 //
+// (G13) *** THE MESH DRAIN, MEASURED FROM THE WAVEFORM: io_busy IS EXACT AND runningLoops IS 141
+//       CYCLES EARLY.  THIS RESOLVES THE FA_SP_WCNT CONTRADICTION AND EXONERATES THE DRAIN. ***
+//       FSDB /tmp/hsfsdb_bkFS.fsdb, banked config (QSPLIT WCNT PAX CVTX) at FA_NT2, cluster 0's
+//       gemmini (cluster_prci_domain...tile_prci_domain_2...radiance_gemmini_tile_3), prologue QK:
+//           runningLoops 0->1                        166,135,000 ps =  83,067 cyc  (matmul issued)
+//           runningLoops 1->0                        182,361,000 ps =  91,180 cyc  <- MMIO 0x28,
+//                                                                        what FA_SP_WCNT waits on
+//           last acc_mems_0.io_write_valid           182,643,000 ps =  91,321 cyc  <- data final
+//           _gemmini_io_busy 1->0                    182,643,000 ps =  91,321 cyc  <- MMIO 0x20,
+//                                                                        THE SAME CYCLE
+//       Matmul duration 8,113 cyc against the mesh model's 8,210 for QK, so this is the QK.
+//       *** DRAIN GAP = 141 CYCLES ***, and confirmed on the second drain (the fa_store_acc loop_ws):
+//       runningLoops falls 184,415,000, io_busy falls 184,705,000 -> 145 cycles, same shape.
+//       WHAT IT SETTLES.  The FA_SP_WCNT note argues runningLoops "cannot lie" because it rises in
+//       the same cycle as the command write, and that io_busy can fall straight through.  BOTH ARE
+//       TRUE, ABOUT OPPOSITE ENDS: io_busy false-negatives at the START (it has not risen yet when
+//       polled right after issue); runningLoops cannot, but it false-negatives at the END by 141
+//       cycles.  The correct drain is therefore BOTH, IN THAT ORDER -- waitcount(0) then busy --
+//       which is exactly what fa_gfl already does under FA_SP_WCNT.
+//       *** SO THE ACCUMULATOR DRAIN IS ALREADY COVERED ON THE WCNT PATH AND IS NOT THE SURVIVING
+//       HAZARD. ***  That is the load-bearing inference: it rules out every drain-shaped explanation
+//       and points at ordering across DIFFERENT accumulator rows (the AccumulatorMem interlock is
+//       per-row only).  It also says a correctly sized pad would cost 141 x 2 drains = ~282 cyc/tile
+//       = 0.62% of the 45,582-cycle banked tile, so FA_SP_ACCPAD's +68,000 is not the pad -- it is
+//       where the pad was placed -- and its 128 cycles were 13 short of even the gap it aimed at.
+//       CAVEAT ON MY OWN SIGNAL: io_busy shows two 3-cycle glitch pulses at 183,303,000 and
+//       183,457,000, between the matmul drain and the store.  Benign for fa_gfl (a poll that samples
+//       a gap correctly reads "not busy"), but code that polls busy WITHOUT the preceding waitcount
+//       could latch on a glitch.
+//       NEXT CAPTURE, for whoever owns the mechanism: cluster 1
+//       (cluster_prci_domain_1...radiance_gemmini_tile_6), the tile 6->7 boundary, tracing
+//       acc_mems_0.io_write_bits_addr against io_write_valid for two writes to DIFFERENT rows
+//       completing out of order, with runningLoops bracketing each matmul.  Size the +dump-start
+//       window from the mark stamps first: a full dump is ~310 MB per 100k cycles.
+//
+// (G12) *** THE WIDTH MECHANISM FOR THE HOST-SMEM-READ FAILURE IS REFUTED BY MY OWN EXPERIMENT.
+//       RECORDED IN FULL BECAUSE THIS ONE QUESTION HAS NOW PRODUCED THREE CONFIDENT WRONG ANSWERS. ***
+//       The prediction was: the SMEM subbanks advertise get = TransferSizes(4,4) EXACTLY
+//       (RadianceSharedMem.scala:68), so an 8-byte host Get must be fragmented and re-stitched while a
+//       4-byte one passes as a single beat -- therefore 4-byte reads should not trip
+//       "TLMonitor xbar_3: 'D' channel contains improper response size".  MEASURED, per variant:
+//           f4      SMEM mailbox, 8-byte, heaviest softmax   ASSERT @  82,468 cyc
+//           f6      SMEM mailbox, 8-byte, throttled poll     ASSERT @  98,400 cyc
+//           h2      SMEM mailbox, 8-byte                     ASSERT @ 247,237 cyc
+//           hsfLD   SMEM mailbox, 8-byte, + FA_SP_WCNT       ASSERT @ 290,934 cyc
+//           hsfRD4  SMEM mailbox, *4-byte*                   ASSERT @ 343,604 cyc   <-- REFUTES IT
+//           hsfPB   printBuf mailbox, 8-byte                 NO ASSERT, 12 of 12 correct
+//       A 4-byte Get is EXACTLY what the manager advertises, and it still asserts.  So transfer WIDTH
+//       IS NOT THE MECHANISM; it only moves WHEN the assert lands (82k -> 344k), which is the signature
+//       of a RATE- or OCCUPANCY-dependent window rather than of an illegal request.  The
+//       TransferSizes(4,4) reading is still a true RTL fact -- it just does not explain this.
+//       AND IT REINSTATES THE SUSPECT I WRONGLY DEMOTED.  I demoted RWSplitterNode's source/size
+//       truncation on the grounds that the node is "common to the working printBuf case".  IT IS NOT:
+//       RadianceCluster.scala:103 is `printBuf := clcbus.outwardNode`, DIRECT, whereas the SMEM leg is
+//       clcbus -> extClients -> TLFragmenter(4,128) -> RWSplitterNode -> subbanks.  So the splitter is
+//       on the failing path only, and its
+//           arb_in.bits.source := trim(r.bits.source, 1 << in_node.d.bits.source.getWidth)
+//           arb_in.bits.size   := trim(r.bits.size,   1 << in_node.d.bits.size.getWidth) // FIXME
+//       has exactly the shape of a fault that appears only once enough requests are outstanding: a
+//       trimmed source collides, a D beat is delivered against the wrong outstanding request, and the
+//       size it carries then cannot match -- which is precisely what the monitor reports.  The assert
+//       time also correlates INVERSELY with how hard the GPU is hammering SMEM (f4, heaviest softmax,
+//       fails first), which is what an occupancy-dependent collision looks like.
+//       THE FSDB TEST THAT SETTLES IT: does the offending D beat's source match ANY outstanding A
+//       source on that edge?  If yes, the splitter is exonerated too and the fault is downstream.
+//       *** DO NOT WRITE A FOURTH MECHANISM INTO THIS FILE WITHOUT THE A/D BEAT PAIR TO BACK IT. ***
+//
 // (G11) *** A BUILD-INPUT RULE, BECAUSE THE FIX FOR SOMEONE ELSE'S BUG LANDED MID-FLIGHT. ***
 //       FA_SM_2P's pb overrun was fixed in fd722ac (2026-07-27 19:27:15) with compile-time
 //       static_asserts, and 489ff35 / 6ff6e07 followed within half an hour, both touching pass A's
