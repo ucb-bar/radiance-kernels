@@ -95,6 +95,67 @@ so P and l stay mutually consistent -- which exonerates PV, its operand spad, V'
 finalize. Successive wrong tiles share **0 of 4096 words**, so each tile is freshly corrupted
 rather than inheriting one damaged resident operand. Values latch around 93-121% of golden.
 
+## S IS the site -- confirmed by direct measurement, and the corruption is a DRIFT
+
+`FA_SP_DUMPS` dumps per-row XOR checksums of S the instant it is resident. On one `PHASE2` run:
+
+* **cluster 0**: S identical for tiles 0-3, then **all 64 rows change at tile 4** -- and its O onset
+  is tile 4.
+* **cluster 1**: S identical at every tile, O clean at every tile. *Same run.*
+
+That replaces the earlier convex-hull *inference* with a positive localization. Three more facts fall
+out of the same checksums, free:
+
+* **Not a permutation.** 0 of 64 wrong checksums appear anywhere in the correct S, and no rotation
+  reproduces it. S is being **computed** differently -- not read from the wrong place.
+* **Fresh each tile.** Tile 4's corruption differs from tile 5's.
+* **Monotonically worse.** O Frobenius 3.567 -> 84.635 -> 114.566.
+
+**All 64 rows at once + fresh each tile + worsening + never recovering + one cluster only = a
+monotonically drifting index.** That is *not* what a per-row ordering violation looks like -- that
+would corrupt a subset of rows -- so this weighs **against** the accumulator-row-ordering candidate
+that had been the last one standing.
+
+### Leading hypothesis: the `ScaleFactorMem` odometer, with its falsifying test
+
+`ScaleFactorMem` has no reset path; it re-zeros only on a complete sweep of the **live** bounds. A
+drifting scale index would corrupt every row of S at once, freshly each tile, cumulatively, and
+independently per cluster -- which matches every observation above, **including the
+cluster-position dependence** (cluster 1 completes all 72 tiles clean while cluster 0 fails at 17 in
+the very same binary).
+
+`FA_ST_CFGPRE` (a `gemmini_fence` immediately before *and* after `CONFIG_SCALE_MEM`) **refutes the
+obvious trigger** -- and does worse than nothing: it pulls the onset *in* (cl1 to tile 3 under
+`PHASE1` and tile 1 under `PHASE2`, where the unfixed reference has cl1 clean).
+
+The remaining way to slip the odometer is a matmul performing a **different number of scale-enabled
+reads** than `bound_i * bound_j * bound_k * 16`. Contention causes exactly that, and **no software
+fence can prevent it**.
+
+**Test that would kill it:** count `read_req.fire && scaling_enable` per matmul in a waveform, on a
+run whose onset is already known. If the count matches the bound product on every matmul up to the
+onset tile, the hypothesis is dead. This is cheap now precisely *because* the onset is deterministic
+-- you know which tile to capture.
+
+## De-overlapping does something real
+
+| config | perturbation | cl0 onset | cl1 onset |
+|---|---|---|---|
+| 36% reference | `PHASE1` | **4** | none(>5) |
+| 36% + `FA_ST_CFGPRE` | `PHASE1` / `PHASE2` | none(>5) | **3** / **1** |
+| 36% + `FA_ST_CFGFENCE` | `PHASE1` | none(>5) | none(>5) |
+| 36% + `FA_ST_CFGFENCE` | **NT24**, unperturbed | **13** | **15** |
+| **`FA_ST_NOOVL`** | none / `P1` / `P2` | none(>5) | none(>5) |
+| sequential `FULL_ATTN2` | none / `P1` | none(>5) | none(>5) |
+| un-overlapped `FA_SP` | none / `P1` / `P2` / `P3` | tile-0 only | tile-0 only |
+
+The un-overlapped body's steady state survives `PHASE1`, `2` **and** `3`. Note the tile-0 prologue
+defect is a *separate* bug from the hazard -- `fa_rowdiag.py --onset` distinguishes them (tile 0
+wrong with tile 1 right means the hazard onset is **unmeasured**, not 0) and reports a missing
+cluster as **ABSENT** rather than a spurious clean, which is the FPGA case.
+
+`FA_ST_PROLOGF` did **not** fix the tile-0 prologue defect, so that drain hypothesis is dead.
+
 ## Live candidates for the real mechanism
 
 None tested yet. In rough order of suspicion:
