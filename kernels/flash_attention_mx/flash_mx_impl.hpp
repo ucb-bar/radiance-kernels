@@ -646,8 +646,15 @@ static inline uint32_t e4m3_pack4_swar(uint32_t wlo, uint32_t whi, uint32_t D2,
 //      TinyLlama-1.1B at S=2048 is 144 tiles = 72/cluster, so it reaches EVERY onset here.  NO
 //      configuration in this campaign survives a real invocation; the frontier's onset at 17 would
 //      still corrupt 55 of 72 tiles.  Report peak utilisation and largest-tile-survived separately.
-//   2. THE ONSET IS REPRODUCIBLE FOR A GIVEN BINARY (nA16 and nA24, different tile counts, identical
-//      c0=12/c1=7), so this is NOT a coin flip -- it is a deterministic function of the schedule.
+//   2. THE ONSET IS REPRODUCIBLE FOR A GIVEN BINARY -- now FOUR runs, TWO configs, FOUR tile counts,
+//      all in EXACT agreement, which is the strongest single statement in this pass:
+//          FA_SP_ACCRS        nA16 (NT16) c0=12 c1=7  ==  nA24 (NT24) c0=12 c1=7
+//          FA_SP_ACCPAD+PREPK nP24 (NT24) c0= 9 c1=7  ==  nL72 (NT72) c0= 9 c1=7
+//      So this is NOT a coin flip -- it is a deterministic function of the schedule, and the tile
+//      index at which it fires is a STABLE, CHEAP OBSERVABLE of a configuration.  Two practical
+//      consequences: (a) a config can be characterised by its onset from ONE run, no repetition
+//      needed; (b) "it passed at NT<n>" means only "its onset is > n", which is why NT8 was
+//      producing false confidence.
 //      *** AND IT CLUSTERS AT TILE 7 ACROSS THREE INDEPENDENT CONFIGS, which points at a resource
 //      that turns over on a period of ~8 tiles rather than a random race.  The waveform window that
 //      follows is cluster 1, the tile 6->7 boundary, reproducible on any of three builds. ***
