@@ -62,7 +62,28 @@ That distinction matters because the two uses have different requirements:
   first bites at tile 7 of 8 will fire constantly. A stability-oriented variant is tracked
   separately and should not be conflated with this one.
 
-**`FA_PHASE` strictly dominates NT8; NT8 is NOT a sufficient gate.** Measured across five
+**NT8 is NOT a sufficient gate, and here is the measurement that proves it.** `FA_SP_ACCRS` alone,
+run at NT16, has **two different onsets**: cluster 0 goes wrong at **tile 12**, cluster 1 at
+**tile 7**. Both latch and never recover.
+
+```
+cluster 0:  0-11 correct,  12 13 14 15 WRONG
+cluster 1:  0-6  correct,   7  8  9 10 11 12 13 14 15 WRONG
+```
+
+| gate | reaches | verdict |
+|---|---|---|
+| NT6 | tile 5 | 12/12 -- **both onsets invisible** |
+| NT8 | tile 7 | 15/16 -- catches cluster 1 by exactly **one tile** |
+| NT16 | tile 15 | **19/32** -- catches both |
+
+Cluster 0's onset at tile 12 is unreachable at NT8 and would have passed every gate this campaign
+used for weeks. NT8 caught cluster 1 with a single tile of margin -- luck, not headroom. Extrapolated
+to a real 144-tile invocation (72/cluster), this config would produce **~65 of 72 wrong tiles per
+cluster**: a 12-of-12 NT6 pass and a production-unusable kernel, simultaneously. That is the whole
+gap between "peak utilization at a fixed schedule" and "survives an invocation", in one run.
+
+**`FA_PHASE` also strictly dominates NT8.** Measured across five
 configurations -- every one fails somewhere:
 
 | config | cyc/tile | unperturbed | NT8 | P1 | P2 | P3 |
