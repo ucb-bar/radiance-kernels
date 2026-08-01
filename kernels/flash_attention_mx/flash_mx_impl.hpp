@@ -593,6 +593,70 @@ static inline uint32_t e4m3_pack4_swar(uint32_t wlo, uint32_t whi, uint32_t D2,
 // ============================================================================================
 //
 // ============================================================================================
+// *** SEVENTH-PASS FRONTIER (2026-07-31).  PEAK UTILISATION 38.78% AT NT6 / 38.76% AT NT8, BOTH
+// BIT-EXACT, AND THE CORRECTNESS GATE IS "LARGEST TILE INDEX SURVIVED" RATHER THAN NT6/NT8. ***
+//
+//   config = FULL_ATTN2 FA_SP QOVL LEANCFG QKACC PKOVL QSPLIT WCNT PAX CVTX FA_SM_2P FA_SM_2PRAW
+//            + FA_SP_ACCRS + FA_SP_PREPK          (GPU image c97d00047b189c9b at FA_NT8)
+//   FA_NT6  (zAP6)   42,344 cyc/tile  38.78%  spread 6.7%  12 of 12
+//   FA_NT8  (zAP8)   42,364 cyc/tile  38.76%  spread 7.0%  16 of 16
+//   FA_NT24 (mAP24)  42,373                   spread 7.4%  41 of 46 -- cluster 0 onset at TILE 17,
+//                                                          cluster 1 clean through tile 23
+//   vs the git-tagged fa-mx-best-36.02: -3,234 cyc/tile, +2.75 POINTS, at the same 16 of 16.
+//   (mAP24's mean is NOT quotable -- 5 wrong tiles -- but it agrees with the two clean runs to
+//    within 30 cycles, which is a useful consistency check on the clean numbers.)
+//
+// LEVER ACCOUNTING, all measured on this base, all bit-exact by construction:
+//   FA_SP_ACCRS   -1,915 vs the ACCPAD base, -196 vs E1.  Deletes the pre-store fa_gfl and lets
+//                 ReservationStation's "raw for st b <- ex a" clause order the accumulator read.
+//   FA_SP_PREPK   -306 here (-434 on the ACCPAD base).  The only lever that survived the pass.
+//   FA_SP_BANKA   *** REFUTED: -10 at NT6, +28 at NT8, i.e. noise, and WRONG on its own (zAB6,
+//                 10 of 12).  Its recorded -304 came from ybk1, a 9-ok/3-WRONG run. ***
+//   FA_SP_ACCPAD  +1,694 and buys nothing that survives; FA_SM_2PBM +5,390; CVTXS +4,766;
+//                 FA_SP_FZ6 +179 here against a recorded +1,330 that also came from an unscored run.
+//   THREE recorded lever values (BANKA -304, FZ6 +1,330, 2PBM's row) traced to runs whose own tiles
+//   were wrong.  A cycle number from a corrupt run is not a measurement -- and this is the third
+//   time that artifact has set a verdict in this file.
+//
+// *** THE CEILING OF THIS PIPELINE SHAPE IS ~38.8%, AND 40% NEEDS A DIFFERENT SHAPE. ***  My own
+// projection of 39.18% failed by exactly BANKA's phantom -304.  What is left is SIMT: 23,128 of
+// 42,650 (S2 softmax 10,028 | S3 pass-A 2,753 | S4 convert||pack 10,347) against a mesh-coupled
+// 19,514 (S5 8,881 + S6 9,635 + S1 998) that cannot shrink without splitting a matmul, which
+// structural limit 1 forbids.  Both SIMT stages are AT their floors:
+//   * S2 -- the fence budget is already spent.  FA_SM_2P is 3 fences/warp = 9 per binding core
+//     against the reference's 128; the reference->2P transition removes 119 fences for a MEASURED
+//     -2,775, i.e. 23.3 cyc/fence, which reproduces this file's own ~22.  A GROUP-OF-TWO form goes
+//     9 -> 64 fences = +1,280, SO IT IS A LOSS, NOT THE ~900 WIN PROJECTED ABOVE.  That projection
+//     is correct against the REFERENCE and inverts once FA_SM_2P is in the stack; it was not built.
+//   * S4 -- issue-bound, and FA_SP_CVTSWAR already lost there with 56 FEWER instructions.
+// So the remaining ~1,300 to 41,050 has no identified source in this shape.  The Sq=32
+// double-buffered restructure (PROJECTED, not measured) is the identified next step: it makes tile
+// i's PV overlap tile i+1's softmax, the one overlap this single-buffer map cannot express.
+//
+// *** AND THE CORRECTNESS GATE HAS MOVED, WHICH IS THE MOST TRANSFERABLE RESULT OF THE PASS.  THE
+// ONSET IS DETERMINISTIC, CONFIG-DEPENDENT, AND OFTEN BEYOND NT8. ***
+//   E1+PREPK (no pad, no ACCRS)      onset c0 t3      11 of 16 at NT8
+//   FA_SP_ACCPAD_N4 base             onset c0 t3       9 of 12 at NT6
+//   FA_SP_ACCRS alone                onset c1 t7, c0 t12   -- NT16 AND NT24 AGREE EXACTLY
+//   FA_SP_ACCPAD + PREPK             onset c1 t7, c0 t9    -- yet 16 of 16 at NT8
+//   FA_SP_ACCRS + PREPK (frontier)   onset c0 t17, c1 none through t23
+// TWO CONSEQUENCES:
+//   1. NT8 PASSES BY LUCK.  ACCPAD+PREPK is 16-of-16 at NT8 with an onset at tile 9, and ACCRS alone
+//      is 15-of-16 with an onset at 7 -- one tile of margin in each case.  A real invocation of
+//      TinyLlama-1.1B at S=2048 is 144 tiles = 72/cluster, so it reaches EVERY onset here.  NO
+//      configuration in this campaign survives a real invocation; the frontier's onset at 17 would
+//      still corrupt 55 of 72 tiles.  Report peak utilisation and largest-tile-survived separately.
+//   2. THE ONSET IS REPRODUCIBLE FOR A GIVEN BINARY (nA16 and nA24, different tile counts, identical
+//      c0=12/c1=7), so this is NOT a coin flip -- it is a deterministic function of the schedule.
+//      *** AND IT CLUSTERS AT TILE 7 ACROSS THREE INDEPENDENT CONFIGS, which points at a resource
+//      that turns over on a period of ~8 tiles rather than a random race.  The waveform window that
+//      follows is cluster 1, the tile 6->7 boundary, reproducible on any of three builds. ***
+// BUDGET WARNING FOR LONG-NT RUNS: a corrupt run is MUCH slower than a clean one (nP24's cluster 0
+// managed 12 tiles in 1.6M cycles, ~128k/tile against a 44k nominal), so size long-NT budgets for
+// the CORRUPT case.  nP24 and mAP24 both truncated at their wall; the onset is still valid because
+// the wrong images are complete (4096/4096), but neither is an NT24 result.
+// ============================================================================================
+// ============================================================================================
 // THE PHASE SWEEP APPLIED TO EVERYTHING, INCLUDING THE GIT TAG. (2026-07-30/31)
 //
 // *** SCOPING NOTE, ADDED AFTER I OVER-CORRECTED THIS ONCE.  A FA_PHASE FAILURE DOES NOT
