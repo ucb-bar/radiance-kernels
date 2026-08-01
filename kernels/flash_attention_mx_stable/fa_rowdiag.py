@@ -77,17 +77,81 @@ def image(grp):
     return (u.reshape(64, 128).astype(np.uint32) << 16).view(np.float32)
 
 
+def onset_report(path, gf):
+    """ONSET TILE -- the observable to score a configuration by, instead of pass/fail.
+
+    Established by the perf track over four runs and two configs spanning NT16..NT72: the onset is a
+    DETERMINISTIC function of the schedule, identical at NT16 and NT24 for one config and at NT24 and
+    NT72 for another.  So it is a real-valued statistic that can be RANKED and BISECTED against, and
+    it needs no repetition -- whereas "passed at NT n" carries exactly the information "onset > n",
+    which is why NT8 gave false confidence for weeks.
+
+    Reported per cluster, since the two clusters have different onsets in every failing run seen
+    (7/9, 7/12, 7/17 in the perf track's data).  Conventions that matter:
+      * onset = the FIRST wrong tile index, 0-based, or "none(>N-1)" if all N complete images are
+        correct -- printed that way so a clean run cannot be mistaken for a measured onset.
+      * INCOMPLETE images (a still-growing trace) are excluded and the exclusion is stated: an
+        incomplete tail must never be read as an onset.
+      * a TILE-0-ONLY failure with a correct tile 1 is called out separately, because in this
+        directory that is the un-overlapped path's PROLOGUE defect and NOT the timing hazard --
+        conflating them would report onset 0 for a config whose hazard onset is unmeasured.
+    """
+    gr = groups_of(path)
+    out = []
+    for c in (0, 1):
+        if not gr[c]:
+            # ONE-CLUSTER RUNS ARE NOT FAILURES.  The FPGA board carries 1 of the 2 clusters, so the
+            # same kernel yields HALF the tile-images (NT6 = 6, not 12) and cluster 1 is simply
+            # absent.  Saying "absent" rather than letting the empty case fall through to
+            # "onset none(>-1)" is the difference between a readable hardware result and a scary one.
+            out.append(f"cl{c}: ABSENT (no O stores -- expected on a 1-cluster board)")
+            continue
+        verdicts, ncomplete = [], 0
+        for grp in gr[c]:
+            if len(grp) < NW:
+                verdicts.append(None)
+                continue
+            ncomplete += 1
+            f = image(grp)
+            rel = float(np.linalg.norm(np.nan_to_num(f) - gf) / np.linalg.norm(gf))
+            verdicts.append(abs(rel * 100 - 3.5666) < 0.05 and not np.isnan(f).any())
+        wrong = [i for i, v in enumerate(verdicts) if v is False]
+        nincomplete = sum(1 for v in verdicts if v is None)
+        if not wrong:
+            s = f"cl{c}: onset none(>{ncomplete - 1})"
+        elif wrong == [0] and len(verdicts) > 1 and verdicts[1]:
+            s = f"cl{c}: TILE-0-ONLY (prologue defect); hazard onset none(>{ncomplete - 1})"
+        elif wrong[0] == 0 and len(verdicts) > 1 and verdicts[1]:
+            later = [w for w in wrong if w > 0]
+            s = (f"cl{c}: tile0 prologue defect + hazard onset "
+                 + (f"{later[0]}" if later else f"none(>{ncomplete - 1})"))
+        else:
+            s = f"cl{c}: onset {wrong[0]}"
+        s += f"  [{ncomplete} complete images"
+        if nincomplete:
+            s += f", {nincomplete} INCOMPLETE excluded"
+        s += f", wrong {wrong}]"
+        out.append(s)
+    print(f"{path.rsplit('/', 1)[-1]:20s} " + " | ".join(out))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("traces", nargs="+")
     ap.add_argument("--golden", default=None)
     ap.add_argument("--rows", action="store_true", help="print the per-row fit for every row")
+    ap.add_argument("--onset", action="store_true",
+                    help="print ONLY the per-cluster onset tile -- see onset_report()'s docstring "
+                         "for why this, and not pass/fail, is the statistic to rank configs by")
     args = ap.parse_args()
     gpath = args.golden or __file__.rsplit("/", 1)[0] + "/golden_O_u16.npy"
     g = np.load(gpath).astype(np.uint16).reshape(64, 128)
     gf = (g.astype(np.uint32) << 16).view(np.float32)
 
     for path in args.traces:
+        if args.onset:
+            onset_report(path, gf)
+            continue
         print(f"=== {path}")
         gr = groups_of(path)
         fits = {}

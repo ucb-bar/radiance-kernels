@@ -45,6 +45,96 @@ Target -- bit-correct on **all** of:
 
 **No configuration has passed this yet.** Status is tracked below rather than claimed.
 
+## Score configurations by ONSET TILE, not by pass/fail
+
+The perf track established that the onset is a **deterministic function of the schedule**, not a
+sampled race outcome: identical at NT16 and NT24 for one config, and at NT24 and NT72 for another.
+So "passed at NT *n*" carries exactly the information "onset > *n*" -- which is why NT8 gave false
+confidence for weeks -- while the onset tile is a real-valued observable that can be **ranked and
+bisected against from a single run**. `fa_rowdiag.py --onset <trace>` prints it per cluster; it
+excludes INCOMPLETE images explicitly, and it separates the un-overlapped path's **tile-0 prologue
+defect** from a hazard onset, because conflating them would report "onset 0" for a config whose
+hazard onset is actually unmeasured.
+
+### Onsets measured here (seed 12345, `NT6` unless stated)
+
+| config | perturbation | cl0 onset | cl1 onset |
+|---|---|---|---|
+| 36% config (`stD6p1`) -- the reference | `FA_PHASE1` | **4** | none(>5) |
+| 36% + `FA_ST_CFGPRE` (`stE6p1`) | `FA_PHASE1` | none(>5) | **3** |
+| 36% + `FA_ST_CFGPRE` (`stE6p2`) | `FA_PHASE2` | none(>5) | **1** |
+| 36% + `FA_ST_CFGFENCE` (`stC6p1`) | `FA_PHASE1` | none(>5) | none(>5) |
+| 36% + `FA_ST_CFGFENCE`, **NT24** (`stC24`) | none | **13** | **15** |
+| **`FA_ST_NOOVL`** (`stV6`/`p1`/`p2`) | none / `P1` / `P2` | none(>5) | none(>5) |
+| sequential `FULL_ATTN2 FA_STEADY` (`stS6`/`p1`) | none / `P1` | none(>5) | none(>5) |
+| un-overlapped `FA_SP` (`stR6`/`p1`/`p2`/`p3`) | none / `P1` / `P2` / `P3` | tile-0 only, hazard none(>5) | same |
+
+Two things to read off this. **`FA_ST_CFGPRE` makes the hazard *worse*** -- it pulls cl1's onset in
+to 3 (`PHASE1`) and 1 (`PHASE2`), where the unfixed reference has cl1 clean at NT6. That is a
+stronger refutation than "it didn't help". And **the un-overlapped `FA_SP` body's steady state
+survives `FA_PHASE1`, `FA_PHASE2` *and* `FA_PHASE3`** at NT6 with only its tile-0 prologue defect --
+so de-overlapping does something real. NT24 runs for `FA_ST_NOOVL` (`stV24`, `stV24p1`, `stV24p2`),
+the fully de-overlapped body (`stM24`), the reference (`stD24`) and the sequential body (`stS24`) are
+the measurements that turn "none(>5)" into a number.
+
+## S IS THE SITE -- confirmed positively, per-tile and per-cluster, under FA_PHASE
+
+`FA_SP_DUMPS` writes a per-row XOR checksum of **S** the instant `S(t)` becomes resident, before the
+softmax touches it. Q, K, V and their MX scales are loop-invariant in `FA_SP`, so `S(t)` must be
+bit-identical for every `t`. Measured on `stG6p2` = 36% config + `FA_SP_DUMPS` + `FA_PHASE2`, whose
+O onset is cl0 = 4:
+
+| | S row-checksums | O |
+|---|---|---|
+| cluster 0 | identical for tiles 0-3, then **all 64 rows change at tile 4 and stay changed** | onset 4 |
+| cluster 1 | **identical at every tile** | clean at every tile |
+
+S goes wrong in exactly the cluster and exactly the tile where O goes wrong, and nowhere else, in the
+same run. That is a *positive* localization rather than the previous convex-hull inference, and it
+rules out softmax, requant, pack, PV and finalize for this failure.
+
+### The wrong S is a DRIFT, not a fixed mis-addressing -- which kills one story and names another
+
+Three further facts, all from the same checksums at zero extra cost:
+
+* **It is not a permutation.** 0 of 64 wrong row-checksums appear anywhere in the correct S; there
+  is no rotation `k` for which the wrong S is the correct S rotated. So S is not being *read from
+  the wrong place* with the right data -- it is being *computed differently*.
+* **Tile 4's S differs from tile 5's S.** A fresh corruption each tile, not one latched error.
+* **It gets monotonically worse:** O Frobenius 3.567 (t0-t3) -> **84.635** (t4) -> **114.566** (t5),
+  reproducing the shape of the pre-existing `FA_PHASE2` record (108.6 / 113.1 / 118.2 / 119.4 /
+  119.4 -- progressive, saturating).
+
+All 64 rows at once + fresh each tile + monotonically worsening + never recovering + one cluster is
+the signature of a **monotonically drifting index that starts slipping at the onset tile**, not of a
+one-shot latch and not of a per-row ordering violation (which would corrupt a *subset* of rows).
+
+That fits `ScaleFactorMem`'s odometer exactly: `counter_i/j/k_runtime` (`ScaleFactorMem.scala:70-104`)
+advance on mesh scale reads, re-zero **only** by completing a full sweep of the *live* `loop_bound_*`
+registers, and have no reset path. Once a sweep fails to land on zero, every later gemm reads scale
+rows further off -- progressively worse, never recovering. **But `FA_ST_CFGPRE` refutes the obvious
+trigger**: fencing on both sides of `CONFIG_SCALE_MEM` does not stop it (and makes it worse). So if
+it is the odometer, the slip is *not* caused by a bound change landing mid-sweep.
+
+The remaining way to slip that odometer is for one matmul to perform a **different number of
+scale-enabled reads** than `bound_i x bound_j x bound_k x 16` -- a read replayed or dropped under
+scale-port/SMEM contention. That would be triggered by exactly the contention `FA_PHASE` perturbs,
+and it would be **immune to any software fence**, because a fence orders *commands* and not the
+mesh's internal read stream. It also predicts that de-overlapping pushes the onset out, which is
+what the `NT6` phase results and the perf track's `ACCRS`+`PREPK` onset of 17 both show.
+**This is a hypothesis with a named test, not a claim:** the test is a waveform count of
+`read_req.fire && scaling_enable` per matmul, checked against `bound_i*bound_j*bound_k*16`, on a run
+whose onset tile is known -- which is now cheap to arrange, because the onset is deterministic.
+
+### Reading a 1-cluster (FPGA) run
+
+The board carries 1 of the 2 clusters, so the same kernel yields **half** the tile-images (`NT6` = 6,
+not 12) and cluster 1 is simply absent. `fa_rowdiag.py --onset` prints
+`cl1: ABSENT (no O stores -- expected on a 1-cluster board)` rather than letting the empty case fall
+through to a scary-looking `onset none(>-1)`. Verified against a synthetically 1-clusterized trace.
+The surviving mechanism candidate is intra-cluster and `FA_PHASE_BOTH` already argued against an
+inter-cluster contest, so a 1-cluster board is well matched to what is actually being tested.
+
 ## Status
 
 | gate | best known |
