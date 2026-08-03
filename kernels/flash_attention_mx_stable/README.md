@@ -175,9 +175,44 @@ what the `NT6` phase results and the perf track's `ACCRS`+`PREPK` onset of 17 bo
 > `counter_k_runtime` (the slowest of the three) to get a compact per-matmul picture;
 > `counter_i_runtime` changes every 16 reads and will swamp any change list.
 >
-> **Not yet answered, and it is the whole question:** does `counter_k_runtime` reach `bound_k - 1`
-> and wrap to 0 at the end of *every* matmul, or does some sweep fail to land on zero before the
-> hang at cycle 169,778? The capture had reached only ~cycle 100,000 when this was written.
+> #### MEASURED, AND IT GOES AGAINST THE HYPOTHESIS: the odometer is NOT stranded at the hang
+>
+> Capture completed (474 MB, to cycle 200,000; the hang is at 169,778). Point-sampled at
+> **t = 380,000,000 ps = cycle 190,000, i.e. ~20,000 cycles into the hang**:
+>
+> | signal | cluster 0 (`gemmini_tile_3`) | cluster 1 (`gemmini_tile_6`) |
+> |---|---|---|
+> | `counter_i_runtime` | **0** | -- |
+> | `counter_j_runtime` | **0** | **0** |
+> | `counter_k_runtime` | **0** | **0** |
+>
+> `counter_i_runtime` is also 0 at cycle 125,000, and `loop_bound_k = 8` (the QK half-tile value) is
+> live at cycle 98,000. **The odometer reads (0,0,0) at the hang, in both clusters -- it is not
+> stranded at a nonzero value.** Per the criterion pre-registered above, that is **evidence against
+> the drift hypothesis for this failure**, and it is recorded as such rather than reaching for a
+> reason it might not count.
+>
+> **The one caveat that keeps it from being a clean kill**, stated because it is real and not because
+> it rescues anything: `(0,0,0)` is *also* what the odometer reads if the failing matmul never fed a
+> single row, so its sweep never started. A clean wrap and a never-started sweep are identical at this
+> sample point. Distinguishing them needs the *sequence* across the failing matmul, not a point
+> sample -- and see the tool caveat below for why that is harder than it looks.
+>
+> **Scope limit, also worth being explicit about:** this is a *hang* (`Sq=32`, a PV half-tile that
+> never retires). The `Sq=64` onset corruption is a different failure mode -- wrong data, no hang --
+> and nothing here transfers to it automatically. The drift hypothesis is damaged for the hang; for
+> the onset it remains untested.
+>
+> #### TOOL CAVEAT: `fsdb_signal_changes` windowing is unreliable here -- use point samples
+>
+> Asked for changes in `[300000000, 400000000]`, the MCP returned `num_changes: 4` listing changes at
+> **191,739,000 / 192,763,000 / 193,787,000** -- outside the requested window -- with the first entry
+> stamped at the window start. So a change list from this tool must not be read as "these are all the
+> changes in this window", and a conclusion like *"counter_k only reached 3, so the sweep never
+> completed"* is **not supportable from it** -- it would also contradict the RTL, where
+> `ScaleFactorMem.scala:95-99` clears `counter_k` only from `bound_k - 1`. `fsdb_signal_value` at an
+> explicit time is self-consistent and is where every number in the table above comes from. Anyone
+> reconstructing a per-matmul *sequence* should sample on a time grid rather than trust a change list.
 >
 > **REVISED OBSERVABLE:** the per-matmul **odometer state sampled at each bounds change** --
 > `counter_i/j/k_runtime` immediately before and after every `CONFIG_SCALE_MEM` -- and not any total
