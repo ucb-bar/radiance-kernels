@@ -5620,8 +5620,30 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 #    define FA_NTILES 6
 #  elif defined(FA_NT8)
 #    define FA_NTILES 8
+// *** THESE FIVE WERE MISSING AND THE OMISSION IS SILENT. ***  FA_NT12/16/24/36/72 were added to
+// FA_SPTILES (the FA_SP body) but not here, so `FULL_ATTN2 FA_STEADY FA_NT24` fell through to the
+// `!defined(FA_NTILES)` default and ran FOUR tiles -- with no warning, a normal $finish, and a
+// perfectly clean 4-tile result.  Measured: stS24 stopped at 428,097 cycles with 4 tile tops when
+// 24 were asked for, which reads as "onset none(>3)" and would have been quoted as a 24-tile pass.
+// An unrecognised FA_NT<n> must therefore be a BUILD ERROR, never a default -- see the #error below.
+#  elif defined(FA_NT12)
+#    define FA_NTILES 12
+#  elif defined(FA_NT16)
+#    define FA_NTILES 16
+#  elif defined(FA_NT24)
+#    define FA_NTILES 24
+#  elif defined(FA_NT36)
+#    define FA_NTILES 36
+#  elif defined(FA_NT72)
+#    define FA_NTILES 72
 #  elif !defined(FA_NTILES)
 #    define FA_NTILES 4
+#  endif
+#  if defined(FA_NTILES) && (defined(FA_NT12) || defined(FA_NT16) || defined(FA_NT24) \
+      || defined(FA_NT36) || defined(FA_NT72))
+#    if FA_NTILES == 4
+#      error "FA_NT12/16/24/36/72 was requested but FA_NTILES fell through to the default 4 -- a tile count was silently ignored"
+#    endif
 #  endif
     // Per-iteration state that must be re-established: NONE. online_softmax_block is called with
     // first=1 so m/l are re-initialized; S/PBF/O_acc/spad-A/spad-B/SF_MEM are all fully rewritten

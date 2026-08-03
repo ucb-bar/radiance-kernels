@@ -176,8 +176,42 @@ inter-cluster contest, so a 1-cluster board is well matched to what is actually 
 |---|---|
 | NT6 (12 images) | several configs, 12/12 |
 | NT8 (16 images) | `FA_SP_ACCPAD`+`FA_SP_PREPK`, 16/16 |
-| NT72 (~1 TinyLlama head) | **not yet measured** (~3.3M cycles, ~10 h sim) |
-| `FA_PHASE1/2/3` | **none** -- every config measured fails at least one k |
+| NT72 (~1 TinyLlama head) | **`FA_ST_NOOVL`, 144 of 144 tile-images** (`stV72`) |
+| `FA_PHASE1/2/3` | `FA_ST_NOOVL`: `P1` and `P2` clean at NT6 **and NT24**; `P3`/`BOTH` in flight |
+
+### `FA_ST_NOOVL` -- the first configuration to survive a large NT
+
+| run | config | tiles | perturbation | result |
+|---|---|---|---|---|
+| `stV72` | `FA_ST_NOOVL` | **NT72** | none | **144/144, onset none(>71) both clusters** |
+| `stV24` | `FA_ST_NOOVL` | NT24 | none | 48/48, onset none(>23) both |
+| `stV24p1` | `FA_ST_NOOVL` | NT24 | `FA_PHASE1` | **48/48, onset none(>23) both** |
+| `stV24p2` | `FA_ST_NOOVL` | NT24 | `FA_PHASE2` | **48/48, onset none(>23) both** |
+| `stM24` | fully de-overlapped + `LEANCFG` | NT24 | none | 48/48, onset none(>23) both |
+| `stD24` | **the 36% reference** | NT24 | none | **cl0 onset 13**, cl1 none(>23) |
+| `stC24` | 36% + `FA_ST_CFGFENCE` | NT24 | none | **cl0 onset 13**, cl1 onset 15 |
+
+NT72 is 144 tile-images = one full TinyLlama head at `Sq=64`/`Sk=256` causal, i.e. the exposure a real
+kernel invocation actually sees. **Still outstanding before the gate is met:** `FA_PHASE3`,
+`FA_PHASE_BOTH` (both `k`), and an explicit `NT8` -- all four launched (`stV24p3`, `stV24b1`,
+`stV24b2`, `stV8`). Nothing measured so far fails, but the gate is not passed until those land.
+
+Two side results from the same table. `FA_ST_CFGFENCE` leaves cl0's unperturbed onset at **13**,
+identical to the unfixed reference -- so it is **not a fix**, and its clean `FA_PHASE1` run at NT6 was
+a reshuffle. And the fully de-overlapped body (`stM24`) is clean to 23 as well, so the robustness is
+not specific to `FA_ST_NOOVL`'s particular staging -- it tracks *removing the overlap*.
+
+### What it costs
+
+| config | cyc/tile (steady, NT24) | util | onset |
+|---|---|---|---|
+| 36% reference (`stD24`) | 45,827 | 35.83% | 13 |
+| **`FA_ST_NOOVL`** (`stV24`) | **57,256** | **28.68%** | none(>71) |
+| fully de-overlapped (`stM24`) | 63,952 | 25.68% | none(>23) |
+
+`FA_ST_NOOVL` buys the exposure from tile 13 to beyond tile 71 for **25% more cycles per tile**
+(35.83% -> 28.68% utilization). Per this directory's charter that is a good trade; per the sibling's
+it is not, which is exactly why there are two directories.
 
 Everything below was measured with the scripts and tools in this directory; the run set is
 reconstructible from disk with **`./fa_runtable.sh /tmp/struns`** (tag, whether the sim reached
@@ -553,7 +587,22 @@ far better than three days of flag A/B has managed.
 
 ## Building, running, verifying
 
-Identical to the sibling -- see [`../flash_attention_mx/README.md`](../flash_attention_mx/README.md)
+**`FA_NT<n>` HAD A SILENT HOLE, NOW A BUILD ERROR.** `FA_NT12/16/24/36/72` were added to `FA_SPTILES`
+(the `FA_SP` body) but **not** to `FA_NTILES` (the sequential `FULL_ATTN2 FA_STEADY` body), so
+`FULL_ATTN2 FA_STEADY FA_NT24` fell through to the default and ran **four** tiles -- normal `$finish`,
+no warning, and a perfectly clean 4-tile result that would have been quoted as a 24-tile pass.
+Measured: `stS24` stopped at 428,097 cycles with 4 tile tops. The five cases are now present, and an
+`FA_NT<n>` that falls through to the default is now `#error` -- verified by temporarily disabling the
+`FA_NT24` case and confirming the build fails.
+
+**`make kernel.s` / `make flash_attention_mx.s` silently does not rebuild** (broken rule, rc=2; a
+byte-identical file size is the only tell, and a three-week-old assembly was nearly reported as a
+fresh result on the sibling track). To read generated code, invoke the compiler directly with
+`kernel-build-env.sh` sourced -- `clang++ -S` (or `-E -P` for the preprocessed body, which is what the
+structural claims in this file were verified with) -- and then confirm the output contains a
+shape-specific symbol before trusting it.
+
+Otherwise identical to the sibling -- see [`../flash_attention_mx/README.md`](../flash_attention_mx/README.md)
 for the build, the config flags, and the **verification traps**: the only sound scorer is
 `fa_verify_tiles.py`; use `golden_O_u16.npy`; `TIMEOUT_CYCLES=N` yields only N/2 cycles; run
 `fa_regs3.py` (not `fa_regs.py`) before every sim; hash the **RV32 segments**, never `.text`; and
