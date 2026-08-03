@@ -122,9 +122,44 @@ scale-port/SMEM contention. That would be triggered by exactly the contention `F
 and it would be **immune to any software fence**, because a fence orders *commands* and not the
 mesh's internal read stream. It also predicts that de-overlapping pushes the onset out, which is
 what the `NT6` phase results and the perf track's `ACCRS`+`PREPK` onset of 17 both show.
-**This is a hypothesis with a named test, not a claim:** the test is a waveform count of
-`read_req.fire && scaling_enable` per matmul, checked against `bound_i*bound_j*bound_k*16`, on a run
-whose onset tile is known -- which is now cheap to arrange, because the onset is deterministic.
+> #### PRE-REGISTERED CRITERION, REVISED BEFORE MEASURING -- and the revision matters
+>
+> I first wrote this test as *"count `read_req.fire && scaling_enable` per matmul and compare against
+> `bound_i x bound_j x bound_k x 16`"*, with a match reading as refutation. **That criterion is wrong
+> and would have killed a live hypothesis on a null result.** From the peak track's static arithmetic
+> over the `Sq=32` shapes (`PE_M=PE_N=PE_K=16`, `mxgemm_core.hpp:318-320`):
+>
+> | cfg | M,N,K | bounds | `bi*bj*bk*16` |
+> |---|---|---|---|
+> | QK full | 64,256,128 | 4,16,8 | 8,192 |
+> | QK half | 32,256,128 | 2,16,8 | **4,096** |
+> | PV full | 64,128,256 | 4,8,16 | 8,192 |
+> | PV half | 32,128,256 | 2,8,16 | **4,096** |
+>
+> The half-tile bound product *equals* its mesh-cycle count -- one scale read per row-feed, sweep
+> complete -- and `fa_mm_acc` re-issues `gemmini_mxquant_config_mvout` with `C.PE_TILES_I/J/K()` on
+> **every** call, so each matmul latches its own bounds instead of inheriting the previous ones. Per
+> 64 query rows the totals are **identical** across shapes: 16,384 scale reads, 768 A-scale writes.
+> **So "the count matches" is the EXPECTED result on both shapes and carries no information about the
+> odometer.**
+>
+> **The hypothesis is a RATE hypothesis, not a COUNT hypothesis.** What `Sq=32` changes is not the
+> read count but the number of matmuls per 64 rows, **2 -> 4**, and hence the number of
+> `CONFIG_SCALE_MEM` issuances and bounds *changes*:
+>
+> * drift **per scale read** => `Sq=32` behaves like `Sq=64` (identical total reads);
+> * drift **per matmul / per bounds change** => `Sq=32` accumulates at **twice the rate** and should
+>   fail about twice as early.
+>
+> Measured, and consistent with the second: `Sq=64` fails at tiles 7-17 while `Sq=32` dies at
+> **half-tile 1-2** -- sooner by well more than 2x.
+>
+> **REVISED OBSERVABLE:** the per-matmul **odometer state sampled at each bounds change** --
+> `counter_i/j/k_runtime` immediately before and after every `CONFIG_SCALE_MEM` -- and not any total
+> count. Confirmation is `counter_* != 0` at a bounds change; refutation is `counter_* == 0` at every
+> bounds change up to and including the failing matmul. All six signals are `dontTouch`'d
+> (`ScaleFactorMem.scala:73-75`, `ExecuteController.scala:163-165`), so they survive into the netlist
+> and are directly probeable.
 
 ### Reading a 1-cluster (FPGA) run
 
