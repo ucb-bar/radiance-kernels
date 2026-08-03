@@ -154,6 +154,31 @@ what the `NT6` phase results and the perf track's `ACCRS`+`PREPK` onset of 17 bo
 > Measured, and consistent with the second: `Sq=64` fails at tiles 7-17 while `Sq=32` dies at
 > **half-tile 1-2** -- sooner by well more than 2x.
 >
+> **THE PROBE, RESOLVED AND WORKING** (so nobody re-derives the hierarchy walk). FSDB capture:
+> `/tmp/fa_fsdb_go.sh s16 200000 130000 12345`. Note `+dump-start` did **not** clip anything here --
+> the FSDB spans from time 0 regardless, which is convenient (it covers the healthy early matmuls too)
+> but means budgeting disk for the whole run: 95 MB by cycle 100k.
+> Scope, cluster 0 (`cluster_prci_domain`; cluster 1 is `cluster_prci_domain_1`, and note the module
+> is `ScalingFactorMem` while the Scala file is `ScaleFactorMem.scala`):
+>
+> ```
+> TestDriver.testHarness.chiptop0.system.cluster_prci_domain.element_reset_domain_element
+>   .tile_prci_domain_2.element_reset_domain_radiance_gemmini_tile_3.gemmini.spad.acc_mems_0
+>   .scaleFactorMem.{counter_i_runtime, counter_j_runtime, counter_k_runtime,
+>                    io_scaleMemCntl_loop_bound_{i,j,k}, read_row_addr_{act,w}}
+> ```
+>
+> **Healthy baseline measured on `s16` (`Sq=32`, `NT16`), cluster 0.** `counter_k_runtime` advances
+> `0 -> 1 -> 2 -> 3` at 191.739 / 192.763 / 193.787 Mps, i.e. **one increment every 512 cycles
+> exactly** -- which is `bound_i x bound_j x 16 = 2 x 16 x 16 = 512` for the QK half-tile, so the
+> odometer is behaving as derived and the units are confirmed. Use `fsdb_signal_changes` on
+> `counter_k_runtime` (the slowest of the three) to get a compact per-matmul picture;
+> `counter_i_runtime` changes every 16 reads and will swamp any change list.
+>
+> **Not yet answered, and it is the whole question:** does `counter_k_runtime` reach `bound_k - 1`
+> and wrap to 0 at the end of *every* matmul, or does some sweep fail to land on zero before the
+> hang at cycle 169,778? The capture had reached only ~cycle 100,000 when this was written.
+>
 > **REVISED OBSERVABLE:** the per-matmul **odometer state sampled at each bounds change** --
 > `counter_i/j/k_runtime` immediately before and after every `CONFIG_SCALE_MEM` -- and not any total
 > count. Confirmation is `counter_* != 0` at a bounds change; refutation is `counter_* == 0` at every
