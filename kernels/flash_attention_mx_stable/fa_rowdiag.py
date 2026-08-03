@@ -100,11 +100,22 @@ def onset_report(path, gf):
     out = []
     for c in (0, 1):
         if not gr[c]:
-            # ONE-CLUSTER RUNS ARE NOT FAILURES.  The FPGA board carries 1 of the 2 clusters, so the
-            # same kernel yields HALF the tile-images (NT6 = 6, not 12) and cluster 1 is simply
-            # absent.  Saying "absent" rather than letting the empty case fall through to
-            # "onset none(>-1)" is the difference between a readable hardware result and a scary one.
-            out.append(f"cl{c}: ABSENT (no O stores -- expected on a 1-cluster board)")
+            # THREE DIFFERENT THINGS LOOK LIKE "no images", and giving them all one name produces a
+            # false signal in both directions:
+            #   * the OTHER cluster HAS images -> this really is a 1-CLUSTER run.  The FPGA board
+            #     carries 1 of the 2 clusters, so the same kernel yields HALF the tile-images
+            #     (NT6 = 6, not 12) and the missing cluster is legitimately absent.
+            #   * NEITHER cluster has images -> the run has not reached its first finalize yet (boot
+            #     alone is ~67k cycles, ~12 min wall clock).  Calling that "ABSENT" states a hardware
+            #     fact about a run that simply has not started producing.  Observed: five freshly
+            #     launched runs all reported ABSENT, which is exactly the kind of thing that gets
+            #     copied into a table and believed.
+            # Neither case may fall through to "onset none(>-1)", which would read as a CLEAN run.
+            if gr[1 - c]:
+                out.append(f"cl{c}: ABSENT (1-cluster run -- cl{1-c} has images)")
+            else:
+                out.append(f"cl{c}: NO IMAGES YET (neither cluster has stored O -- the run has not "
+                           f"reached its first finalize; this is NOT a result)")
             continue
         verdicts, ncomplete = [], 0
         for grp in gr[c]:
