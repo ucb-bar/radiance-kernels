@@ -613,6 +613,20 @@ static inline void configure_mxgemmini(const uint32_t dim_m,
         scale_w_sel,   // B (weight) scale double-buffer select (1 = host-prefilled V scales)
         QUANT_LUT_UPDATE_GRANULARITY);
 
+    // ==== FA_ST_NOBOUNDS -- DROP THE TWO STRAY LOOP_WS_CONFIG_BOUNDS COMMANDS. ==================
+    // These two are issued OUTSIDE any gemmini_loop_ws_spad sequence, and LoopMatmul.scala:1122
+    // writes their payload into the `loop_being_configured` slot WITHOUT setting that loop's
+    // `configured` bit (only the LOOP_WS case at :1162 sets it).  So a stray pair lands in the very
+    // slot the next real LOOP_WS will use.  They are also REDUNDANT: gemmini_loop_ws_spad re-issues
+    // the bounds itself, which is why FA_SP_LEANCFG -- whose whole effect is to stop calling this
+    // function per gemm -- is the flag that makes tile 0 come out right (measured: stN6 with LEANCFG
+    // has tile 0 CORRECT in both clusters, stN7 with PAX+CVTX but no LEANCFG has the same 24-row /
+    // 1-row NaN fingerprint as the bare body).  This flag tests the narrower hypothesis: that it is
+    // specifically the stray bounds pair, and not the extra CONFIG_SCALE_MEM, that breaks tile 0.
+    // *** NOTE THIS IS NOT NEEDED BY THE DELIVERABLE.  FA_ST_NOOVL carries FA_SP_LEANCFG, so it never
+    // calls configure_mxgemmini in the loop and has no tile-0 defect (stV2/stV24/stV72 all have tile 0
+    // at 3.5666%).  This is for the non-LEANCFG de-overlapped variants and for the record. ***
+#ifndef FA_ST_NOBOUNDS
     // Configure loop bounds for the loop FSM
     // This only needs to be done once since the kernel does not change the
     // SMEM tile size
@@ -625,6 +639,7 @@ static inline void configure_mxgemmini(const uint32_t dim_m,
         C.PE_TILES_I(), C.PE_TILES_J(), C.PE_TILES_K(),
         0, 0, 0 // pad_I=0, pad_J=0, pad_K=0
     );
+#endif
     gemmini_fence();
 }
 

@@ -43,7 +43,37 @@ Target -- bit-correct on **all** of:
   invocation.
 * `FA_PHASE1/2/3` and `FA_PHASE_BOTH`
 
-**No configuration has passed this yet.** Status is tracked below rather than claimed.
+### *** THE GATE IS PASSED -- `FA_ST_NOOVL`, every point, scored with `fa_verify_tiles.py` ***
+
+| gate point | tile-images | result |
+|---|---|---|
+| `NT6` (`stV6`) | 12 | **12 correct, 0 wrong** |
+| `NT8` (`stV8`) | 16 | **16 correct, 0 wrong** |
+| `NT24` (`stV24`) | 48 | **48 correct, 0 wrong** |
+| **`NT72`** (`stV72`) -- one full TinyLlama head | **144** | **144 correct, 0 wrong** |
+| `NT24` + `FA_PHASE1` (`stV24p1`) | 48 | **48 correct, 0 wrong** |
+| `NT24` + `FA_PHASE2` (`stV24p2`) | 48 | **48 correct, 0 wrong** |
+| `NT24` + `FA_PHASE3` (`stV24p3`) | 48 | **48 correct, 0 wrong** |
+| `NT24` + `FA_PHASE1` + `FA_PHASE_BOTH` (`stV24b1`) | 48 | **48 correct, 0 wrong** |
+| `NT24` + `FA_PHASE2` + `FA_PHASE_BOTH` (`stV24b2`) | 48 | **48 correct, 0 wrong** |
+
+Onset is `none(>N-1)` in **both clusters** on every row. Config:
+
+```
+FULL_ATTN2 FA_SP FA_SP_QOVL FA_SP_LEANCFG FA_SP_QKACC FA_SP_PKOVL FA_SP_QSPLIT
+FA_SP_WCNT FA_SP_PAX FA_SP_CVTX  FA_ST_NOOVL
+```
+
+Cross-checked: `fa_rowdiag.py --onset` and `fa_verify_tiles.py` agree on every run. 57,256 cyc/tile,
+**28.68%** utilization (vs the peak track's 35.83% at onset tile 13).
+
+Two things this does **not** say. It is one seed (12345) -- and the simulator is timing-deterministic,
+so a second seed only randomises uninitialised state and is *not* a second test of the schedule;
+`FA_PHASE` and more tiles are. And `FA_PHASE` sweeps `k = 1,2,3`; a `k` beyond 3 has not been run.
+
+The **sequential `FULL_ATTN2 FA_STEADY`** body is also clean at `NT24` (`stS24b`, 48/48) now that the
+`FA_NTILES` hole is fixed -- a second, structurally unrelated de-overlapped body reaching the same
+place, which is the corroboration that matters most here.
 
 ## Score configurations by ONSET TILE, not by pass/fail
 
