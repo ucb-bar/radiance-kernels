@@ -2111,6 +2111,31 @@ static __attribute__((noinline)) void fa_mvin_B(const uint8_t *B, uint32_t spad_
 #else
 #define FA_ST_CFG_ORDER_PRE()  do { } while (0)
 #endif
+// ============================================================================================
+// FA_ST_NOOVL IS THREE INDEPENDENT REMOVALS.  These let each be put BACK one at a time.
+//
+// FA_ST_NOOVL removes three things that straddle a stage boundary in FA_SP_QSPLIT.  Collapsing them
+// into one flag was right for getting a correct baseline, and wrong for everything after: with onset
+// as the observable, re-admitting ONE overlap and watching whether the onset moves both (a) names the
+// racing stage and (b) buys cycles back if the onset does not move.  A stage whose reintroduction
+// leaves the onset absent at NT24 under FA_PHASE1/2 is free robustness-wise.
+//   FA_ST_OVL_QK   put back: QK(t+1)'s 8,210 mesh cycles running underneath finalize(t)   [~8.2k]
+//   FA_ST_OVL_DMA  put back: Q(t+1)'s 8 KB move-in DMA issued in S4, transferring into S5/S6
+//   FA_ST_OVL_SCL  put back: Q(t+1)'s 64 SF-SRAM scale stores running under the PV matmul
+// Each FA_ST_SER_* below is "this one is still serialized".  Only meaningful with FA_ST_NOOVL.
+// ============================================================================================
+#if defined(FA_ST_NOOVL) && !defined(FA_ST_OVL_QK)
+#  define FA_ST_SER_QK 1
+#endif
+#if defined(FA_ST_NOOVL) && !defined(FA_ST_OVL_DMA)
+#  define FA_ST_SER_DMA 1
+#endif
+#if defined(FA_ST_NOOVL) && !defined(FA_ST_OVL_SCL)
+#  define FA_ST_SER_SCL 1
+#endif
+#if (defined(FA_ST_OVL_QK) || defined(FA_ST_OVL_DMA) || defined(FA_ST_OVL_SCL)) && !defined(FA_ST_NOOVL)
+#  error "FA_ST_OVL_* put back one of FA_ST_NOOVL's removals; they need FA_ST_NOOVL"
+#endif
 // Issue one matmul with FULLY explicit A/B/C spad rows and SF-SRAM half selects. Async.
 template <GemmConfig C>
 static __attribute__((noinline)) void fa_mm(uint32_t a_row, uint32_t b_end, uint32_t c_row,
@@ -5041,7 +5066,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         // the DMA cannot break an accumulator->spad move-out's atomic 16-subbank grant, which is
         // the hazard FA_SP_QOVL3 hit and FA_SP_QOVL4 only relocated.  Only the ROCC ISSUE (32
         // gemmini_extended_mvin commands) is on warp 0's critical path here; the transfer is not.
-#if !defined(FA_SP_QEARLY) && !defined(FA_ST_NOOVL)
+#if !defined(FA_SP_QEARLY) && !defined(FA_ST_SER_DMA)
         /* FA_SP_QEARLY issues it at the top of stage S2; FA_ST_NOOVL issues it in stage S6a,
            where it is also DRAINED, so that no DMA transfer is ever in flight across a stage
            boundary. */
@@ -5205,7 +5230,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         fa_gf(tid);
 #endif
         fa_mm<PVF>(SP_P, SP_V_END, SP_C, /*asel=*/0, /*wsel=*/1, tid);
-#if !defined(FA_SP_HSF) && !defined(FA_ST_NOOVL)
+#if !defined(FA_SP_HSF) && !defined(FA_ST_SER_SCL)
         /* FA_ST_NOOVL moves these 64 SF-SRAM stores into stage S6a, so that nothing at all runs
            concurrently with the PV matmul. */
         if (t + 1 < (uint32_t)FA_SPTILES)
@@ -5341,18 +5366,22 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     // here: stage S1 of the next iteration drains and moves the accumulator out.
     // (Under FA_ST_NOOVL this becomes S6a and DOES drain -- see the block above.)
     if (warp == 0) {
-#ifdef FA_ST_NOOVL
-        // S6a, serialized: the whole Q(t+1) prefetch plus QK(t+1), each drained before the next
-        // step, with warps 1-5 parked at FAP_BAR(16) below.
+#if defined(FA_ST_SER_DMA) || defined(FA_ST_SER_SCL)
+        // S6a, serialized: whichever of the Q(t+1) prefetch halves is still serialized happens HERE,
+        // each drained before the next step, with warps 1-5 parked at the barrier below.
         if (t + 1 < (uint32_t)FA_SPTILES) {
+#ifdef FA_ST_SER_DMA
             fa_mvin_A<QKF>(&QK_A_in[0][0], SP_Q, FA_D, tid);
             fa_gf(tid);                 // DRAIN the 8 KB DMA -- it must not cross into S6b
+#endif
+#ifdef FA_ST_SER_SCL
             fa_scl(fa_sf_a(1), &QK_A_scales_row[0][0], QKF.SCALE_FACTORS_PER_TILE(), tid);
             mu_fence_smem();            // publish the SF stores from this warp's LSU queues
             fa_gf(tid);                 // ... and order them at the gemmini port (the QGF lesson)
+#endif
         }
 #endif
-#if defined(FA_SP_QSPLIT) && !defined(FA_ST_NOOVL)
+#if defined(FA_SP_QSPLIT) && !defined(FA_ST_SER_DMA)
         // FA_SP_QSPLIT: BOTH halves of the Q(t+1) prefetch are already done (the move-in was
         // issued in S4, the scale words were written under the PV matmul in S5), so this stage
         // contains nothing but a drain and the QK issue -- ~200 cycles instead of ~4.4k.  That is
@@ -5402,7 +5431,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
             fa_scl(fa_sf_b(1), &V_scales[0][0], PVF.SCALE_FACTORS_PER_TILE_B(), tid);
         }
 #endif
-#ifdef FA_ST_NOOVL
+#ifdef FA_ST_SER_QK
         fa_gfl(tid);        // *** DRAIN QK(t+1) HERE.  This is what removes overlap (1): finalize
                             // in S6b below can no longer run underneath the mesh. ***
     } else { asm volatile("nop"); }     // the `else` is MANDATORY (unbalanced warp-uniform region)

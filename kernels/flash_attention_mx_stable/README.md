@@ -645,6 +645,44 @@ PV compute in three different stages each separated by a real drain.
 
 `FA_ST_NOOVL` adds a stage, so it emits **8** marks per tile, not 7.
 
+### `FA_ST_NOOVL` is three independent removals -- `FA_ST_OVL_QK` / `_DMA` / `_SCL` put them back
+
+Collapsing them into one flag was right for getting a correct baseline and wrong for everything after.
+With onset as the observable, re-admitting **one** overlap and watching whether the onset moves both
+names the racing stage *and* buys cycles back when it doesn't move. Each `FA_ST_OVL_*` restores one:
+
+| flag | puts back | worth |
+|---|---|---|
+| `FA_ST_OVL_QK` | QK(t+1)'s 8,210 mesh cycles under `finalize(t)` (no S6a drain; finalize in the `else`) | ~8.2k |
+| `FA_ST_OVL_DMA` | Q(t+1)'s 8 KB move-in issued in S4, transferring into S5/S6 | smaller |
+| `FA_ST_OVL_SCL` | Q(t+1)'s 64 SF-SRAM scale stores under the PV matmul | smaller |
+
+All four shapes verified in the preprocessed body (the S5/S6 call-and-barrier sequence), and
+`FA_ST_OVL_*` without `FA_ST_NOOVL` is an `#error`.
+
+**The refactor is provably inert on the gate result:** rebuilding plain `FA_ST_NOOVL FA_NT24` after it
+reproduces RV32-segment sha `82e73680240b60f2`, byte-identical to the gate-passing `stV24` image. So
+the table above is not invalidated by the restructuring.
+
+### Utilization: target 30%, currently 28.68%
+
+Need <= 54,733 cyc/tile, i.e. **2,523 cycles**. Two levers taken first because they *cannot*
+reintroduce the hazard, both confirmed wired into this body by preprocessing (`PREPK` was found not to
+be wired into the `Sq=32` body, so this was checked rather than assumed):
+
+* **`FA_SP_ACCRS`** (~-1,915) deletes the pre-store `fa_gfl` in S1. On the peak body that rests on
+  `ReservationStation.scala`'s interlock; **here the argument is stronger and needs no interlock at
+  all** -- verified in the preprocessed body that between S6a's `fa_gfl` and the next tile's
+  `fa_store_acc` there is *no mesh operation whatsoever* (only a barrier, `finalize_O`, a barrier and
+  the marks). So `ACCRS` removes a poll of an already-drained mesh.
+* **`FA_SP_PREPK`** (-306 to -434), bit-exact by construction.
+
+In flight: `stX24`/`p1`/`p2` (`ACCRS`+`PREPK` at NT24, unperturbed + `PHASE1` + `PHASE2`) for the cycle
+number *and* confirmation that robustness is retained; `stY24`/`stY24p2` (`OVL_QK`) for the
+biggest single payback and for whether the onset moves when the mesh/SIMT overlap comes back.
+Deliberately **not** run: the group-of-two softmax (+1,280 once `FA_SM_2P` is baseline) and
+`FA_SP_ACCPAD` (+1,694 for nothing that survives perturbation).
+
 **It computes correctly** -- `stV2` (`FA_NT2`) is 3.5666% in both clusters at tile 0, so the
 restructuring is bit-exact as intended and the register budget (UPPER 219, in the unresolved
 `(216, 246]` band) does not trip the renamer. Its `FA_NT6` phase sweep (`stV6`, `stV6p1`, `stV6p2`,
