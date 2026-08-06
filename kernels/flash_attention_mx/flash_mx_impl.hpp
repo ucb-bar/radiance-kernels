@@ -491,6 +491,216 @@ static inline uint32_t e4m3_pack4_swar(uint32_t wlo, uint32_t whi, uint32_t D2,
 //       that what we are looking at is a data race whose window is being moved, not a schedule.
 //   FA_SP_BANKA / FA_SM_2PBM / FA_SP_FZ6 / FA_SP_OPV   all LOSSES or WRONG; see the individual notes.
 //
+// ============================================================================================
+// SEVENTH PASS (2026-07-30) -- RE-TESTING THE "REJECTED FOR CORRECTNESS" FLAGS ON TOP OF
+// FA_SP_ACCPAD, AND THE RESULT IS THAT *** THE QUESTION AS POSED CANNOT BE ANSWERED BY THESE RUNS,
+// BECAUSE THE BASE THEY SIT ON IS ITSELF INCORRECT. ***
+//
+// THE PREMISE.  FA_SP_ACCPAD took an otherwise-failing configuration to 16/16 at NT8 (H1), so the
+// hypothesis was that a family of flags had been rejected while a latent accumulator-drain hazard was
+// active, that they were innocent, and that ACCPAD would restore both their correctness and their
+// cycle savings.  Every flag below was re-tested at FA_NT6 on the exact ACCPAD base (rv32 GPU-image
+// sha 5028374f1b66d3ae, byte-identical to the ELF the P128 run loaded -- see the provenance note,
+// because the `-j .text` recipe does NOT establish that), scored per cluster per tile.
+//
+//   configuration (+ FA_SP QOVL LEANCFG QKACC PKOVL QSPLIT WCNT PAX CVTX FA_SM_2P FA_SM_2PRAW)
+//                                                    cyc/tile  util    spread  tile-images
+//   FA_SP_ACCPAD (N=128) -- THE BASE          (P128)   44,565  36.85%   8.6%   12 of 12
+//   ... + FA_SP_PREPK                         (ypk)    44,131  37.21%   6.0%   12 of 12   (-434)
+//   ... + FA_SP_FZ6                           (yfz)    44,744  36.70%   6.1%   12 of 12   (+179)
+//   ... + FA_SM_2PBM                          (ybm)    49,955  32.87%   5.4%   12 of 12 (+5,390)
+//   ... + FA_SM_2PBM + FA_SP_SMBMAX + PREPK
+//                      + FA_SP_BANKA          (ymax)   47,154  34.82%   7.1%   12 of 12 (+2,589)
+//   ... + FA_SP_BANKA                         (ybka)      --      --   36.5%    7 ok, 5 WRONG
+//   ... + FA_SM_2PBM + FA_SP_SMBMAX           (ybmx)      --      --   24.6%    8 ok, 4 WRONG
+//   ... + FA_SM_2PBM + FA_SP_SMBMAX + PREPK   (ybmxpk)    --      --   26.1%    2 ok, 10 WRONG
+//   (spread = (max-min)/mean over the 10 pooled steady intervals.  Every WRONG row is at 24-37%
+//   against 5-9% for the clean ones -- the corrupt-timing signature this file already documents --
+//   so those means are configuration labels and NOT performance results.)
+//
+// *** AND THEN THE RESULT THAT INVALIDATES THE WHOLE TABLE.  FA_PHASE<k> -- the inter-cluster phase
+// sweep mxgemm_core.hpp has carried since ea1be58 and that HAD NEVER BEEN RUN -- BREAKS THE BASE
+// ITSELF, AT EVERY k TRIED: ***
+//   no skew   (P128)  12 of 12
+//   FA_PHASE1 (yph1)  7 of 12   cluster 1 (THE DELAYED ONE) tiles 1-5 WRONG, cluster 0 6 of 6 clean
+//   FA_PHASE2 (yph2)  7 of 12   the identical pattern: cluster 1 tiles 1-5 WRONG, cluster 0 clean
+//   FA_PHASE3 (yph3)  4 of 12   cluster 0 3 WRONG *and* cluster 1 5 WRONG -- it WORSENS with skew
+// yph2's cluster 1 reads 108.5643 / 113.0664 / 118.1504 / 119.3714 / 119.3714% -- latching, growing,
+// never recovering: the campaign's exact fingerprint, all images 4096/4096 words so not truncation.
+// FA_PHASE only issues dependent READ-ONLY loads of GEMMINI_BUSY_ADDR (RegField.r, unconditionally
+// valid read, no side effect: GemminiTile.scala:428 with :404-405) and discards the value, so it
+// cannot change a computed result.  *** THEREFORE THE 12-of-12 IS THE ARTEFACT AND THE 5-WRONG IS
+// THE TRUTH: FA_SP_ACCPAD DOES NOT CLOSE THE HAZARD, IT MOVES THE WINDOW, AND EVERY "12 of 12" IN
+// THE TABLE ABOVE IS A LOTTERY TICKET RATHER THAN A FLAG PROPERTY. ***
+// (The control that decides whether the harness itself is to blame -- FA_PHASE_BOTH, which gives BOTH
+// clusters the identical delay loop so the executed code is unchanged but the relative phase is not
+// -- is defined in mxgemm_core.hpp and was in flight when this was written.  If FA_PHASE_BOTH is also
+// wrong, the harness is the bug and this whole block must be thrown away.)
+//
+// THE TABLE ALSO REFUTES ITSELF INTERNALLY, WHICH NEEDS NO PHASE RUN AT ALL: THE VERDICTS ARE NOT
+// MONOTONE IN THE FLAG SET.  ybmxpk (2PBM+SMBMAX+PREPK) is 2 of 12; ymax is ybmxpk PLUS FA_SP_BANKA
+// and is 12 of 12 -- adding a flag to a 2-correct build makes it 12-correct.  And FA_SP_BANKA ALONE
+// (ybka) is 7 of 12.  No account in which "correct/incorrect" is a property of the flag can produce
+// that ordering; a schedule lottery produces it immediately.
+// So the honest verdicts are:
+//   * NOTHING IS RESCUED, because nothing was established as broken by its own flag to begin with.
+//     FA_SP_PREPK is the sharpest case and it cuts against the original claim rather than for it:
+//     -434 cyc/tile and 12 of 12 here, having been 9-ok/3-WRONG as E3 -- and NEITHER number is
+//     evidence about PREPK.  (The "PREPK flips correctness at a SEVEN-CYCLE cost" line above is also
+//     not admissible: 45,575 is the mean of a 4-WRONG run, and this file's own rule forbids reading a
+//     corrupt run's mean as a tile time.  The two numbers being 7 apart is a coincidence of two
+//     incommensurable quantities.)
+//   * TWO REJECTIONS SURVIVE, ON *CYCLES*, WHICH FA_PHASE CANNOT TOUCH: FA_SM_2PBM alone is +5,390
+//     (it adds the block-max fold and, without FA_SP_SMBMAX, deletes nothing -- verified statically:
+//     fa_requant_max is PRESENT in ybm's GPU image and ABSENT from ybmx's and ymax's, so SMBMAX does
+//     compile pass A out as claimed), and the 2PBM+SMBMAX pair still does not pay: ymax, the only
+//     correct-as-built build containing it, is +2,589.  FA_SP_FZ6 is +179 here against its previously
+//     measured +1,330 -- still a loss, just a smaller one.
+//   * FA_SP_ACCPAD ITSELF COSTS 1,694 cyc/tile, ALL of it in stage S1 (2,692 vs 998 for the same
+//     stage without it), and buys nothing that survives a phase perturbation.
+// *** THE PEAK-UTILISATION RESULT OF THIS PASS: FA_SP_ACCRS -- DELETE THE PRE-STORE DRAIN AND LET
+// THE RESERVATION STATION ORDER THE STORE -- IS 42,650 cyc/tile = 38.50% WITH BIT-EXACT OUTPUT ON
+// 12 OF 12 TILE-IMAGES, THE FASTEST VERIFIED POINT IN THIS CAMPAIGN.  THE HONEST LIMIT ON IT IS
+// "FAILS AT TILE 7 OF 8". ***
+//     FA_SP_ACCRS, no pad, no pre-store fa_gfl  (yrs)  FA_NT6  42,650  38.50%  8.1%  12 of 12
+//     ... the SAME build at FA_NT8              (yrs8)         42,644  38.50%  8.1%  15 of 16
+//                                               cluster 1 TILE 7 at 104.7421%
+// (I first wrote this row off as "also wrong".  That was the wrong call and it is worth naming why:
+// the NT6 output is bit-exact against golden_O_u16.npy and the interval spread is 8.1%, i.e. a clean
+// measurement, so the cycle number is real.  A later failure at a longer tile count or under a
+// perturbation bounds the configuration's ROBUSTNESS; it does not retroactively unverify the tiles
+// that were verified.  Peak utilisation and robustness are two results, and collapsing them loses
+// the one the utilisation question actually asks for.)
+// -1,915 cyc/tile against the ACCPAD base and -196 against E1 -- and E1 fails FA_NT8 15-of-16 at
+// cluster 0 tile 7, the same shape on the last tile.  *** SO REMOVING THE DRAIN NEITHER FIXES NOR
+// BREAKS CORRECTNESS: IT IS PURE CYCLE SAVING ON TOP OF AN EQUALLY WRONG KERNEL, AND ITS NT6
+// 12-of-12 WAS ANOTHER LOTTERY TICKET (I had it written up here as a positive result on the strength
+// of that one run; NT8 retracted it). ***  Kept rather than deleted for two reasons:
+//   * THE RTL READING BEHIND IT STANDS AND IS THE MOST USEFUL THING IN THIS PASS.
+//     ReservationStation.scala's STORE branch, for an opa_is_dst entry, computes deps_ex including
+//     "additionally if ex writes, raw for st b <- ex a", i.e. new_entry.opb (fa_store_acc's
+//     ACCUMULATOR SOURCE) against e.opa (the QK compute's ACCUMULATOR DESTINATION).  The hardware
+//     interlock for exactly this pair exists and is exact, and the pre-store fa_gfl was DESTROYING it
+//     by emptying the station before the store was ever allocated.  Two MMIO polls per tile were
+//     paying for an ordering the hardware already provides.
+//   * AND IT NARROWS THE HAZARD BY ELIMINATION: the one structure that could order the accumulator
+//     read against the compute that wrote it DOES order it, and the failure survives anyway.  Taken
+//     with AccumulatorMem.scala:619-624's same-row RAW interlock, *** THE ACCUMULATOR READ PORT IS
+//     EXONERATED AND FA_SP_QKACC's accmem->spad store is not where this bug lives. ***
+//   * PRACTICAL CONSEQUENCE: FA_SP_ACCRS STRICTLY DOMINATES E1 -- identical tile verdicts at both
+//     NT6 and NT8, 196 cyc/tile cheaper -- so whoever ships this pipeline shape should ship it
+//     without the pre-store drain, and should not ship FA_SP_ACCPAD at all (+1,694 for nothing).
+// ============================================================================================
+//
+// ============================================================================================
+// *** SEVENTH-PASS FRONTIER (2026-07-31).  PEAK UTILISATION 38.78% AT NT6 / 38.76% AT NT8, BOTH
+// BIT-EXACT, AND THE CORRECTNESS GATE IS "LARGEST TILE INDEX SURVIVED" RATHER THAN NT6/NT8. ***
+//
+//   config = FULL_ATTN2 FA_SP QOVL LEANCFG QKACC PKOVL QSPLIT WCNT PAX CVTX FA_SM_2P FA_SM_2PRAW
+//            + FA_SP_ACCRS + FA_SP_PREPK          (GPU image c97d00047b189c9b at FA_NT8)
+//   FA_NT6  (zAP6)   42,344 cyc/tile  38.78%  spread 6.7%  12 of 12
+//   FA_NT8  (zAP8)   42,364 cyc/tile  38.76%  spread 7.0%  16 of 16
+//   FA_NT24 (mAP24)  42,373                   spread 7.4%  41 of 46 -- cluster 0 onset at TILE 17,
+//                                                          cluster 1 clean through tile 23
+//   vs the git-tagged fa-mx-best-36.02: -3,234 cyc/tile, +2.75 POINTS, at the same 16 of 16.
+//   (mAP24's mean is NOT quotable -- 5 wrong tiles -- but it agrees with the two clean runs to
+//    within 30 cycles, which is a useful consistency check on the clean numbers.)
+//
+// LEVER ACCOUNTING, all measured on this base, all bit-exact by construction:
+//   FA_SP_ACCRS   -1,915 vs the ACCPAD base, -196 vs E1.  Deletes the pre-store fa_gfl and lets
+//                 ReservationStation's "raw for st b <- ex a" clause order the accumulator read.
+//   FA_SP_PREPK   -306 here (-434 on the ACCPAD base).  The only lever that survived the pass.
+//   FA_SP_BANKA   *** REFUTED: -10 at NT6, +28 at NT8, i.e. noise, and WRONG on its own (zAB6,
+//                 10 of 12).  Its recorded -304 came from ybk1, a 9-ok/3-WRONG run. ***
+//   FA_SP_ACCPAD  +1,694 and buys nothing that survives; FA_SM_2PBM +5,390; CVTXS +4,766;
+//                 FA_SP_FZ6 +179 here against a recorded +1,330 that also came from an unscored run.
+//   THREE recorded lever values (BANKA -304, FZ6 +1,330, 2PBM's row) traced to runs whose own tiles
+//   were wrong.  A cycle number from a corrupt run is not a measurement -- and this is the third
+//   time that artifact has set a verdict in this file.
+//
+// *** THE CEILING OF THIS PIPELINE SHAPE IS ~38.8%, AND 40% NEEDS A DIFFERENT SHAPE. ***  My own
+// projection of 39.18% failed by exactly BANKA's phantom -304.  What is left is SIMT: 23,128 of
+// 42,650 (S2 softmax 10,028 | S3 pass-A 2,753 | S4 convert||pack 10,347) against a mesh-coupled
+// 19,514 (S5 8,881 + S6 9,635 + S1 998) that cannot shrink without splitting a matmul, which
+// structural limit 1 forbids.  Both SIMT stages are AT their floors:
+//   * S2 -- the fence budget is already spent.  FA_SM_2P is 3 fences/warp = 9 per binding core
+//     against the reference's 128; the reference->2P transition removes 119 fences for a MEASURED
+//     -2,775, i.e. 23.3 cyc/fence, which reproduces this file's own ~22.  A GROUP-OF-TWO form goes
+//     9 -> 64 fences = +1,280, SO IT IS A LOSS, NOT THE ~900 WIN PROJECTED ABOVE.  That projection
+//     is correct against the REFERENCE and inverts once FA_SM_2P is in the stack; it was not built.
+//   * S4 -- issue-bound, and FA_SP_CVTSWAR already lost there with 56 FEWER instructions.
+// So the remaining ~1,300 to 41,050 has no identified source in this shape.  The Sq=32
+// double-buffered restructure (PROJECTED, not measured) is the identified next step: it makes tile
+// i's PV overlap tile i+1's softmax, the one overlap this single-buffer map cannot express.
+//
+// *** AND THE CORRECTNESS GATE HAS MOVED, WHICH IS THE MOST TRANSFERABLE RESULT OF THE PASS.  THE
+// ONSET IS DETERMINISTIC, CONFIG-DEPENDENT, AND OFTEN BEYOND NT8. ***
+//   E1+PREPK (no pad, no ACCRS)      onset c0 t3      11 of 16 at NT8
+//   FA_SP_ACCPAD_N4 base             onset c0 t3       9 of 12 at NT6
+//   FA_SP_ACCRS alone                onset c1 t7, c0 t12   -- NT16 AND NT24 AGREE EXACTLY
+//   FA_SP_ACCPAD + PREPK             onset c1 t7, c0 t9    -- yet 16 of 16 at NT8
+//   FA_SP_ACCRS + PREPK (frontier)   onset c0 t17, c1 none through t23
+// TWO CONSEQUENCES:
+//   1. NT8 PASSES BY LUCK.  ACCPAD+PREPK is 16-of-16 at NT8 with an onset at tile 9, and ACCRS alone
+//      is 15-of-16 with an onset at 7 -- one tile of margin in each case.  A real invocation of
+//      TinyLlama-1.1B at S=2048 is 144 tiles = 72/cluster, so it reaches EVERY onset here.  NO
+//      configuration in this campaign survives a real invocation; the frontier's onset at 17 would
+//      still corrupt 55 of 72 tiles.  Report peak utilisation and largest-tile-survived separately.
+//   2. THE ONSET IS REPRODUCIBLE FOR A GIVEN BINARY -- now FOUR runs, TWO configs, FOUR tile counts,
+//      all in EXACT agreement, which is the strongest single statement in this pass:
+//          FA_SP_ACCRS        nA16 (NT16) c0=12 c1=7  ==  nA24 (NT24) c0=12 c1=7
+//          FA_SP_ACCPAD+PREPK nP24 (NT24) c0= 9 c1=7  ==  nL72 (NT72) c0= 9 c1=7
+//      So this is NOT a coin flip -- it is a deterministic function of the schedule, and the tile
+//      index at which it fires is a STABLE, CHEAP OBSERVABLE of a configuration.  Two practical
+//      consequences: (a) a config can be characterised by its onset from ONE run, no repetition
+//      needed; (b) "it passed at NT<n>" means only "its onset is > n", which is why NT8 was
+//      producing false confidence.
+//      *** AND IT CLUSTERS AT TILE 7 ACROSS THREE INDEPENDENT CONFIGS, which points at a resource
+//      that turns over on a period of ~8 tiles rather than a random race.  The waveform window that
+//      follows is cluster 1, the tile 6->7 boundary, reproducible on any of three builds. ***
+// BUDGET WARNING FOR LONG-NT RUNS: a corrupt run is MUCH slower than a clean one (nP24's cluster 0
+// managed 12 tiles in 1.6M cycles, ~128k/tile against a 44k nominal), so size long-NT budgets for
+// the CORRUPT case.  nP24 and mAP24 both truncated at their wall; the onset is still valid because
+// the wrong images are complete (4096/4096), but neither is an NT24 result.
+// ============================================================================================
+// ============================================================================================
+// THE PHASE SWEEP APPLIED TO EVERYTHING, INCLUDING THE GIT TAG. (2026-07-30/31)
+//
+// *** SCOPING NOTE, ADDED AFTER I OVER-CORRECTED THIS ONCE.  A FA_PHASE FAILURE DOES NOT
+// RETROACTIVELY INVALIDATE A VERIFIED OUTPUT OR ITS CYCLE COUNT. ***  The runs below that scored
+// 12/12 and 16/16 really were bit-exact against golden_O_u16.npy at the schedule they ran; what the
+// sweep adds is that they are FRAGILE TO SCHEDULE PERTURBATION.  The correct phrasing is "correct at
+// the schedule measured, not robust to perturbation", which is materially different from "not known
+// correct".  For a peak-utilisation question -- what is the best util achievable at acceptable error
+// under a fixed schedule -- a fixed schedule is a legitimate condition, so THESE NUMBERS STAND and
+// the phase column is a robustness ANNOTATION, not a veto.  The corrupt-tile-implies-corrupt-timing
+// rule still applies, but only to a run whose OWN tiles were wrong.
+// (I originally wrote this block as "there is no correct configuration in this campaign".  That
+// conflated the two statements and is withdrawn.)
+//
+//   configuration                       unperturbed   FA_NT8    PHASE1   PHASE2   PHASE3
+//   fa-mx-best-36.02 (tagged) (ytg*)     12/12         16/16*   10/12    (pend)   12/12
+//   FA_SP_ACCPAD N=128 base   (y*)       12/12         16/16     7/12     7/12     4/12
+//   ... + FA_SP_PREPK         (ypk*)     12/12         16/16     7/12     5/12    10/12
+//   FA_SP_ACCRS (no drain)    (yrs*)     12/12         15/16     8/12     5/12    10/12
+//   FA_SP_ACCPAD N=4 (0x20+4) (q*)        9/12         11/16     --       9/12     --
+//   (* the tag's 16/16 is bkNT8 from the sixth pass; ytg0 reproduces its NT6 number EXACTLY at
+//    45,582 = 36.02%, 12/12, so the config under test is the tagged one.)
+//
+// EVERY ROW IS FRAGILE SOMEWHERE.  Three of them -- the tag, the ACCPAD base, and ACCPAD+PREPK --
+// pass FA_NT8 SIXTEEN of SIXTEEN and then lose 2 to 7 tile-images to a delay that computes nothing.
+// So "16 of 16 at NT8" establishes bit-exactness AT THAT SCHEDULE and does NOT establish robustness;
+// report the two separately rather than collapsing them.
+// ytg1's failure is cluster 0 tiles 4 and 5 at 93.3168% / 121.1437% -- the familiar latching shape,
+// 4096/4096 words, on the configuration this repo has tagged and would ship.
+//
+// FA_SP_PREPK deserves one line of its own because it is the flag this pass was launched to rescue:
+// on the ACCPAD base it is 44,131 = 37.21% and 12/12 at NT6, and 43,982 = 37.33% and 16 of 16 at
+// FA_NT8 (ypk8) -- i.e. it clears every gate this campaign has ever used -- and it is 7/12, 5/12,
+// 10/12 across PHASE1/2/3.  That is the single cleanest demonstration that the gates were too weak,
+// and it is why "does ACCPAD rescue the rejected flags" cannot be answered as posed.
+// ============================================================================================
+//
 // *** THE NT8 METHODOLOGY POINT, AND IT INVALIDATES A TEST WE HAVE BEEN RELYING ON: A SLOWER
 // CONFIGURATION PASSING NT8 SAYS NOTHING ABOUT A FASTER ONE. ***  zw2 (with CVTXS, 47,844) passes
 // NT8 16-of-16; E1/E2 (identical except CVTXS, 42,814) fails NT8 15-of-16.  CVTXS's +4,766 cycles
@@ -538,14 +748,23 @@ static inline uint32_t e4m3_pack4_swar(uint32_t wlo, uint32_t whi, uint32_t D2,
 // PROVENANCE, because the obvious check gives FALSE FAILURES on this build system: two consecutive
 // builds of IDENTICAL defines from IDENTICAL source differ in 776 bytes, all at file offset
 // >= 120,671 (tail metadata), while .text is bit-identical.  So a whole-file `cmp` reports every ELF
-// as stale and tells you nothing.  And do NOT compare .text either: /tmp/flash_<tag>.elf is the
-// FUSED soc image, so .text is the RV64 HOST and the GPU code lives in .rv32.seg0..seg4.  A
-// .text hash is VACUOUS for a GPU build -- two builds with wildly different flag sets share
-// .text 07daffadb184d09f and differ only in rv32, so the check passes every pair and can never
-// fail.  Hash the RV32 SEGMENTS:
-//     readelf -x .rv32.seg0 -x .rv32.seg1 -x .rv32.seg2 -x .rv32.seg3 -x .rv32.seg4 <elf> \
-//       | sha256sum      # non-vacuous: distinguishes all 52 builds measured
+// as stale and tells you nothing.  Compare .text only:
+//     llvm-objdump -s -j .text <elf> | grep -v "file format"
 // Verified that way, all of the measured ELFs above match the source they were measured on.
+//
+// *** AND THAT RECIPE IS ITSELF BROKEN ON /tmp/flash_<TAG>.elf, WHICH IS THE FILE EVERY RUN ACTUALLY
+// LOADS.  IT COMPARES THE RV64 *HOST* TEXT AND IS BLIND TO EVERY GPU-SIDE FLAG. ***  fa_build.sh
+// copies flash_attention_mx.SOC.elf, which fuse_rv32_into_rv64.sh builds by embedding the rv32 GPU
+// image as .rv32.seg0 .. .rv32.seg4 (seg2 = GPU .text at 0x110002000, seg4 = fa_data) alongside the
+// Rocket host's own .text.  `-j .text` therefore selects host.cpp's code.  MEASURED: six builds
+// differing in FA_NT6/FA_NT8, FA_SP_PREPK, FA_SP_FZ6, FA_SP_BANKA and FA_SM_2PBM all produced the
+// IDENTICAL .text sha (4670c09a4f0f13ae) while their GPU images were all different -- i.e. the check
+// passes every pair of builds and could never have failed.  The sound compare is the rv32 segments:
+//     readelf -x .rv32.seg0 -x .rv32.seg1 -x .rv32.seg2 -x .rv32.seg3 -x .rv32.seg4 <elf> | sha256sum
+// (or disassemble kernels/flash_attention_mx/flash_attention_mx.radiance.elf, but that file is
+// OVERWRITTEN by the next build in this shared directory, so it has to be saved per tag).  Verified
+// non-vacuous: it distinguishes all ten builds above, and it confirms an independent rebuild of the
+// P128 defines is BYTE-IDENTICAL to the ELF the P128 run loaded (5028374f1b66d3ae).
 //
 // CLUSTER RAM INVENTORY (asked because SMEM being exactly full is what kills FA_SP_OPV).  TLPrintf
 // (radiance/memory/Coalescing.scala:1266-1292) is NOT storage -- it is an empty class whose apply()

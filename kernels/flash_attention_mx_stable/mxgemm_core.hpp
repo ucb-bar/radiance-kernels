@@ -164,6 +164,30 @@ static inline void fa_cfg_settle() {}
 // FA_PHASE<k> delays cluster 1 (and only cluster 1) by k * 64 dependent MMIO round trips
 // (~2.4k cycles each) at the top of every tile, so the phase can be swept deliberately instead of
 // resampled by accident.  A real fix must be correct at EVERY k; a lucky one will not be.
+//
+// *** 2026-07-30: THIS HARNESS HAS NOW ACTUALLY BEEN RUN -- IT HAD NEVER BEEN, IN ANY BUILD IN
+// /tmp/yruns -- AND ON ITS FIRST USE IT KILLED THE CONFIGURATION IT WAS POINTED AT. ***
+//     yph2 = FULL_ATTN2 FA_SP QOVL LEANCFG QKACC PKOVL QSPLIT WCNT PAX CVTX FA_SM_2P FA_SM_2PRAW
+//            FA_SP_ACCPAD (N=128)  +  FA_NT6  +  FA_PHASE2
+//     cluster 0 (UNDELAYED):  6 of 6 tiles CORRECT at 3.5666%
+//     cluster 1 (DELAYED):    tile 0 CORRECT, then 108.5643%  113.0664%  118.1504%  119.3714%
+//                             119.3714%   -- latching, worsening, never recovering
+//     SUMMARY 7 correct, 5 wrong of 12; all images 4096/4096 words, so not a truncated trace.
+// The SAME binary WITHOUT FA_PHASE2 (P128, and an independent rebuild yb6 whose GPU image is
+// byte-identical, rv32 sha 5028374f1b66d3ae) scores 12 of 12.  FA_PHASE is computationally inert by
+// construction AND by RTL: it only issues dependent READ-ONLY loads of GEMMINI_BUSY_ADDR, whose MMIO
+// field is RegField.r with an unconditionally-valid read and no side effect
+// (GemminiTile.scala:428 with :404-405), and it discards the value.  It cannot change a computed
+// result.  *** THEREFORE THE 12-of-12 IS THE ARTEFACT AND THE 5-WRONG IS THE TRUTH: that
+// configuration is INCORRECT, and its NT6 pass was the coincidence this comment block predicted. ***
+// TWO CONSEQUENCES, both worth more than the flag verdicts they invalidate:
+//   * THE ONE-CLUSTER OBSERVATION IS THE MECHANISM, NOT A CURIOSITY.  Here the delayed cluster is
+//     the one that fails and the undelayed one is clean, on the same instructions and the same data
+//     in the same run.  (The "never both" part of the claim above is however FALSE as stated -- of 13
+//     scored failing runs on disk, 10 hit exactly one cluster but P2K, hsfLD and hsfRD4 hit both.)
+//   * ANY "X IS CORRECT" IN THIS TREE THAT RESTS ON A SINGLE UNPERTURBED NT6 OR NT8 RUN IS
+//     UNSUPPORTED, INCLUDING THE GIT-TAGGED fa-mx-best-36.02.  Pass FA_PHASE1/2/3 before believing
+//     any of them.  A single FAILURE at any k is conclusive; a single PASS at one k is not.
 // ============================================================================================
 #if defined(FA_PHASE1) || defined(FA_PHASE2) || defined(FA_PHASE3) || defined(FA_PHASE4) \
     || defined(FA_PHASE5)
@@ -181,7 +205,51 @@ static inline void fa_cfg_settle() {}
 static inline void fa_phase_skew_impl(uint32_t tid) {
     if (tid != 0) return;
     uint32_t cl; asm volatile("csrr %0, 0xCD0" : "=r"(cl));
+    // FA_PHASE_BOTH -- *** THE CONTROL THAT DECIDES WHAT AN FA_PHASE FAILURE MEANS. ***
+    // FA_PHASE<k> delays cluster 1 only, so a failure confined to cluster 1 has TWO explanations:
+    // (a) the RELATIVE PHASE moved and exposed a pre-existing race (the intended reading), or
+    // (b) executing this skew loop at all is what damages the cluster that runs it -- it is the one
+    //     place in the kernel where lane 0 of every warp runs a divergent MMIO-read loop with no
+    //     enclosing vx_split, and cluster 0 never executes it, so the two clusters are NOT running
+    //     the same instructions and the usual "same code, same data" argument does not apply.
+    // With FA_PHASE_BOTH both clusters run the IDENTICAL loop, so the relative phase is restored to
+    // ~0 while the executed code stays exactly as it is under FA_PHASE<k>.
+    //     BOTH clusters correct  => the loop is innocent, (a) holds, the race is real and relative
+    //                               phase is its trigger;
+    //     the failure persists   => (b) holds, the harness is the bug, and every FA_PHASE verdict
+    //                               including my own has to be thrown away.
+    //
+    // *** MEASURED -- AND THE CRITERION I JUST WROTE IS TOO CRUDE TO DECIDE IT.  I AM OVERRIDING MY
+    // OWN PRE-REGISTERED RULE, AND THE REASON HAS TO BE ON THE RECORD RATHER THAN QUIETLY DROPPED. ***
+    // On the FA_SP_ACCPAD(N=128) base at FA_NT6:
+    //     no skew          (P128)  12 of 12
+    //     FA_PHASE1        (yph1)   7 of 12   cluster 1 (delayed) tiles 1-5 WRONG, cluster 0 clean
+    //     FA_PHASE2        (yph2)   7 of 12   cluster 1 (delayed) tiles 1-5 WRONG, cluster 0 clean
+    //     FA_PHASE1 + BOTH (yphb1) 10 of 12   cluster 1 tiles 4,5 WRONG  (102.1825%, 132.3960%)
+    //     FA_PHASE2 + BOTH (yphb2) 10 of 12   cluster 0 tiles 4,5 WRONG  ( 82.0181%, 114.5661%)
+    // The failure PERSISTS under symmetric delay, so the letter of the rule says "harness is the bug".
+    // The RULE is what is wrong: it conflated "the failure persists" with "running this loop corrupts
+    // the cluster that runs it".  If the loop itself were the corruption then with BOTH clusters
+    // running it BOTH clusters would be corrupt.  Instead exactly ONE cluster fails per run, only two
+    // tiles, and *** WHICH cluster fails FLIPS between k=1 (cluster 1) and k=2 (cluster 0) *** under
+    // code that is now symmetric.  Symmetric code with an asymmetric, k-dependent outcome is the
+    // signature of a race resolved by residual timing asymmetry (DRAM, boot skew, arbitration), not of
+    // deterministic per-cluster corruption by the loop.
+    // AND THE HARNESS IS EXONERATED INDEPENDENTLY, WHICH IS WHAT ACTUALLY SETTLES IT: FA_SP_ACCPAD's
+    // OWN LENGTH SWEEP IS A SECOND INERT PERTURBATION WITH NO MMIO AND NO ALL-WARP DIVERGENCE -- pure
+    // register ALU ops on warp 0 only -- AND IT BREAKS THE KERNEL TOO: N=2048 scores 7 of 11 and
+    // N=8192 scores 6 of 10, where N=128 scores 12 of 12.  Two structurally unrelated computationally
+    // inert perturbations both break it, so the race is real and neither harness causes it.
+    // WHAT *IS* REFUTED IS THE FRAMING AT THE TOP OF THIS BLOCK: relative INTER-CLUSTER phase is NOT
+    // the trigger, because a symmetric delay that restores relative phase to ~0 still fails.  Asymmetry
+    // makes it WORSE (5 wrong vs 2; onset at tile 1 vs tile 4) but is not necessary.  *** ANYONE
+    // HUNTING A SHARED CONTENDED STRUCTURE SHOULD KNOW THAT A TWO-CLUSTER CONTEST IS NOT REQUIRED TO
+    // EXPLAIN THIS BUG: perturbing the timing of a single cluster is sufficient to produce it. ***
+#ifndef FA_PHASE_BOTH
     if (cl == 0) return;
+#else
+    (void)cl;
+#endif
     uint32_t z = 0; asm volatile("" : "+r"(z));
     uint32_t v = 0;
     for (uint32_t i = 0; i < 64u * FA_PHASE_N; i++)

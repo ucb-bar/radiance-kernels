@@ -1774,6 +1774,73 @@ static __attribute__((noinline)) void fap_fence(uint32_t tid) {
 //      strided Q-scale chunks and one round of correctness).  If it aborts, Sq=32 needs (a) first and
 //      should be the recommendation for AFTER this sprint rather than a target inside it.
 //
+// (G13) *** THE MESH DRAIN, MEASURED FROM THE WAVEFORM: io_busy IS EXACT AND runningLoops IS 141
+//       CYCLES EARLY.  THIS RESOLVES THE FA_SP_WCNT CONTRADICTION AND EXONERATES THE DRAIN. ***
+//       FSDB /tmp/hsfsdb_bkFS.fsdb, banked config (QSPLIT WCNT PAX CVTX) at FA_NT2, cluster 0's
+//       gemmini (cluster_prci_domain...tile_prci_domain_2...radiance_gemmini_tile_3), prologue QK:
+//           runningLoops 0->1                        166,135,000 ps =  83,067 cyc  (matmul issued)
+//           runningLoops 1->0                        182,361,000 ps =  91,180 cyc  <- MMIO 0x28,
+//                                                                        what FA_SP_WCNT waits on
+//           last acc_mems_0.io_write_valid           182,643,000 ps =  91,321 cyc  <- data final
+//           _gemmini_io_busy 1->0                    182,643,000 ps =  91,321 cyc  <- MMIO 0x20,
+//                                                                        THE SAME CYCLE
+//       Matmul duration 8,113 cyc against the mesh model's 8,210 for QK, so this is the QK.
+//       *** DRAIN GAP = 141 CYCLES ***, and confirmed on the second drain (the fa_store_acc loop_ws):
+//       runningLoops falls 184,415,000, io_busy falls 184,705,000 -> 145 cycles, same shape.
+//       WHAT IT SETTLES.  The FA_SP_WCNT note argues runningLoops "cannot lie" because it rises in
+//       the same cycle as the command write, and that io_busy can fall straight through.  BOTH ARE
+//       TRUE, ABOUT OPPOSITE ENDS: io_busy false-negatives at the START (it has not risen yet when
+//       polled right after issue); runningLoops cannot, but it false-negatives at the END by 141
+//       cycles.  The correct drain is therefore BOTH, IN THAT ORDER -- waitcount(0) then busy --
+//       which is exactly what fa_gfl already does under FA_SP_WCNT.
+//       *** SO THE ACCUMULATOR DRAIN IS ALREADY COVERED ON THE WCNT PATH AND IS NOT THE SURVIVING
+//       HAZARD. ***  That is the load-bearing inference: it rules out every drain-shaped explanation
+//       and points at ordering across DIFFERENT accumulator rows (the AccumulatorMem interlock is
+//       per-row only).  It also says a correctly sized pad would cost 141 x 2 drains = ~282 cyc/tile
+//       = 0.62% of the 45,582-cycle banked tile, so FA_SP_ACCPAD's +68,000 is not the pad -- it is
+//       where the pad was placed -- and its 128 cycles were 13 short of even the gap it aimed at.
+//       CAVEAT ON MY OWN SIGNAL: io_busy shows two 3-cycle glitch pulses at 183,303,000 and
+//       183,457,000, between the matmul drain and the store.  Benign for fa_gfl (a poll that samples
+//       a gap correctly reads "not busy"), but code that polls busy WITHOUT the preceding waitcount
+//       could latch on a glitch.
+//       NEXT CAPTURE, for whoever owns the mechanism: cluster 1
+//       (cluster_prci_domain_1...radiance_gemmini_tile_6), the tile 6->7 boundary, tracing
+//       acc_mems_0.io_write_bits_addr against io_write_valid for two writes to DIFFERENT rows
+//       completing out of order, with runningLoops bracketing each matmul.  Size the +dump-start
+//       window from the mark stamps first: a full dump is ~310 MB per 100k cycles.
+//
+// (G12) *** THE WIDTH MECHANISM FOR THE HOST-SMEM-READ FAILURE IS REFUTED BY MY OWN EXPERIMENT.
+//       RECORDED IN FULL BECAUSE THIS ONE QUESTION HAS NOW PRODUCED THREE CONFIDENT WRONG ANSWERS. ***
+//       The prediction was: the SMEM subbanks advertise get = TransferSizes(4,4) EXACTLY
+//       (RadianceSharedMem.scala:68), so an 8-byte host Get must be fragmented and re-stitched while a
+//       4-byte one passes as a single beat -- therefore 4-byte reads should not trip
+//       "TLMonitor xbar_3: 'D' channel contains improper response size".  MEASURED, per variant:
+//           f4      SMEM mailbox, 8-byte, heaviest softmax   ASSERT @  82,468 cyc
+//           f6      SMEM mailbox, 8-byte, throttled poll     ASSERT @  98,400 cyc
+//           h2      SMEM mailbox, 8-byte                     ASSERT @ 247,237 cyc
+//           hsfLD   SMEM mailbox, 8-byte, + FA_SP_WCNT       ASSERT @ 290,934 cyc
+//           hsfRD4  SMEM mailbox, *4-byte*                   ASSERT @ 343,604 cyc   <-- REFUTES IT
+//           hsfPB   printBuf mailbox, 8-byte                 NO ASSERT, 12 of 12 correct
+//       A 4-byte Get is EXACTLY what the manager advertises, and it still asserts.  So transfer WIDTH
+//       IS NOT THE MECHANISM; it only moves WHEN the assert lands (82k -> 344k), which is the signature
+//       of a RATE- or OCCUPANCY-dependent window rather than of an illegal request.  The
+//       TransferSizes(4,4) reading is still a true RTL fact -- it just does not explain this.
+//       AND IT REINSTATES THE SUSPECT I WRONGLY DEMOTED.  I demoted RWSplitterNode's source/size
+//       truncation on the grounds that the node is "common to the working printBuf case".  IT IS NOT:
+//       RadianceCluster.scala:103 is `printBuf := clcbus.outwardNode`, DIRECT, whereas the SMEM leg is
+//       clcbus -> extClients -> TLFragmenter(4,128) -> RWSplitterNode -> subbanks.  So the splitter is
+//       on the failing path only, and its
+//           arb_in.bits.source := trim(r.bits.source, 1 << in_node.d.bits.source.getWidth)
+//           arb_in.bits.size   := trim(r.bits.size,   1 << in_node.d.bits.size.getWidth) // FIXME
+//       has exactly the shape of a fault that appears only once enough requests are outstanding: a
+//       trimmed source collides, a D beat is delivered against the wrong outstanding request, and the
+//       size it carries then cannot match -- which is precisely what the monitor reports.  The assert
+//       time also correlates INVERSELY with how hard the GPU is hammering SMEM (f4, heaviest softmax,
+//       fails first), which is what an occupancy-dependent collision looks like.
+//       THE FSDB TEST THAT SETTLES IT: does the offending D beat's source match ANY outstanding A
+//       source on that edge?  If yes, the splitter is exonerated too and the fault is downstream.
+//       *** DO NOT WRITE A FOURTH MECHANISM INTO THIS FILE WITHOUT THE A/D BEAT PAIR TO BACK IT. ***
+//
 // (G11) *** A BUILD-INPUT RULE, BECAUSE THE FIX FOR SOMEONE ELSE'S BUG LANDED MID-FLIGHT. ***
 //       FA_SM_2P's pb overrun was fixed in fd722ac (2026-07-27 19:27:15) with compile-time
 //       static_asserts, and 489ff35 / 6ff6e07 followed within half an hour, both touching pass A's
@@ -3898,6 +3965,31 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 #    define FA_SPTILES 6
 #  elif defined(FA_NT8)
 #    define FA_SPTILES 8
+// ==== TILE COUNTS THAT MATCH A REAL INVOCATION, WHICH IS THE GATE THAT ACTUALLY MATTERS. =========
+// The corruption onset in this family is at a SPECIFIC tile (measured: 4, 5, 7 in different builds),
+// not scattered, and it LATCHES once it starts -- so a configuration whose onset is at tile 12 or 30
+// passes every gate this campaign has and still fails every real kernel invocation.  The relevant
+// count is per FA-KERNEL INVOCATION (the GPU is reset between kernels), NOT per model forward pass.
+// TinyLlama-1.1B, one head, S=2048 causal, Sq=64 / Sk=256:  sum_{m=1..32} ceil(m/4) = 144 tiles.
+// This harness counts tiles PER CLUSTER across 2 clusters, so 144 tiles == 72 tiles/cluster == NT72,
+// which makes the real gate exactly measurable rather than a statistical extrapolation.
+// COST, so nobody under-budgets it: ~44k cyc/tile x 72 + ~67k boot ~= 3.24M cycles, and VCS runs
+// this design at ~91-95 cycles/sec => ~10 HOURS of wall clock.  It is the long pole; start it first.
+// AND THE BUDGET RULE IS 1:1, NOT N/2 -- fa_launch_safe.sh's header comment is STALE.  Its third
+// argument is passed straight through as fa_run.sh's BUDGET, and fa_run.sh sets MC=BUDGET*2 with
+// +max-cycles counting HALF cycles, so the run stops at BUDGET cycles exactly.  Verified: P2K and
+// P8K were launched with BUDGET=900000 and both $finish at 1,800,000,500 ps = 900,000 cycles at
+// 2000 ps/cycle.  So NT72 wants BUDGET ~= 4,200,000 (30% headroom), not 7,000,000.
+#  elif defined(FA_NT12)
+#    define FA_SPTILES 12
+#  elif defined(FA_NT16)
+#    define FA_SPTILES 16
+#  elif defined(FA_NT24)
+#    define FA_SPTILES 24
+#  elif defined(FA_NT36)
+#    define FA_SPTILES 36
+#  elif defined(FA_NT72)
+#    define FA_SPTILES 72
 #  else
 #    define FA_SPTILES 4
 #  endif
@@ -4526,10 +4618,108 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     if (warp == 0) {
 #ifdef FA_SP_DUMPWC
         fa_gfl_probe(tid, t);                         // see fa_gfl_probe: is the busy-fence racing?
+#elif defined(FA_SP_ACCRS)
+        // ==== FA_SP_ACCRS -- *** DELETE THE PRE-STORE DRAIN AND LET THE RESERVATION STATION DO IT.
+        // ==== THE OPPOSITE MOVE TO EVERY OTHER FIX IN THIS CHAIN, AND IT IS FREE IF IT WORKS. ====
+        // Read out of the RTL (ReservationStation.scala, the `otherwise` = STORE branch, deps_ex):
+        //     Mux(new_entry.opa_is_dst,
+        //       (opa overlaps e.opa && e.opa.valid) || (opa overlaps e.opb && e.opb.valid) ||
+        //       // additionally if ex writes, raw for st b <- ex a
+        //         (e.opa.valid && e.opa_is_dst && new_entry.opb overlaps e.opa),
+        //       ...)
+        // fa_store_acc issues STORE_SPAD_CMD, for which dst.valid is true (line 266) so
+        // opa_is_dst == 1, opa = the SPAD destination and opb = the ACCUMULATOR source.  The third
+        // clause is therefore exactly the RAW we need: the store's accumulator SOURCE against the
+        // QK compute's accumulator DESTINATION.  *** SO THE HARDWARE ALREADY ORDERS THIS PAIR
+        // EXACTLY -- but only if BOTH commands are in the reservation station at the same time. ***
+        // The pre-store fa_gfl drains the station to empty first, which DESTROYS the dependency and
+        // hands the ordering job to a software MMIO poll; every fix in this chain (the fourth pass's
+        // gemmini_fence, FA_SP_WCNT, now FA_SP_ACCPAD) has been an attempt to make that software
+        // poll as good as the hardware interlock it replaced.  This flag stops replacing it.
+        // WHAT IT PREDICTS, so it can be killed rather than confirmed: correct at NT6 AND NT8 AND
+        // at every FA_PHASE k, with the ~1,694 cyc/tile of FA_SP_ACCPAD *and* the drain's own MMIO
+        // round trips both removed.  If it is WRONG, the RAW clause above is not doing what I read
+        // it as doing, and the next step is the waveform (does the ST entry's deps_ex bit for the
+        // QK EX entry ever get set?), not another A/B.
+        // NOTE the trailing fa_gfl after the store is KEPT: stage S2's SIMT reads S out of the spad
+        // and nothing in the reservation station orders a *Muon* SMEM read against a gemmini write.
 #else
         fa_gfl(tid);                                  // mesh drained -> ACC holds S(t)   (FA_SP_WCNT)
 #endif
 #ifdef FA_SP_ACCPAD
+        // *** READ THIS FIRST: THE MECHANISM THE BLOCK BELOW ARGUES FOR IS REFUTED BY THE RTL, AND
+        // THE PAD-LENGTH DATA IS NON-MONOTONE.  FA_SP_ACCPAD IS A SCHEDULE PERTURBATION UNTIL SOMEONE
+        // SHOWS OTHERWISE. ***  (2026-07-30, from the generated Chisel sources, not the waveform.)
+        //  (1) *** THERE ARE TWO DIFFERENT SIGNALS CALLED "COMPLETION" AND THIS COMMENT ORIGINALLY
+        //      CONFLATED THEM.  I FIRST WROTE THE OPPOSITE OF (1a) INTO THIS FILE AND IT WAS WRONG;
+        //      IT IS RECORDED HERE SO THE NEXT READER DOES NOT REDERIVE THE MISTAKE. ***
+        //      (1a) MMIO 0x28 (runningLoops) COUNTS *LOOP* COMPLETIONS AND IS ISSUE-BASED.
+        //           GemminiTile.scala:410-412 decrements it on completion_io.completed, which is
+        //           Controller.scala:619 loop_completed, which LoopMatmul.scala:1374 raises on
+        //           head_loop.all_completed().  ex_completed is set by LoopMatmul.scala:1357
+        //               when (ex.io.idle && loops(ex.io.loop_id).running && ... ex_started)
+        //           and the EX unroller's `idle` (:497) is reached when the LAST COMPUTE COMMAND HAS
+        //           BEEN ACCEPTED DOWNSTREAM -- into the reservation station -- not when it executed.
+        //           For a compute-only loop (fa_mm_acc, skip_stc=1) st_completed is pre-set from
+        //           rs2(7) at config time (:1178), so all_completed fires immediately after that.
+        //           => runningLoops can read 0 with up to a reservation station's worth of COMPUTEs
+        //           still queued.  FA_SP_WCNT's argument -- "runningLoops cannot lie, it is raised in
+        //           the same cycle as the LOOP_WS write" -- is about the RAISING edge.  The edge that
+        //           matters here is the FALL, and the fall is issue-based.  A residual measured at
+        //           >=164 cycles and formally unbounded, which no fixed pad can cover.
+        //      (1b) MMIO 0x20 (io.busy) IS THE STRONGER OF THE TWO AND IS THE ONE THIS PAD SITS
+        //           BEHIND.  Controller.scala:786 has
+        //               io.busy := raw_cmd.valid || loop_conv_unroller_busy ||
+        //                          loop_matmul_unroller_busy || reservation_station.io.busy ||
+        //                          spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid ||
+        //                          conv_cmd.valid
+        //           There is NO MESH TERM in that list, but reservation_station.io.busy covers the
+        //           mesh INDIRECTLY, because an EX entry is not retired at issue --
+        //           ReservationStation.scala:383 complete_on_issue := is_config && q =/= exqu, so only
+        //           non-EX CONFIGs complete on issue -- and its retirement comes from
+        //           ExecuteController.scala:1171-1177,
+        //               when (mesh.io.resp.fire && tag.rob_id.valid) {
+        //                 when (mesh.io.resp.bits.last) { io.completed.valid := true.B ... }
+        //           i.e. THE LAST RESULT ROW LEAVING THE 16x16 ARRAY.  So 0x20 == 0 does imply the
+        //           array is done; what it does NOT cover is the write path behind it.
+        //      (1c) TWO WAYS 0x20 CAN STILL LIE, both worth designing around:
+        //           ReservationStation.scala:140 io.busy := !empty && !(utilization === 1.U &&
+        //           solitary_preload) -- A LONE PRELOAD IN THE STATION READS AS NOT BUSY; and the
+        //           missing mesh term means anything that reaches the mesh without a live RS entry is
+        //           invisible.  "+4" bounds the drain AFTER busy is honest; it does not make it honest.
+        //  (2) THE WRITE PATH BEHIND 0x20 IS SHORT AND BOUNDED, WHICH IS WHY 4 IS THE RIGHT NUMBER.
+        //      The last accmem datum is readable 3 cycles after io.busy falls (structural drain of 35
+        //      register stages, readable at +36, established by flop-counting in a parallel audit), so
+        //      FOUR straight-line cycles is a bound.  For orientation on the same path,
+        //      AccumulatorMem.scala:225-241 holds writes in `pipelined_writes`, a shift register of
+        //      depth acc_latency with require(acc_latency >= 2), and this design sets acc_latency = 3
+        //      (radiance/subsystem/Configs.scala:273, :367).
+        //  (3) AND THE ORIGINAL HYPOTHESIS -- "fa_store_acc reads a MID-ACCUMULATION accumulator" --
+        //      IS REFUTED AT THE READ PORT.  AccumulatorMem.scala:619-624 implements a full SAME-ROW
+        //      RAW interlock across all three write-pipeline stages, honoured on both the mvout and ex
+        //      consumers and live in silicon.  A read of the same accumulator row cannot return a
+        //      partially accumulated value.  So whatever FA_SP_ACCPAD is doing, it is NOT closing a
+        //      same-row accmem race at the accumulator read port.  The candidates left are SMEM-side
+        //      visibility AFTER the mvout, the requantizer path, and cross-ROW ordering.
+        //  (4) THE PAD-LENGTH DATA IS NOT MONOTONE, WHICH NO DRAIN-DEPTH STORY CAN PRODUCE
+        //      (all FA_NT6, same base = PAX CVTX FA_SM_2P FA_SM_2PRAW on FA_SP_WCNT):
+        //          pad cost ~1,694 (N=128, register loop)   P128   44,565   12 of 12 CORRECT
+        //          pad cost ~24,700 (N=2048)                P2K    69,273    7 of 11, onset tile 2
+        //          pad cost ~69,300 (the DRAM-loop pad)     H2    113,863   12 of 12 CORRECT
+        //          ... the same DRAM pad at FA_NT8          H1    113,809   16 of 16 CORRECT
+        //          pad cost ~106,000 (N=8192)               P8K   150,511    6 of 10, onset tile 1
+        //      Correct, wrong, correct, wrong as the delay increases monotonically.  A pipeline that
+        //      needs N cycles to drain cannot be fixed by 1,694, broken by 24,700 and fixed again by
+        //      69,300.  (The pad's marginal cost is a consistent ~12.9 cyc per iteration across all
+        //      three register-pad points, so the delays themselves are measured, not assumed.)
+        //  (5) AND THE PRIOR ON A SINGLE "12 of 12" IS ALREADY DOCUMENTED AS WEAK: mxgemm_core.hpp's
+        //      FA_PHASE block records that 14 of 19 arbitrary perturbations score 12 of 12 with no
+        //      correlation to the flag set, i.e. ~74% by chance.  P128 is one such run.
+        // SO: keep the flag (it is cheap and it is the currently-fastest correct-as-built NT6 point),
+        // but do NOT describe it as a drain fix, and do not carry its correctness to a neighbour.
+        // The instrument that can actually settle it is FA_PHASE<k>, which had never been run.
+        //
+        // ==== ORIGINAL RATIONALE, KEPT BECAUSE (1) AND (2) ABOVE ARE ITS REFUTATION ================
         // ==== FA_SP_ACCPAD -- WAIT FOR THE MESH *PIPELINE*, NOT JUST THE COMMAND FSM. =============
         // *** A TEST OF WHY FA_SP_WCNT IS NECESSARY BUT NOT SUFFICIENT. ***  WCNT polls MMIO 0x28
         // (runningLoops) then MMIO 0x20 (io.busy), and argues runningLoops "cannot lie" because it is
@@ -4556,7 +4746,79 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         // *** IF THIS CLOSES THE HAZARD THE FIX IS NOT THIS PAD -- it is that the drain must observe
         // the MESH.  The pad only proves where to look.  If it does NOT close it, the accumulator
         // race is exonerated and the search moves to Q, K^T and their scale words. ***
-        { volatile int _d = 0; for (int _i = 0; _i < 128; _i++) asm volatile("addi %0,%0,1" : "+r"(_d)); }
+        // *** AND THE PAD ITSELF HAD THE BUG THIS FILE ALREADY DOCUMENTS AT THE TOP. ***  Written
+        // `volatile int _d`, the counter gets a STACK SLOT -- and the stack is in GMEM/DRAM -- so the
+        // loop compiled to
+        //     .LBB0_17: lw.global a1,12(sp) / addi a1,a1,1 / addi a0,a0,-1 / sw.global a1,12(sp) / bnez
+        // i.e. 128 iterations x a DRAM load AND a DRAM store, ~265 cyc per round trip = +68,000
+        // cyc/tile instead of the intended 128.  That is EXACTLY the BAR_PAD `volatile int _p` trap
+        // recorded in the header (FSDB-confirmed 2026-07-25), reintroduced verbatim.  Dropping
+        // `volatile` on the VARIABLE while keeping `asm volatile` on the instruction keeps the counter
+        // in a register and makes each iteration one retiring ALU op.
+        // *** MEASUREMENT CONSEQUENCE THAT MATTERS: H1/H2 proved correctness with an EFFECTIVE delay
+        // of ~68,000 cycles, not 128.  So the working experiment does NOT establish that 128 cycles
+        // is enough -- it establishes only that ~68,000 is.  FA_SP_ACCPAD_N sweeps the real
+        // requirement instead of assuming it. ***
+// Pad length.  Discrete flags rather than -DFA_SP_ACCPAD_N=<n>, because fa_build.sh prepends
+// `#define <flag> 1` and a valued define does not survive that.
+#ifndef FA_SP_ACCPAD_N
+#  if   defined(FA_SP_ACCPAD_N8K)
+#    define FA_SP_ACCPAD_N 8192
+#  elif defined(FA_SP_ACCPAD_N2K)
+#    define FA_SP_ACCPAD_N 2048
+#  elif defined(FA_SP_ACCPAD_N512)
+#    define FA_SP_ACCPAD_N 512
+#  elif defined(FA_SP_ACCPAD_N32)
+#    define FA_SP_ACCPAD_N 32
+#  elif defined(FA_SP_ACCPAD_N4)
+#    define FA_SP_ACCPAD_N 4
+#    define FA_SP_ACCPAD_FLAT 1     /* see below: at N=4 the LOOP is 3x the delay it is padding */
+#  else
+#    define FA_SP_ACCPAD_N 128
+#  endif
+#endif
+#ifdef FA_SP_ACCPAD_FLAT
+        // ==== "0x20 + 4": THE ONE PAD LENGTH WITH AN RTL ARGUMENT BEHIND IT. ======================
+        // fa_gfl ends on gemmini_fence(), i.e. `while (load32_shared(GEMMINI_BUSY_ADDR) != 0) nop;`
+        // == MMIO 0x20 == io.busy.  Per the RTL audit that landed 2026-07-30, io.busy falls exactly
+        // THREE cycles before the last accmem datum is readable (the structural drain is 35 register
+        // stages, readable at +36, established by flop-counting), so FOUR cycles after 0x20 reads 0
+        // is a BOUND rather than a guess.  Contrast MMIO 0x28 (runningLoops), which FA_SP_WCNT polls
+        // FIRST: LoopMatmul.scala:497 returns to `idle` the cycle the last COMPUTE is ACCEPTED INTO
+        // THE RESERVATION STATION, with up to 16 ex commands still queued behind it -- a residual of
+        // >=164 cycles and formally unbounded, which NO fixed pad can cover.  It is only safe here
+        // because fa_gfl polls 0x28 and THEN 0x20, so the 0x20 poll is the operative one and this pad
+        // sits directly behind it.
+        // *** WHY THIS IS FLAT AND NOT A LOOP. ***  The N=128 form is a 3-instruction loop measured at
+        // ~12.9 cyc/iteration (consistent across N=128/2048/8192, i.e. 1,694 / 24,700 / 105,900
+        // cyc/tile), so a 4-ITERATION loop would deliver ~52 cycles -- thirteen times the bound, and
+        // the branch would dominate what it is supposed to be measuring.  Four straight-line retiring
+        // ALU ops deliver 4 cycles.  `_d` is deliberately NOT volatile: a volatile local gets a stack
+        // slot, the stack is in GMEM/DRAM, and that is exactly the trap that turned a nominal
+        // 128-cycle pad into ~68,000 (verified in the disassembly for this build: the pad is four
+        // `addi a0,a0,0x1` with no lw.global/sw.global anywhere in the region).
+        // TWO CAVEATS THIS PAD CANNOT FIX, recorded so nobody reads it as a proof:
+        //   * io.busy has NO MESH TERM AT ALL (Controller.scala:786), and
+        //   * a lone PRELOAD resident in the reservation station makes io.busy read 0
+        //     (ReservationStation.scala:140),
+        // so the 0x20 poll can itself fall through; "+4" bounds the drain AFTER busy is honest, not
+        // the honesty of busy.
+        // AND THE HYPOTHESIS THIS FLAG WAS BUILT ON IS NOW SUPERSEDED: AccumulatorMem.scala:619-624
+        // implements a full SAME-ROW RAW interlock across all three write-pipeline stages, honoured on
+        // both the mvout and ex consumers, so a read of the same accumulator row CANNOT return a
+        // mid-accumulation value.  Whatever ACCPAD is doing is not a same-row accmem race at the
+        // accumulator read port.  Treat it as an empirically effective delay of unpinned mechanism.
+        { int _d = 0;
+          asm volatile("addi %0,%0,1" : "+r"(_d));
+          asm volatile("addi %0,%0,1" : "+r"(_d));
+          asm volatile("addi %0,%0,1" : "+r"(_d));
+          asm volatile("addi %0,%0,1" : "+r"(_d));
+          asm volatile("" :: "r"(_d)); }
+#else
+        { int _d = 0;
+          for (int _i = 0; _i < (FA_SP_ACCPAD_N); _i++) asm volatile("addi %0,%0,1" : "+r"(_d));
+          asm volatile("" :: "r"(_d)); }
+#endif
 #endif
         fa_store_acc<QKF>(SP_C, tid);
         fa_gfl(tid);                                  // drain the accmem->spad store     (FA_SP_WCNT)
