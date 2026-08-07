@@ -664,11 +664,52 @@ All four shapes verified in the preprocessed body (the S5/S6 call-and-barrier se
 reproduces RV32-segment sha `82e73680240b60f2`, byte-identical to the gate-passing `stV24` image. So
 the table above is not invalidated by the restructuring.
 
-### Utilization: target 30%, currently 28.68%
+### Where 57,135 cyc/tile actually goes -- the per-stage table for `FA_ST_NOOVL`
 
-Need <= 54,733 cyc/tile, i.e. **2,523 cycles**. Two levers taken first because they *cannot*
-reintroduce the hazard, both confirmed wired into this body by preprocessing (`PREPK` was found not to
-be wired into the `Sq=32` body, so this was checked rather than assumed):
+From `stX24` (48/48 correct, so the timing is admissible), `fa_marks3.py --per 8 --mesh 16420`,
+mean over 15 steady tiles, cluster 0:
+
+| stage | cycles | what it is |
+|---|---|---|
+| s0 | 52 | top-of-tile mark |
+| s1 | 885 | accumulator -> S(t) @ SP_C (`ACCRS` removed the pre-store drain) |
+| s2 | **12,825** | softmax, cooperative, all six warps |
+| s3 | 2,754 | requant pass A (with `PAX`) |
+| s4 | 10,233 | warp 0 SF pack (with `PREPK`) \|\| warps 1-5 requant convert |
+| **s6a** | **11,906** | *the stage `FA_ST_NOOVL` adds*: Q(t+1) prefetch **+** QK(t+1) issue **+** QK drain |
+| s5 | 8,870 | PV matmul -- **warp 0 spins in a fence for ~8.6k of it** |
+| s7 | 9,081 | finalize(t) -> GMEM |
+| sum | 56,606 | (pooled interval 57,135) |
+
+Two readings that set the remaining strategy. **S6a is 11,906**, of which ~8,210 is QK's own mesh time
+and the balance ~3,700 is the serialized Q prefetch: an 8 KB move-in plus **64 strictly serial
+SF-SRAM scale words at ~65 cyc each (~4,160)**. And **S5 leaves warp 0 idle for ~8.6k cycles** inside
+a `gemmini_fence`. So the scale words have a free home, which is exactly what `FA_ST_OVL_SCL`
+restores -- and it is a *scale-store relocation*, not a mesh/SIMT overlap, i.e. a different risk class
+from the one `OVL_QK` just failed at.
+
+### `FA_ST_OVL_QK` IS REFUTED ON BOTH AXES, and the de-overlap cost is therefore mostly structural
+
+| run | correctness | cycles |
+|---|---|---|
+| `stY24` (`OVL_QK`, unperturbed) | **45 of 48 -- 3 wrong** | **VOID** (not all-correct) |
+| `stY24p2` (`OVL_QK` + `PHASE2`) | **9 of 24** | **VOID** |
+
+Putting QK(t+1)'s mesh work back underneath `finalize(t)` re-introduces the hazard, and because the
+run is not all-correct its cycle number is unusable -- so the ~8.2k payback it was projected to return
+**cannot even be claimed**. That is the single largest piece of the 11,429 cycles de-overlapping cost,
+and it is **not recoverable**. *The de-overlap cost is mostly structural, not mostly recoverable.*
+**Do not retry `OVL_QK` in any variant.**
+
+### Utilization: target 30%, currently 28.74%
+
+Need <= 54,733 cyc/tile. **`ACCRS`+`PREPK` bought only -121 cycles here** (57,256 -> 57,135 =
+**28.74%**), not the ~2,349 they are worth on the peak body -- so these levers **do not transfer at
+face value**, and any projection that adds up peak-body savings on this body is unsound. Robustness is
+retained (`stX24` 48/48 unperturbed, `stX24p1` 48/48 at `PHASE1`, `stX24p2` 48/48 at `PHASE2`), so they
+stay; they are nearly free rather than decisive. **Still ~2,402 cycles short.** Both were confirmed
+wired into this body by preprocessing (`PREPK` was found *not* wired into the `Sq=32` body, so this was
+checked rather than assumed):
 
 * **`FA_SP_ACCRS`** (~-1,915) deletes the pre-store `fa_gfl` in S1. On the peak body that rests on
   `ReservationStation.scala`'s interlock; **here the argument is stronger and needs no interlock at
