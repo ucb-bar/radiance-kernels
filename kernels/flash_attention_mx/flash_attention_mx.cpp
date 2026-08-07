@@ -4743,9 +4743,38 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         // So: after the drain, burn a bounded number of cycles covering the mesh's pipeline depth.
         // 128 is generous for a 16x16 array plus the accmem write, and it runs on warp 0 only in a
         // stage where the other five warps are already at the barrier: ~128 cyc/tile, ~0.3% of 43k.
-        // *** IF THIS CLOSES THE HAZARD THE FIX IS NOT THIS PAD -- it is that the drain must observe
-        // the MESH.  The pad only proves where to look.  If it does NOT close it, the accumulator
-        // race is exonerated and the search moves to Q, K^T and their scale words. ***
+        // *** MEASURED, AND THE ANSWER IS NEITHER: FA_SP_ACCPAD IS NOT A FIX, AND THE PAD-LENGTH
+        // SWEEP IS NON-MONOTONIC.  DO NOT SHIP IT AS ONE. ***  FA_NT6/FA_NT8, seed 12345, on
+        // FA_SM_2P + FA_SM_2PRAW (42,846 cyc/tile without any pad):
+        //     pad N      cyc/tile   util     NT6 tile-images      NT8 tile-images
+        //     none         42,846   38.32%   12 of 12             15 of 16
+        //     32           43,066   38.13%    9 of 12              11 of 16
+        //     128          44,565   36.85%   12 of 12             --
+        //     2,048        69,273   23.70%    8 of 12             --
+        //     8,192       150,511   10.91%    6 of 10             --
+        //     ~68,000     113,809   14.43%   12 of 12             16 of 16   (the volatile/DRAM pad)
+        // Correctness goes PASS, FAIL, PASS, FAIL, FAIL, PASS as the delay grows.  A drain cannot
+        // behave that way: if the pad were covering a fixed latency, more delay could never HURT, so
+        // the pad is not draining anything -- it is RELOCATING THE SCHEDULE, and some lengths happen
+        // to land outside a race window.  The original H1/H2 result (16 of 16 at NT8) was real as an
+        // observation and false as a fix: it was the ~68,000-cycle accidental DRAM pad landing in a
+        // safe window, which is the same green-by-accident pattern this file records for
+        // FA_SP_QSPLIT, FA_SP_PAX, FA_SP_QEARLY and FA_SP_CVTXS-masking-NT8.
+        // AND IT KILLS THE "poll 0x20 then pad >= 3" PRESCRIPTION TOO: fa_gfl already ends on the
+        // 0x20 busy poll, so N=32 IS "0x20 + 32" -- an order of magnitude past the 3-cycle bound --
+        // and it is WRONG at both NT6 and NT8.  There is therefore no pad length and no poll at this
+        // point that closes it, which agrees with the RTL: AccumulatorMem.scala:619-624 has a
+        // complete same-row RAW interlock across all three write-pipeline stages, honoured on both
+        // consumers, so a read of the same accumulator row CANNOT return a mid-accumulation value.
+        // *** THE ACCUMULATOR READ PORT IS EXONERATED AS THE SITE. ***  Whatever FA_SP_ACCPAD
+        // perturbs, it is not that, and the remaining candidates are SMEM-side visibility after the
+        // mvout, the requantizer path, and ordering across DIFFERENT accumulator rows.
+        // ONE REUSABLE NUMBER FROM THE SWEEP: the pad costs ~13 CYCLES PER ITERATION, not 1
+        // (13.4 / 12.9 / 13.1 measured at N=128 / 2,048 / 8,192), even though the loop is three
+        // instructions with zero memory ops.  Stage S1 has warp 0 alone on its core with the other
+        // five warps already at the barrier, so there is no second warp to interleave and every
+        // dependent instruction pays full issue latency.  A "free" ALU pad in a quiesced stage costs
+        // ~13x its instruction count on this machine.
         // *** AND THE PAD ITSELF HAD THE BUG THIS FILE ALREADY DOCUMENTS AT THE TOP. ***  Written
         // `volatile int _d`, the counter gets a STACK SLOT -- and the stack is in GMEM/DRAM -- so the
         // loop compiled to

@@ -1225,6 +1225,20 @@ static __attribute__((noinline)) void online_softmax_block(
     //       arithmetic; corr_out is not written, so FA_SP_DUMPL/DUMPLM's corr column is invalid
     //       under this flag.
     //
+    // WHAT THE REGISTER RETRACTION MAKES NEWLY AFFORDABLE HERE, worked out but NOT built (the
+    // measurements in flight are of the form below, and this would be a different lever):
+    // FA_SM_2P's whole trade is "drop slo[8]/shi[8] and RE-READ S in pass B, in exchange for being
+    // able to batch the reductions per WARP instead of per ROW".  The re-read costs ~40
+    // instructions/row (8 lw + 16 fmul + the half extraction) and the batching saves ~41 of a
+    // warp's 44 fences.  At the ~22 cyc/fence measured above that is ~900 cycles saved against
+    // ~1,280 of extra issue on the binding core (40 x 32 rows) -- so the trade is close to EVEN,
+    // and it was only forced because holding the arrays looked unaffordable.  It is not: there are
+    // ~42 spare arch registers.  A GROUP-OF-TWO form -- keep slo/shi for TWO rows (32 registers),
+    // reduce both rows behind ONE pair of fences, and never re-read S -- gets 1 fence/row instead
+    // of the reference's 4 with ZERO re-read cost, and should beat both the reference AND this
+    // implementation.  Grouping by three (48 registers) is also inside the budget.  The reason this
+    // is not built here is only sequencing: FA_SM_2P was already measured, so the hybrid is a later
+    // pass's first move rather than a mid-flight rewrite.  It remains unbuilt and unmeasured.
     // SCRATCH: pb needs SQ x 17 halfwords = 2,176 B at 0x15600, inside the 0x14000..0x16000
     // scratch window (REDBUF 0x15000 ends at 0x150C0; LPART 0x15400 is FUSE-only and CBMAX_SMEM
     // 0x15800 is CBMAX-only, both mutually exclusive with this flag).  The stride is 2*NT+1 = 17,
