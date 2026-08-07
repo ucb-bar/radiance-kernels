@@ -65,7 +65,9 @@ FA_SP_WCNT FA_SP_PAX FA_SP_CVTX  FA_ST_NOOVL
 ```
 
 Cross-checked: `fa_rowdiag.py --onset` and `fa_verify_tiles.py` agree on every run. 57,256 cyc/tile,
-**28.68%** utilization (vs the peak track's 35.83% at onset tile 13).
+**28.68%** utilization (`stV24`, unperturbed and 48/48, so admissible). The reference
+comparison is the sibling's **45,582 = 36.02%** measured at NT6 12/12 -- see the admissibility rule
+above for why its NT24 figure cannot be used.
 
 Two things this does **not** say. It is one seed (12345) -- and the simulator is timing-deterministic,
 so a second seed only randomises uninitialised state and is *not* a second test of the schedule;
@@ -74,6 +76,45 @@ so a second seed only randomises uninitialised state and is *not* a second test 
 The **sequential `FULL_ATTN2 FA_STEADY`** body is also clean at `NT24` (`stS24b`, 48/48) now that the
 `FA_NTILES` hole is fixed -- a second, structurally unrelated de-overlapped body reaching the same
 place, which is the corroboration that matters most here.
+
+## A cycle number is admissible only if the run is BOTH fully correct AND unperturbed
+
+Two separate rules, and they compose into something narrower than either alone:
+
+1. **Not all-correct => the timing is void.** A wrong tile also has wrong timing (~28% steady-interval
+   spread vs ~3% when clean), so a run that is not N-of-N has no usable cycle number -- it only
+   identifies the configuration.
+2. **`FA_PHASE<k>` => the timing is void.** The harness injects `k x 64` dependent MMIO round-trips
+   **per tile per cluster** (~2.4k cyc per step), and `FA_PHASE_BOTH` injects into *both* clusters. So
+   a phase run can be **perfectly clean and its cycles still meaningless**: they carry the
+   instrumentation. Observed deltas on `stX24` were +499 (`P1`) and +1,212 (`P2`) -- smaller than the
+   nominal injection, so some is absorbed, but the direction is one-way.
+
+**Therefore: 30% is decided by the UNPERTURBED run clearing <= 54,733 cyc/tile; the gate is decided by
+the PERTURBED runs being N-of-N. Never mix them.** A lever whose *perturbed* run happens to come in
+under 54,733 has not cleared 30%; one whose perturbed run comes in over it has not failed.
+
+**What rule 2 does NOT void: onsets.** An onset from a phase run is exactly what the harness is *for*
+-- perturbing the schedule is the measurement, not a contaminant. Rule 2 voids cycle counts only. Do
+not throw away the phase onsets in this file on the strength of it.
+
+### Retroactive audit of this file, run against the combined rule
+
+Every cycle figure quoted here was checked against its run's `.defines` and `.score`:
+
+| figure | run | unperturbed? | all-correct? | verdict |
+|---|---|---|---|---|
+| 57,256 (28.68%) | `stV24` | yes | 48/48 | **admissible** |
+| 63,952 (25.68%) | `stM24` | yes | 48/48 | **admissible** |
+| 57,135 (28.74%) + stage table | `stX24` | yes | 48/48 | **admissible** |
+| ~~45,827 (35.83%), the 36% reference~~ | `stD24` | yes | **37 of 41 -- 4 WRONG** | **VOID** |
+
+The last row is mine and I had quoted it twice. `stD24` is the reference config at NT24, whose onset
+is tile 13 -- so the run *is* corrupt by construction and rule 1 voids its cycles. The reference's
+comparison number must come from a run that is both unperturbed and fully correct, which for that
+config means **NT6 or shorter** (onset 13 > 5): the sibling README's **45,582 cyc/tile = 36.02% at
+NT6, 12/12**. That is the figure used below. The distinction matters for the trade being claimed --
+the reference is only that fast *over an exposure short enough to hide its onset*.
 
 ## Score configurations by ONSET TILE, not by pass/fail
 
@@ -272,14 +313,15 @@ not specific to `FA_ST_NOOVL`'s particular staging -- it tracks *removing the ov
 
 ### What it costs
 
-| config | cyc/tile (steady, NT24) | util | onset |
-|---|---|---|---|
-| 36% reference (`stD24`) | 45,827 | 35.83% | 13 |
-| **`FA_ST_NOOVL`** (`stV24`) | **57,256** | **28.68%** | none(>71) |
-| fully de-overlapped (`stM24`) | 63,952 | 25.68% | none(>23) |
+| config | cyc/tile | util | onset | cycles admissible? |
+|---|---|---|---|---|
+| 36% reference, **NT6** | 45,582 | 36.02% | 13 | yes -- 12/12 at NT6, unperturbed |
+| 36% reference, NT24 (`stD24`) | ~~45,827~~ | ~~35.83%~~ | 13 | **NO -- 37 of 41, rule 1** |
+| **`FA_ST_NOOVL`** (`stV24`) | **57,256** | **28.68%** | none(>71) | yes -- 48/48, unperturbed |
+| fully de-overlapped (`stM24`) | 63,952 | 25.68% | none(>23) | yes -- 48/48, unperturbed |
 
 `FA_ST_NOOVL` buys the exposure from tile 13 to beyond tile 71 for **25% more cycles per tile**
-(35.83% -> 28.68% utilization). Per this directory's charter that is a good trade; per the sibling's
+(36.02% -> 28.68% utilization, using the reference's admissible NT6 figure). Per this directory's charter that is a good trade; per the sibling's
 it is not, which is exactly why there are two directories.
 
 Everything below was measured with the scripts and tools in this directory; the run set is
