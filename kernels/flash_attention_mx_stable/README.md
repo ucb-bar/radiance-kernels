@@ -718,6 +718,30 @@ checked rather than assumed):
   the marks). So `ACCRS` removes a poll of an already-drained mesh.
 * **`FA_SP_PREPK`** (-306 to -434), bit-exact by construction.
 
+### One non-overlap lever left, and a distinction worth stating explicitly
+
+The steer was *"do not spend slots on the group-of-two softmax (a +1,280 loss **once `FA_SM_2P` is the
+baseline**)"*. That prohibition is conditional on `FA_SM_2P` already being present -- and **it is not in
+this config**. The gate-passing flag set has no `FA_SM_2P`/`FA_SM_2PRAW`, so `s2 = 12,825` is the
+*unoptimized* cooperative `online_softmax_block`. Adding the pair is recorded in the sibling README as
+**45,582 -> 42,846, i.e. -2,736 cycles** -- more than the 2,402 still needed. So this is not the
+prohibited item; it is a different, untried one on this body.
+
+Why it is the right risk class: it is a **SIMT-only arithmetic restructuring** that touches no mesh, no
+DMA and no gemmini port -- it replaces four `fence.s` *per row* with three *per warp*. And
+`flash_mx_impl.hpp:1139` argues bit-exactness term by term (`m` via order-independent `fmax`; `l` by
+reproducing `warp_tree_reduce`'s exact 16-leaf balanced pairing, which matters because bf16 addition is
+not associative). If it really is bit-exact, correctness can only move by *schedule* perturbation --
+and this body is already clean at `PHASE1/2/3` and `PHASE_BOTH`.
+
+The known caveat, stated because it is the reason this needs measuring and not assuming: on the
+**overlapped** body `2P`+`2PRAW` was the fastest thing measured and **did not bank** (12/12 at NT6 but
+15/16 at NT8). That was with the hazard live. Whether it holds on a body whose hazard is gone is
+exactly the open question. Bonus already observed at build time: it drops the per-warp register budget
+from UPPER **219 to 156**, well clear of the renamer bracket.
+
+Launched: `stQ24` (NT24, unperturbed) and `stQ24p2` (NT24 + `PHASE2`).
+
 In flight: `stX24`/`p1`/`p2` (`ACCRS`+`PREPK` at NT24, unperturbed + `PHASE1` + `PHASE2`) for the cycle
 number *and* confirmation that robustness is retained; `stY24`/`stY24p2` (`OVL_QK`) for the
 biggest single payback and for whether the onset moves when the mesh/SIMT overlap comes back.
