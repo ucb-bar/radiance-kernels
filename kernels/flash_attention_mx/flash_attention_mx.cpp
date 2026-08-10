@@ -1977,6 +1977,70 @@ static constexpr uint32_t SP_C     = 3072;   // S/P/O (C dest)     rows 3072..51
 #endif
 #ifdef FA_SP_SQ32
 // ============================================================================================
+// *** FA_SP_SQ32 DOES NOT RUN.  IT HANGS DETERMINISTICALLY, AND SEVEN MECHANISMS HAVE BEEN
+// ELIMINATED.  READ THIS BEFORE PROPOSING AN EIGHTH. *** (2026-08-10)
+//
+// THE SYMPTOM, pinned: warp 0 spins forever in fa_gfl's unbounded `while (busy != 0)` (MMIO 0x20) in
+// stage S5, waiting for a half-height PV matmul that never retires.  Marks stop right after m[t*7+4].
+// Deterministic and reproducible; three distinct failure modes, all repeatable:
+//   /tmp/flash_s16.elf   (QEARLY, LEANCFG)   HANG, last mark m[18] = half-tile 2 s4 @ 169,778 cyc
+//   /tmp/flash_sctl4.elf (plain, NT4)        HANG, last mark m[11] = half-tile 1 s4 @ 144,128 cyc
+//   /tmp/flash_snl16.elf (NO LEANCFG)        ASSERT ScratchpadBank.sv:127 "DMA queue does not have
+//                                            enough entries" @ 146,385 cyc -- a DIFFERENT failure
+// AND THE DIAGNOSTIC PATTERN THAT CONSTRAINS ANY EXPLANATION: every change that removes ONE gemmini
+// operation from the per-iteration sequence buys EXACTLY ONE more iteration before the hang
+// (FA_SP_ACCRS removes a drain -> one drain later; FA_SP_SQ32_PVMO folds the store loop into the
+// matmul loop -> one half-tile later).  That is a monotonically accumulating resource, not a single
+// stuck command -- with concurrent_loops = 2 (LoopMatmul.scala:986), once the slots are gone the next
+// loop config back-pressures the MMIO store forever.
+//
+// ELIMINATED, with how:
+//  1. BARRIER DUPLICATION / a barrier in a divergent region.  fa_baraudit.py on a PROPERLY REBUILT .s
+//     reports "every barrier at split depth 0 within its own function, no duplicated id" (7 vx_bar,
+//     ids 2..8).  Confirmed in the binary: 7 nu.invoke.ri.pw.sync in fa_entry, ids resolved to
+//     distinct VALUES, one instance each, all with count register s5 = s0>>4 = wpb.
+//     *** AND THE TRAP: `make flash_attention_mx.s` SILENTLY DOES NOT REBUILD (rule broken, rc=2) --
+//     a stale 2026-07-13 .s reported bogus "duplicated ids {2:2,3:2,4:2,5:2,6:2}".  Byte-identical
+//     file size is the only tell.  Generate it with clang++ -S directly (kernel-build-env.sh sourced)
+//     and CONFIRM a Sq=32-only symbol such as fa_scl_qhalf is present before trusting the audit. ***
+//  2. MARK-BUFFER OVERFLOW.  Sq=32 emits 2x the marks per row, but 225 marks = 900 B and there is
+//     64 KB before the next region.  Arithmetic, no run needed.
+//  3. STRUCTURAL LIMIT 1 (the scale-read count).  bound_i*bound_j*bound_k*16 = 2*16*8*16 = 4,096 for
+//     QKH, which EQUALS its mesh-cycle count, and fa_mm_acc re-issues CONFIG_SCALE_MEM with the
+//     halved bounds on every call, so the sweep is complete.  Per 64 rows the totals are IDENTICAL
+//     to Sq=64: 16,384 scale reads and 768 A-scale writes.  *** So Sq=32 is a BUG, NOT A WALL --
+//     limit 1 forbids splitting ONE matmul into halves that share latched bounds, which this is not.
+//  4. THE HALF-HEIGHT accmem->spad STORE.  FA_SP_SQ32_PVMO bypasses it entirely (loop FSM does the
+//     move-out); still hangs, one half-tile later.
+//  5. THE COMPRESSED-ITERATOR BRANCH (my own leading suspicion, refuted by RTL audit).
+//     total_tiles = max_j * max_i, so QKF 64, QKH 32, PVF 32, PVH 16 -- ALL > 4, so the
+//     `total_tiles <= 4` branch (LoopMatmul.scala:563-575, :778-790) is NEVER taken and halving I
+//     does not change which branch is selected.  All four take iter_max_j = max_j/4 with every value
+//     non-zero.  *** BUT NOTE THE CLIFF ONE STEP AWAY: floorAdd with max_plus_one = 0 gives
+//     max = 0xFFFF, so the iterator never wraps, the unroller never reaches idle, the loop is never
+//     freed and MMIO 0x20 stays busy forever with NO assertion.  In the taken branch any max_j < 4
+//     yields iter_max_j = 0.  Anyone shrinking J or going to a 1x1-tile shape gets this verbatim. ***
+//  6. UN-FLUSHED PRELOAD ACCUMULATION.  mesh.io.req.valid := control_state === flush
+//     (ExecuteController.scala:275) and control_state enters flush ONLY on a CONFIG_CMD in the EX
+//     queue (:772-777); the WS preload tag matches TWO MATMULS LATE (MeshWithDelays.scala:239) and
+//     ReservationStation.scala:140's busy carve-out hides exactly ONE solitary preload, not two.
+//     FA_SP_SQ32_FLUSH issues a bare idempotent config_ex in S5 to force the flush: STILL HANGS, at
+//     the SAME mark m[11] as the unmodified build.  (Testing this by simply dropping FA_SP_LEANCFG is
+//     INVALID -- that restores the 7-command configure_mxgemmini, and Sq=32 calls fa_cfg twice per
+//     half-tile, so the config_ld traffic trips the DMA-queue assert first.  Two variables at once.)
+//  7. STALE CONFIG_SCALE_MEM BOUNDS AT STORE ISSUE.  Static: fa_cfg is a NO-OP under FA_SP_LEANCFG and
+//     fa_store_acc issues no CONFIG_SCALE_MEM, so at S5 loop_bound_* holds exactly what
+//     fa_mm_acc<PVH> set -- (2,8,16) -- and the store's LOOP_WS bounds are also (2,8,16).  They agree
+//     by construction, so staleness is not it.
+//
+// WHAT IS LEFT, and it is a WAVEFORM question rather than another A/B: whether loop_bound_i = 2 is
+// itself mishandled in the STORE path -- StoreController.scala:203 (io.dma.req.bits.max_j ->
+// Scratchpad.scala:73-82 WriteReqExpander, which splits every accumulator write into two halves) and
+// :209 (bytes_to_read = rows*blocks -> DMACommandTracker).  A store whose row count never satisfies
+// the tracker leaves st_completed unset, which reproduces this signature exactly.  THE TWO SIGNALS TO
+// LOOK AT: is stC_spad's state stuck in `st` with io.cmd.valid low, and what is loop_bound_i at the
+// cycle the halved STORE_SPAD fires.
+// ============================================================================================
 // FA_SP_SQ32 -- Sq=32 HALF-TILE LOOP WITH S/P AND P8 DOUBLE-BUFFERED.
 //
 // WHY: at Sq=64 the PV matmul's 8,882 cycles are STRUCTURALLY exposed with 5 of 6 warps idle, no
@@ -4304,7 +4368,26 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     if (warp == 0) {
         if (t > 0) {
             fa_cfg<PVH>(0, 1, tid);
+#ifdef FA_SP_SQ32_PVMO
+            // ==== FA_SP_SQ32_PVMO -- DIAGNOSTIC for the Sq=32 drain hang. =========================
+            // The hang is warp 0 spinning in fa_gfl's unbounded `while (busy != 0)` in stage S5,
+            // waiting for a PV HALF-tile matmul that never retires (marks stop at m[t*7+4]; under
+            // FA_SP_ACCRS, which deletes that very drain, the hang moves ONE DRAIN LATER -- which is
+            // what an unretired mesh op does and what a barrier bug cannot do).
+            // S5's manual accmem->spad store is the suspect: fa_store_acc needs an atomic
+            // all-16-subbank grant (Hazard 2), and nothing in this campaign has ever exercised that
+            // path at HALF height (32 rows / PE_TILES_I=2).  This flag bypasses it entirely by letting
+            // the loop FSM do the move-out (acc_move_out=true), exactly as the Sq=64 body's PV does.
+            //   RUNS   => the half-height accmem->spad store is the culprit, and that is a new fact
+            //            about this hardware, not just an Sq=32 fix.
+            //   HANGS  => the fault is in the half-height PV matmul itself, and the next step is the
+            //            waveform on /tmp/flash_s16.elf.
+            // It gives up the bank-disjointness argument (the mesh now writes SMEM during the
+            // matmul), so it is a DIAGNOSTIC, not a candidate configuration.
+            fa_mm<PVH>(FA_H_SPP(np), SP_V_END, FA_H_SP(np), /*asel=*/0, /*wsel=*/1, tid);
+#else
             fa_mm_acc<PVH>(FA_H_SPP(np), SP_V_END, /*asel=*/0, /*wsel=*/1, tid);
+#endif
         }
     } else {
         if (t < FA_NH) fa_requant_max<FA_SQH, FA_SK>(
@@ -4325,7 +4408,40 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     SMARK();                                                            // s4
     // -- S5: drain PV(t-1); accumulator -> O(t-1) @ the LOW HALF of the dead S/P[1-p].  Quiesced. -
     if (warp == 0) {
-#ifdef FA_SP_ACCRS
+#ifdef FA_SP_SQ32_FLUSH
+        // ==== FA_SP_SQ32_FLUSH -- SURGICAL TEST OF THE NO-FLUSH HYPOTHESIS. ======================
+        // From the RTL audit: mesh.io.req.valid := control_state === flush (ExecuteController.scala:275)
+        // and control_state enters `flush` ONLY on a CONFIG_CMD in the EX queue (:772-777).  A PRELOAD
+        // with a real C address retires only when its mesh output emerges, and in WS the tag is matched
+        // TWO MATMULS LATE (MeshWithDelays.scala:239).  ReservationStation.scala:140's busy carve-out
+        // hides exactly ONE solitary preload, not two.  FA_SP_LEANCFG hoists config_ex out of steady
+        // state, so nothing ever forces a flush -> outstanding preloads accumulate -> at two, MMIO 0x20
+        // never drops -> fa_gfl's unbounded `while (busy != 0)` spins forever.  Sq=32 issues twice the
+        // matmul/drain pairs per 64 rows, which is why it reaches that boundary first and why removing
+        // ANY single drain buys exactly one more iteration.
+        // WHY THIS IS SURGICAL: simply dropping FA_SP_LEANCFG restores the whole 7-command
+        // configure_mxgemmini, and Sq=32 calls fa_cfg TWICE per half-tile, so the extra config_ld
+        // traffic trips ScratchpadBank.sv:127 "DMA queue does not have enough entries" at ~146k cycles
+        // (measured: snl16) BEFORE the flush hypothesis can be tested at all.  That test changed two
+        // variables.  This one emits ONLY config_ex -- the single command that moves control_state to
+        // flush -- with the SAME values fa_cfg_once already set, so it is idempotent and its only
+        // effect is the flush.
+        //   RUNS  => the hang is un-flushed preload accumulation.  The fix is a periodic config_ex,
+        //            and FA_SP_LEANCFG carries the same latent hazard on the Sq=64 body -- only
+        //            Sq=32's higher matmul rate exposes it.
+        //   HANGS => preload accumulation is not the mechanism either, and the remaining suspect is
+        //            CONFIG_SCALE_MEM's loop_bound_i disagreeing with the LOOP_WS bounds at the moment
+        //            the half-height STORE_SPAD fires (StoreController.scala:203 -> DMACommandTracker).
+        if (t > 0) {
+            gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY, 1, 1, 0, 0, false,
+                                        GEMMINI_FORMAT_FP8, GEMMINI_FORMAT_FP8, GEMMINI_FORMAT_FULL,
+                                        false);
+            fa_gfl(tid); fa_store_acc<PVH>(FA_H_SP(np), tid); fa_gfl(tid);
+        }
+#elif defined(FA_SP_SQ32_PVMO)
+        // FA_SP_SQ32_PVMO: the loop FSM already moved PV out, so S5 is a DRAIN ONLY.
+        if (t > 0) { fa_gfl(tid); }
+#elif defined(FA_SP_ACCRS)
         // FA_SP_ACCRS in the Sq=32 body: the SAME move that is worth -196 cyc/tile at Sq=64, applied
         // to the PV accumulator instead of the QK one.  ReservationStation.scala's STORE branch, for
         // an opa_is_dst entry, computes deps_ex including "additionally if ex writes, raw for st b <-
