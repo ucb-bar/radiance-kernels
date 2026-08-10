@@ -685,6 +685,67 @@ All four shapes verified in the preprocessed body (the S5/S6 call-and-barrier se
 reproduces RV32-segment sha `82e73680240b60f2`, byte-identical to the gate-passing `stV24` image. So
 the table above is not invalidated by the restructuring.
 
+### *** 30% IS MET: 31.68% with the full NT24 gate ***
+
+Admissible numbers only -- unperturbed **and** all-correct, per the rule above. Verified independently
+from the traces with `fa_verify_tiles.py` + `fa_marks3.py --per 8 --mesh 16420`:
+
+| run | lever added to `FA_ST_NOOVL`+`ACCRS`+`PREPK` | cyc/tile | util | NT24 |
+|---|---|---|---|---|
+| `stX24` | -- (baseline) | 57,135 | 28.74% | 48/48 |
+| `stW24` | `OVL_DMA` | 56,332 | 29.15% | 48/48 |
+| `stZ24` | `OVL_SCL` | 54,726 | **30.00%** | 48/48 |
+| `stQ24` | `FA_SM_2P`+`2PRAW` | 53,852 | **30.49%** | 48/48 |
+| **`stZQ24`** | **`OVL_SCL` + `2P`+`2PRAW`** | **51,834** | **31.68%** | **48/48** |
+
+Perturbed companions (correctness evidence only -- their cycles are void by rule 2): `stQ24p2` 48/48,
+`stZQ24p2` 48/48, `stW24p2` 48/48.
+
+`stZQ24` clears both pre-registered conditions -- 51,834 <= 54,733 unperturbed, and 48/48 under
+`PHASE2` -- so `stZQ72` is launched. `stQ72` alongside it, because `2P`+`2PRAW` alone reaches 30.49%
+with **no overlap restored at all**, and a simpler config passing the full gate is easier to defend
+than a faster one.
+
+### `FA_PHASE<k>` systematically loses ~k tile-images from the DELAYED cluster
+
+`stZ24p1` reported 47 images and `stZ24p2` 46, against 48. **It is not the budget wall** -- checked by
+dividing `$finish` by 2000: every run terminated normally, the largest at 1,544,247 cycles against a
+2,000,000 budget. The actual cause, from the per-cluster counts:
+
+| run | cluster 0 | cluster 1 (the delayed one) |
+|---|---|---|
+| `stZ24` (no phase) | 24 | 24 |
+| `stZ24p1` (`PHASE1`) | 24 | **23** |
+| `stZ24p2` (`PHASE2`) | 24 | **22** |
+
+The shortfall is **always in the delayed cluster and scales with `k`** -- exactly cluster 1's lag from
+`k x 64` MMIO round-trips x 24 tiles (~58k cycles at `k=1`, ~115k at `k=2`, i.e. ~1 and ~2 tiles at
+~55k/tile). Its last tiles' O stores are simply cut off when the simulation terminates.
+
+**How to read it:** the captured images are all correct; the missing ones are *absent from the trace*,
+not wrong. Reporting "47 of 48" as a failure is wrong, and reporting it as "48/48" is also wrong. It is
+config-dependent -- `stZQ24p2` is faster and captured a full 24/24 on cluster 1, and every gate run
+(`stV24p1/p2/p3/b1/b2`) captured 48/48 -- so the gate table is unaffected. **Diagnostic: compare the
+per-cluster counts; if the short one is the delayed cluster, this is the cause.**
+
+Consequence for `OVL_SCL`: its own phase evidence is 47/47 and 46/46 correct rather than 48/48. But
+`OVL_SCL` is *inside* `stZQ24p2` (full 48/48 at `PHASE2`) and inside `stF24p1`/`p2`, so it is covered by
+supersets and does not need a re-run.
+
+### Convergence with the peak track, and the endpoint it implies
+
+Three independent legs now agree that **the QK/SIMT overlap is the hazard and `_DMA`/`_SCL` are not
+implicated**:
+
+1. `FA_ST_OVL_QK` on this body -- restoring *only* QK/SIMT overlap breaks it (45/48, and 9/24 at `PHASE2`).
+2. `FA_SP_NOQKOVL` on the peak body -- removing *only* QK/SIMT overlap makes the fast body pass NT6,
+   NT8, NT24 (48/48, 50,839 = 32.30%) and all five phase variants.
+3. `stW24` here -- restoring `OVL_DMA` alone stays 48/48 at 29.15%.
+
+So `FA_ST_NOOVL` gives up two overlaps for nothing, and the right endpoint is **both non-QK overlaps
+restored, only QK removed**. `stZQ24` is that minus `OVL_DMA`; `stF24`/`p1`/`p2` add it and are in
+flight (projection, to be replaced by measurement: 51,834 - 803 ~= 51,031 ~= 32.18%).
+
 ### Where 57,135 cyc/tile actually goes -- the per-stage table for `FA_ST_NOOVL`
 
 From `stX24` (48/48 correct, so the timing is admissible), `fa_marks3.py --per 8 --mesh 16420`,
