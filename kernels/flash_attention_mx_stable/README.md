@@ -862,7 +862,8 @@ same-base control:
 
 | run | config | cl0 onset | cl1 onset |
 |---|---|---|---|
-| `stY2b` | `OVL_QK`, **no** `BANKA` -- the CONTROL | **17** | none(>17) |
+| `stY2b` | `OVL_QK`, **no** `BANKA` -- the CONTROL | **17** | none(>23) |
+| | *(final: 41 correct / 5 wrong of 46; cycles **VOID** by rule 1; budget-wall truncated)* | | |
 | `stB24` | `OVL_QK` + **`BANKA`** | **8** | 14 |
 | | *(final: 22 correct / 18 wrong of 40; cycles **VOID** by rule 1)* | | |
 | `stB24p2` | `OVL_QK` + `BANKA` + `PHASE2` | **7** | 22 |
@@ -896,8 +897,10 @@ buys, and the SMEM-bank-arbitration story no longer has a working prediction beh
 > The run's own interval spread is the tell, and it is the reason rule 1 exists: **min 41,693, max
 > 74,969** -- a 1.8x spread against ~3% on a clean run. `31.82%` is the mean of garbage.
 >
-> Fixed: the monitor now voids cycles if the run is perturbed **or** has any wrong tile, names which
-> rule fired, and additionally flags a budget-wall truncation. Recorded rather than quietly patched,
+> Fixed, **and the fix is verified working**: on the very next landing (`stY2b`, 41 correct / 5 wrong) the
+> monitor emitted `cycles VOID (rule 1: 5 wrong tiles)` and `*** BUDGET WALL -- image count truncated ***`
+> without being asked. It now voids cycles if the run is perturbed **or** has any wrong tile, names which
+> rule fired, and flags budget-wall truncation. Recorded rather than quietly patched,
 > because the failure mode is the one this campaign keeps repeating -- a check that looks like it
 > enforces a rule while enforcing only the easy half of it.
 
