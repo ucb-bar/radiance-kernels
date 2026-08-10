@@ -20,6 +20,7 @@ error):
 | | config | utilization | evidence |
 |---|---|---|---|
 | **Full gate passed** | `FA_ST_NOOVL` | 28.68% | NT6, NT8, NT24, **NT72 144/144**, `PHASE1/2/3`, `PHASE_BOTH` x2 |
+| **NT72 + >=30%, simplest** | **`stQ`** = `+ FA_SM_2P FA_SM_2PRAW` | **30.49%** | **NT72 144/144**, NT24 48/48, `PHASE2` 48/48; NT6/NT8/`PHASE1`/`PHASE3`/`BOTH` x2 in flight |
 | **Recommended / best admissible** | **`stF24`** (below) | **32.26%** | NT6, NT8, NT24, `PHASE1/2/3`, `PHASE_BOTH` x2 -- **all 48/48, every phase point passes**; only **NT72** (`stF72`) outstanding |
 
 ```
@@ -117,6 +118,34 @@ so a second seed only randomises uninitialised state and is *not* a second test 
 The **sequential `FULL_ATTN2 FA_STEADY`** body is also clean at `NT24` (`stS24b`, 48/48) now that the
 `FA_NTILES` hole is fixed -- a second, structurally unrelated de-overlapped body reaching the same
 place, which is the corroboration that matters most here.
+
+## Second config with the full NT72 gate -- and the first at >=30%: `stQ`, 30.49%
+
+`stQ72`: **144 of 144 tile-images**, onset `none(>71)` in both clusters. Its NT24 cycle number is
+**53,852 = 30.49%**, admissible (unperturbed, 48/48).
+
+```
+# stQ -- FA_ST_NOOVL plus the SIMT softmax restructuring, and NOTHING ELSE.  No overlap restored.
+FULL_ATTN2 FA_SP FA_SP_QOVL FA_SP_LEANCFG FA_SP_QKACC FA_SP_PKOVL FA_SP_QSPLIT FA_SP_WCNT
+FA_SP_PAX FA_SP_CVTX FA_ST_NOOVL FA_SP_ACCRS FA_SP_PREPK FA_SM_2P FA_SM_2PRAW
+```
+
+**Why this one matters even though `stF24` is faster.** `stQ` restores **no overlap at all** -- it is
+`FA_ST_NOOVL` (the fully de-overlapped body, whose full gate is already banked) plus a **SIMT-only**
+arithmetic restructuring that touches no mesh, no DMA and no gemmini port. So its robustness argument does
+not depend on any claim about which overlaps are safe: it inherits the de-overlapped body's structure
+unchanged. `stF24` reaches 32.26% but *does* depend on `_DMA` and `_SCL` being harmless -- which is
+measured (48/48 separately and together) but is a stronger assumption than "no overlap at all".
+
+**So there are now two defensible endpoints, and which to prefer depends on what is being defended:**
+
+* **`stQ` at 30.49%** -- meets the target, NT72 banked, minimal structural assumption. Prefer when the
+  robustness claim has to be argued rather than just cited.
+* **`stF24` at 32.26%** -- faster, every phase point at NT24, NT72 in flight. Prefer when the measured
+  safety of `_DMA`/`_SCL` is accepted.
+
+`stQ`'s remaining gate points (NT6, NT8, `PHASE1`, `PHASE3`, `PHASE_BOTH` x2) are launched -- all cheap,
+since the expensive NT72 is already done.
 
 ## A cycle number is admissible only if the run is BOTH fully correct AND unperturbed
 
