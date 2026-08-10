@@ -718,8 +718,25 @@ the QK/SIMT overlap, which is what the three-way convergence said the endpoint s
 
 Unperturbed and all-correct, so admissible. `stF72` was **self-dispatched** by the monitor on landing.
 
-Gate companions for this config: **`stF24p2` (`PHASE2`) is 48/48**, a full 24/24 on both clusters -- its
-cycle number (52,062) is void by rule 2 and is not quoted as performance. `stF24p1` is still running.
+**Gate status for this config** -- the recommended one, so the gate has to be re-earned on it and not
+inherited from `FA_ST_NOOVL`:
+
+| gate point | run | result |
+|---|---|---|
+| NT24, unperturbed | `stF24` | **48/48**, 50,906 cyc/tile, **32.26%** (admissible) |
+| NT24 + `PHASE1` | `stF24p1` | **48/48** (cycles void by rule 2) |
+| NT24 + `PHASE2` | `stF24p2` | **48/48**, full 24/24 both clusters (cycles void) |
+| NT6 | `stF6` | in flight |
+| NT8 | `stF8` | in flight |
+| NT24 + `PHASE3` | `stF24p3` | in flight |
+| NT24 + `PHASE1`+`BOTH` | `stF24b1` | in flight |
+| NT24 + `PHASE2`+`BOTH` | `stF24b2` | in flight |
+| **NT72** | `stF72` | in flight (self-dispatched) |
+
+**Until those six land, 32.26% is "NT24 gate passed", not "full gate passed".** `FA_ST_NOOVL` holds the
+full-gate result (NT72 144/144 + every phase point) at 28.68%; `stF24` holds the best *admissible* cycle
+number at 32.26% with NT24 + `PHASE1` + `PHASE2`. Those are two different claims and the distinction is
+the whole point of the admissibility rules above.
 
 **The convergence is now quantitative, and this is the strongest structural result in the file.** Two
 bodies reached "only the QK/SIMT overlap removed" from *opposite directions* -- the peak body by
