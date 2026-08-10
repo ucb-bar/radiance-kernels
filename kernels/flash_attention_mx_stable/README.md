@@ -706,6 +706,41 @@ Perturbed companions (correctness evidence only -- their cycles are void by rule
 with **no overlap restored at all**, and a simpler config passing the full gate is easier to defend
 than a faster one.
 
+### NEW BEST: `stF24` = 50,906 cyc/tile, **32.26%**, 48/48 -- and it lands 67 cycles from the peak body
+
+Restoring **both** non-QK overlaps (`OVL_SCL` + `OVL_DMA`) on top of `2P`+`2PRAW`, i.e. removing *only*
+the QK/SIMT overlap, which is what the three-way convergence said the endpoint should be:
+
+| run | config | cyc/tile | util | NT24 |
+|---|---|---|---|---|
+| `stZQ24` | `OVL_SCL` + `2P` | 51,834 | 31.68% | 48/48 |
+| **`stF24`** | **`OVL_SCL` + `OVL_DMA` + `2P`** | **50,906** | **32.26%** | **48/48** |
+
+Unperturbed and all-correct, so admissible. `stF72` was **self-dispatched** by the monitor on landing.
+
+**The convergence is now quantitative, and this is the strongest structural result in the file.** Two
+bodies reached "only the QK/SIMT overlap removed" from *opposite directions* -- the peak body by
+subtracting one overlap (`FA_SP_NOQKOVL`), this body by de-overlapping completely and adding two back:
+
+| body | route | cyc/tile | util |
+|---|---|---|---|
+| peak (`flash_attention_mx`) | `FA_SP_NOQKOVL` -- subtract QK overlap only | 50,839 | 32.30% |
+| stable (here, `stF24`) | de-overlap all, restore `_DMA` + `_SCL` | **50,906** | **32.26%** |
+
+**67 cycles apart -- 0.13%, and 0.04 percentage points of utilization.** Two structurally different
+schedules, two independent flag mechanisms, two separate agents, converging on the same number once the
+same single overlap is gone. That is much stronger than either result alone, and it supports two
+claims:
+
+* **the QK/SIMT overlap is the *only* hazardous overlap** -- `_DMA` and `_SCL` are both safe, measured
+  separately (`stW24` 48/48, `stZ24` 48/48) and together (`stF24` 48/48); and
+* **removing exactly it costs a determinate amount** (~6.2k cyc/tile from the peak body's ~44.7k),
+  reached from either side. It is a property of the hardware hazard, not of one agent's schedule.
+
+The corollary for anyone picking this up: `FA_ST_NOOVL` on its own over-serializes -- it gives up two
+overlaps that cost 6,229 cyc/tile between them (57,135 -> 50,906) and buy no robustness. **The
+recommended stable config is `stF24`'s**, not plain `FA_ST_NOOVL`'s.
+
 ### `FA_PHASE<k>` systematically loses ~k tile-images from the DELAYED cluster
 
 `stZ24p1` reported 47 images and `stZ24p2` 46, against 48. **It is not the budget wall** -- checked by
