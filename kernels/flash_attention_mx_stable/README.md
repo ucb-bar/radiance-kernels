@@ -20,7 +20,7 @@ error):
 | | config | utilization | evidence |
 |---|---|---|---|
 | **Full gate passed** | `FA_ST_NOOVL` | 28.68% | NT6, NT8, NT24, **NT72 144/144**, `PHASE1/2/3`, `PHASE_BOTH` x2 |
-| **Recommended / best admissible** | **`stF24`** (below) | **32.26%** | NT6 12/12, NT8 16/16, NT24 48/48, `PHASE1` 48/48, `PHASE2` 48/48; `PHASE3`, `PHASE_BOTH` x2, NT72 **in flight** |
+| **Recommended / best admissible** | **`stF24`** (below) | **32.26%** | NT6 12/12, NT8 16/16, NT24 48/48, `PHASE1`/`PHASE2`/`PHASE3` all 48/48; `PHASE_BOTH` x2 + NT72 **in flight** |
 
 ```
 # the recommended stable config (stF24) -- only the QK/SIMT overlap is removed
@@ -32,16 +32,16 @@ FA_SM_2P FA_SM_2PRAW
 Target was 30%; `stF24` exceeds it. **`FA_ST_NOOVL` alone over-serializes** -- it gives up two overlaps
 worth 6,229 cyc/tile that buy no robustness. Do not use it as the recommendation; use `stF24`'s set.
 
-**Mechanism, current best hypothesis:** the QK/SIMT overlap is the *only* hazardous one (three
-independent legs agree), and during it the sole structure both parties touch is SMEM -- where
-`SP_C` (read by finalize) spans **banks 1+2** while the mesh reads Q from **bank 2**, which is the
-documented forbidden condition. `FA_SP_BANKA` makes them disjoint. Test + same-base control in flight
-(`stB24`, `stB24p2`, `stY2b`).
+**Mechanism: still unidentified.** The QK/SIMT overlap is the *only* hazardous one (three independent
+legs agree), but **the bank-collision explanation for it is refuted** -- see below. What survives is the
+localization (S, positively, per-tile), the fact that only this one overlap matters, and that removing it
+costs a determinate ~6.2k cyc/tile from either body. `stF24` does not depend on the mechanism being
+known: it removes the overlap.
 
-**Handoff to the peak track, if the bank-collision test confirms:** the same remap should let the *fast*
-body re-admit the QK/SIMT overlap it currently removes via `FA_SP_NOQKOVL`, which is worth ~6.2k cyc/tile
-there too -- i.e. a route past the 38.8% ceiling rather than a robustness fix. Worth their slots only
-after `stB24`/`stB24p2` land, and only if `stY2b` confirms the control fails.
+**~~Handoff to the peak track~~ -- WITHDRAWN, the bank-collision test is REFUTED.** I had suggested
+`FA_SP_BANKA` might let the fast body re-admit the QK/SIMT overlap past the 38.8% ceiling. **Do not spend
+slots on that.** `BANKA` does not fix the hazard -- it moves the onset from tile 17 to tile 8, i.e.
+substantially *worse*. Details below.
 
 **Handoff to the FPGA track:** keep targeting `FA_ST_NOOVL` until `stF72` lands, because it is the config
 with a confirmed NT72 144/144 to diverge from. Details in the 1-cluster section below.
@@ -762,7 +762,7 @@ inherited from `FA_ST_NOOVL`:
 | NT24 + `PHASE2` | `stF24p2` | **48/48**, full 24/24 both clusters (cycles void) |
 | NT6 | `stF6` | **12/12**, 51,450 cyc/tile, 31.91% |
 | NT8 | `stF8` | **16/16**, 51,225 cyc/tile, 32.05% |
-| NT24 + `PHASE3` | `stF24p3` | in flight |
+| NT24 + `PHASE3` | `stF24p3` | **48/48**, full 24/24 both clusters (cycles void) |
 | NT24 + `PHASE1`+`BOTH` | `stF24b1` | in flight |
 | NT24 + `PHASE2`+`BOTH` | `stF24b2` | in flight |
 | **NT72** | `stF72` | in flight (self-dispatched) |
@@ -846,6 +846,34 @@ per-cluster counts; if the short one is the delayed cluster, this is the cause.*
 Consequence for `OVL_SCL`: its own phase evidence is 47/47 and 46/46 correct rather than 48/48. But
 `OVL_SCL` is *inside* `stZQ24p2` (full 48/48 at `PHASE2`) and inside `stF24p1`/`p2`, so it is covered by
 supersets and does not need a re-run.
+
+## THE BANK-COLLISION PREDICTION IS REFUTED -- and it makes the hazard WORSE, not better
+
+Pre-registered prediction: `FA_ST_OVL_QK` + `FA_SP_BANKA` would be *correct*, because `BANKA` makes
+`SP_C` (what finalize reads) bank 1 exactly and therefore disjoint from Q (bank 2). Measured, with a
+same-base control:
+
+| run | config | cl0 onset | cl1 onset |
+|---|---|---|---|
+| `stY2b` | `OVL_QK`, **no** `BANKA` -- the CONTROL | **17** | none(>17) |
+| `stB24` | `OVL_QK` + **`BANKA`** | **8** | 14 |
+| `stB24p2` | `OVL_QK` + `BANKA` + `PHASE2` | **7** | none(>19) |
+
+**The control behaves as required** -- `OVL_QK` on this exact base does fail (onset 17), so the comparison
+is valid and `stY24`'s older-base result was not an artifact. **And the treatment is worse than the
+control: onset 17 -> 8, with both clusters affected instead of one.** The prediction is refuted, and the
+sign is the opposite of predicted. Sixth refuted mechanism of this campaign, and mine.
+
+**What this does and does not establish.** It establishes that `BANKA` is **not a fix** and that the
+peak-track handoff built on it must be withdrawn. It does **not** cleanly establish that "bank collision"
+is wrong in general, because `BANKA` is not a surgical change -- it also relocates P8 from bank 1 to bank
+2, so it could be removing the Q/`SP_C` collision while creating a different one. Those two readings
+cannot be separated by this experiment. What is certain is the direction: this remap costs more than it
+buys, and the SMEM-bank-arbitration story no longer has a working prediction behind it.
+
+**Cost of being wrong here: three runs.** That is what the same-base control bought -- without `stY2b` I
+could have read `stB24`'s onset 8 as "BANKA fails" without knowing whether `OVL_QK` failed on this base at
+all, and the whole comparison would have been uninterpretable.
 
 ## The convergence narrows the mechanism to a BANK COLLISION -- with a prediction and its control
 
