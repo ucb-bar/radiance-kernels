@@ -718,6 +718,9 @@ the QK/SIMT overlap, which is what the three-way convergence said the endpoint s
 
 Unperturbed and all-correct, so admissible. `stF72` was **self-dispatched** by the monitor on landing.
 
+Gate companions for this config: **`stF24p2` (`PHASE2`) is 48/48**, a full 24/24 on both clusters -- its
+cycle number (52,062) is void by rule 2 and is not quoted as performance. `stF24p1` is still running.
+
 **The convergence is now quantitative, and this is the strongest structural result in the file.** Two
 bodies reached "only the QK/SIMT overlap removed" from *opposite directions* -- the peak body by
 subtracting one overlap (`FA_SP_NOQKOVL`), this body by de-overlapping completely and adding two back:
@@ -753,9 +756,18 @@ dividing `$finish` by 2000: every run terminated normally, the largest at 1,544,
 | `stZ24p1` (`PHASE1`) | 24 | **23** |
 | `stZ24p2` (`PHASE2`) | 24 | **22** |
 
-The shortfall is **always in the delayed cluster and scales with `k`** -- exactly cluster 1's lag from
-`k x 64` MMIO round-trips x 24 tiles (~58k cycles at `k=1`, ~115k at `k=2`, i.e. ~1 and ~2 tiles at
-~55k/tile). Its last tiles' O stores are simply cut off when the simulation terminates.
+The shortfall is **always in the delayed cluster**, and on these two runs it tracked `k` -- cluster 1's
+lag from `k x 64` MMIO round-trips x 24 tiles is ~58k cycles at `k=1` and ~115k at `k=2`, i.e. ~1 and ~2
+tiles at ~55k/tile, which matches 23 and 22 exactly. `stZ24p2` is the sharper case: it ended at
+1,425,326 cycles, and cluster 1 at `PHASE2` needs ~24 x (54,726 + 4,800) ~= 1.43M -- so it was *just*
+short of finishing its 24th tile when the run terminated.
+
+> **CORRECTION -- I over-generalized this from two data points.** I wrote that it "scales with `k`" as
+> though lawful. **`stF24p2` refutes the lawfulness:** same `PHASE2`, and it captured a full **24/24 on
+> cluster 1** (48/48 overall). The difference is headroom -- `stF24` is 50,906 cyc/tile against `stZ24`'s
+> 54,726, so cluster 1 clears its 24th tile before termination. So the effect is **`k`-correlated but
+> config-dependent, not lawful**, and it appears only when the delayed cluster's total lands near the
+> termination point. Two data points agreeing is not a law; the third one broke it.
 
 **How to read it:** the captured images are all correct; the missing ones are *absent from the trace*,
 not wrong. Reporting "47 of 48" as a failure is wrong, and reporting it as "48/48" is also wrong. It is
