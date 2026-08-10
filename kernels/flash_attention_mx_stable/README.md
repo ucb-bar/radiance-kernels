@@ -726,12 +726,29 @@ inherited from `FA_ST_NOOVL`:
 | NT24, unperturbed | `stF24` | **48/48**, 50,906 cyc/tile, **32.26%** (admissible) |
 | NT24 + `PHASE1` | `stF24p1` | **48/48** (cycles void by rule 2) |
 | NT24 + `PHASE2` | `stF24p2` | **48/48**, full 24/24 both clusters (cycles void) |
-| NT6 | `stF6` | in flight |
+| NT6 | `stF6` | **12/12**, 51,450 cyc/tile, 31.91% |
 | NT8 | `stF8` | in flight |
 | NT24 + `PHASE3` | `stF24p3` | in flight |
 | NT24 + `PHASE1`+`BOTH` | `stF24b1` | in flight |
 | NT24 + `PHASE2`+`BOTH` | `stF24b2` | in flight |
 | **NT72** | `stF72` | in flight (self-dispatched) |
+
+**Quote the NT24 figure, not the NT6 one.** `stF6` measures 51,450 (31.91%) against `stF24`'s 50,906
+(32.26%) for the *same binary logic*. Both are admissible; they differ because NT6 has 5 steady
+intervals to NT24's 23, so the expensive fill tile is amortized over far fewer of them. The two do not
+disagree -- the longer run is simply the better estimate of steady state. This is the same reason the
+project's own rule says to quote the *converged* interval rather than the minimum.
+
+### Note for the FPGA track: keep targeting `FA_ST_NOOVL` for now
+
+The hardware bring-up was pointed at `FA_ST_NOOVL` because it had a confirmed NT72 144/144 to diverge
+from. **That is still the right reference and should not be switched to `stF24` yet** -- `stF24` is
+faster and is the eventual recommendation, but its NT72 (`stF72`) has not landed, so it does not yet have
+a known-correct long-run reference to compare hardware against. Switch once `stF72` returns 144/144;
+until then a hardware mismatch against `stF24` could not be attributed between the board and the config.
+Both are one `-D` apart (`FA_ST_OVL_SCL FA_ST_OVL_DMA FA_SM_2P FA_SM_2PRAW`), so switching later is cheap.
+Reminders that still apply to either: **8** marks per tile, NT72 yields **72** images on a 1-cluster
+board, and `fa_rowdiag.py --onset` separates `ABSENT (1-cluster run)` from `NO IMAGES YET`.
 
 **Until those six land, 32.26% is "NT24 gate passed", not "full gate passed".** `FA_ST_NOOVL` holds the
 full-gate result (NT72 144/144 + every phase point) at 28.68%; `stF24` holds the best *admissible* cycle
