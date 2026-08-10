@@ -147,6 +147,27 @@ measured (48/48 separately and together) but is a stronger assumption than "no o
 `stQ`'s remaining gate points (NT6, NT8, `PHASE1`, `PHASE3`, `PHASE_BOTH` x2) are launched -- all cheap,
 since the expensive NT72 is already done.
 
+## THREE configs now hold NT72 144/144, and the overlap ladder is monotone
+
+| config | overlaps restored | cyc/tile | util | NT72 | remaining gate points |
+|---|---|---|---|---|---|
+| `FA_ST_NOOVL` | none | 57,256 | 28.68% | **144/144** | -- **complete** |
+| **`stQ`** | none (+ SIMT softmax) | 53,852 | **30.49%** | **144/144** | NT6, NT8, `P1`, `P3`, `BOTH` x2 -- in flight |
+| **`stZQ`** | `_SCL` | 51,834 | **31.68%** | **144/144** | NT6, NT8, `P1`, `P3`, `BOTH` x2 -- not launched |
+| **`stF24`** | `_SCL` + `_DMA` | 50,906 | **32.26%** | `stF72` in flight | none -- all others already 48/48 |
+
+**Utilization rises monotonically as overlaps are restored, and correctness does not degrade at any
+step** -- three independent NT72 confirmations, 432 tile-images, zero wrong. That is worth more than any
+single row: it says the overlap-restoration ladder is well-behaved, i.e. `_SCL` and `_DMA` really are
+free and the cliff is at `_QK` alone, exactly where `stY2b`/`stB24` put it.
+
+**Why `stZQ`'s remaining six points are deliberately NOT launched.** `stF24` is faster *and* needs only
+one run to complete its gate (`stF72`, already past halfway) because every other point is banked;
+`stZQ` would need six. If `stF72` returns 144/144, `stZQ` is redundant -- strictly slower than `stF24`
+with a strictly stronger assumption than `stQ`. If `stF72` fails, `stZQ` becomes the best NT72-banked
+config and its six points get launched then. Spending six slots now on a fallback while the primary is
+one run from done is the wrong order.
+
 ## A cycle number is admissible only if the run is BOTH fully correct AND unperturbed
 
 Two separate rules, and they compose into something narrower than either alone:
