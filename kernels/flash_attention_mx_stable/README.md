@@ -12,6 +12,40 @@ Q,K,V (mvin) --[mesh: QK^T]--> S (accmem -> SMEM)
   --[mesh: PV]--> O (accmem) --[SIMT: finalize]--> O (bf16)
 ```
 
+## CURRENT STATUS -- read this first
+
+Two claims, deliberately kept apart (see the admissibility rules below for why blending them is an
+error):
+
+| | config | utilization | evidence |
+|---|---|---|---|
+| **Full gate passed** | `FA_ST_NOOVL` | 28.68% | NT6, NT8, NT24, **NT72 144/144**, `PHASE1/2/3`, `PHASE_BOTH` x2 |
+| **Recommended / best admissible** | **`stF24`** (below) | **32.26%** | NT6 12/12, NT8 16/16, NT24 48/48, `PHASE1` 48/48, `PHASE2` 48/48; `PHASE3`, `PHASE_BOTH` x2, NT72 **in flight** |
+
+```
+# the recommended stable config (stF24) -- only the QK/SIMT overlap is removed
+FULL_ATTN2 FA_SP FA_SP_QOVL FA_SP_LEANCFG FA_SP_QKACC FA_SP_PKOVL FA_SP_QSPLIT FA_SP_WCNT
+FA_SP_PAX FA_SP_CVTX FA_ST_NOOVL FA_SP_ACCRS FA_SP_PREPK FA_ST_OVL_SCL FA_ST_OVL_DMA
+FA_SM_2P FA_SM_2PRAW
+```
+
+Target was 30%; `stF24` exceeds it. **`FA_ST_NOOVL` alone over-serializes** -- it gives up two overlaps
+worth 6,229 cyc/tile that buy no robustness. Do not use it as the recommendation; use `stF24`'s set.
+
+**Mechanism, current best hypothesis:** the QK/SIMT overlap is the *only* hazardous one (three
+independent legs agree), and during it the sole structure both parties touch is SMEM -- where
+`SP_C` (read by finalize) spans **banks 1+2** while the mesh reads Q from **bank 2**, which is the
+documented forbidden condition. `FA_SP_BANKA` makes them disjoint. Test + same-base control in flight
+(`stB24`, `stB24p2`, `stY2b`).
+
+**Handoff to the peak track, if the bank-collision test confirms:** the same remap should let the *fast*
+body re-admit the QK/SIMT overlap it currently removes via `FA_SP_NOQKOVL`, which is worth ~6.2k cyc/tile
+there too -- i.e. a route past the 38.8% ceiling rather than a robustness fix. Worth their slots only
+after `stB24`/`stB24p2` land, and only if `stY2b` confirms the control fails.
+
+**Handoff to the FPGA track:** keep targeting `FA_ST_NOOVL` until `stF72` lands, because it is the config
+with a confirmed NT72 144/144 to diverge from. Details in the 1-cluster section below.
+
 ## Why two directories
 
 The two goals conflict, and conflating them produced weeks of false results.
@@ -727,7 +761,7 @@ inherited from `FA_ST_NOOVL`:
 | NT24 + `PHASE1` | `stF24p1` | **48/48** (cycles void by rule 2) |
 | NT24 + `PHASE2` | `stF24p2` | **48/48**, full 24/24 both clusters (cycles void) |
 | NT6 | `stF6` | **12/12**, 51,450 cyc/tile, 31.91% |
-| NT8 | `stF8` | in flight |
+| NT8 | `stF8` | **16/16**, 51,225 cyc/tile, 32.05% |
 | NT24 + `PHASE3` | `stF24p3` | in flight |
 | NT24 + `PHASE1`+`BOTH` | `stF24b1` | in flight |
 | NT24 + `PHASE2`+`BOTH` | `stF24b2` | in flight |
