@@ -105,7 +105,14 @@ above for why its NT24 figure cannot be used.
 
 Two things this does **not** say. It is one seed (12345) -- and the simulator is timing-deterministic,
 so a second seed only randomises uninitialised state and is *not* a second test of the schedule;
-`FA_PHASE` and more tiles are. And `FA_PHASE` sweeps `k = 1,2,3`; a `k` beyond 3 has not been run.
+`FA_PHASE` and more tiles are. And `FA_PHASE` swept `k = 1,2,3` at the time this was written.
+
+> **The `k > 3` gap is being closed rather than caveated.** The harness supports `k = 4` and `k = 5`
+> (`mxgemm_core.hpp:192-201`) and there was no reason to leave the sweep short, so `stF24p4` and
+> `stF24p5` are running at NT24 on the recommended config. Budgets were raised to 3.0M/3.2M because
+> `k = 4`/`5` inject 4x/5x the MMIO round-trips per tile per cluster, so the delayed cluster lags further
+> -- exactly the effect that cost `stZ24p1`/`p2` their tails, and the one place where under-budgeting
+> would silently produce a short image count that looks like a result.
 
 The **sequential `FULL_ATTN2 FA_STEADY`** body is also clean at `NT24` (`stS24b`, 48/48) now that the
 `FA_NTILES` hole is fixed -- a second, structurally unrelated de-overlapped body reaching the same
