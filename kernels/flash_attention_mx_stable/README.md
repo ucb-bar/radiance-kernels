@@ -20,7 +20,7 @@ error):
 | | config | utilization | evidence |
 |---|---|---|---|
 | **Full gate passed** | `FA_ST_NOOVL` | 28.68% | NT6, NT8, NT24, **NT72 144/144**, `PHASE1/2/3`, `PHASE_BOTH` x2 |
-| **Recommended / best admissible** | **`stF24`** (below) | **32.26%** | NT6 12/12, NT8 16/16, NT24 48/48, `PHASE1`/`PHASE2`/`PHASE3` all 48/48; `PHASE_BOTH` x2 + NT72 **in flight** |
+| **Recommended / best admissible** | **`stF24`** (below) | **32.26%** | NT6, NT8, NT24, `PHASE1/2/3`, `PHASE_BOTH` x2 -- **all 48/48, every phase point passes**; only **NT72** (`stF72`) outstanding |
 
 ```
 # the recommended stable config (stF24) -- only the QK/SIMT overlap is removed
@@ -764,7 +764,7 @@ inherited from `FA_ST_NOOVL`:
 | NT8 | `stF8` | **16/16**, 51,225 cyc/tile, 32.05% |
 | NT24 + `PHASE3` | `stF24p3` | **48/48**, full 24/24 both clusters (cycles void) |
 | NT24 + `PHASE1`+`BOTH` | `stF24b1` | **48/48**, full 24/24 both clusters (cycles void) |
-| NT24 + `PHASE2`+`BOTH` | `stF24b2` | in flight |
+| NT24 + `PHASE2`+`BOTH` | `stF24b2` | **48/48**, full 24/24 both clusters (cycles void) |
 | **NT72** | `stF72` | in flight (self-dispatched) |
 
 **Quote the NT24 figure, not the NT6 one.** `stF6` measures 51,450 (31.91%) against `stF24`'s 50,906
