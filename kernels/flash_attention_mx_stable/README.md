@@ -864,7 +864,13 @@ same-base control:
 |---|---|---|---|
 | `stY2b` | `OVL_QK`, **no** `BANKA` -- the CONTROL | **17** | none(>17) |
 | `stB24` | `OVL_QK` + **`BANKA`** | **8** | 14 |
-| `stB24p2` | `OVL_QK` + `BANKA` + `PHASE2` | **7** | none(>19) |
+| `stB24p2` | `OVL_QK` + `BANKA` + `PHASE2` | **7** | 22 |
+
+(`stB24p2` completed at 29 correct / 10 wrong of 39 images. **It hit the budget wall at exactly
+2,500,000 cycles** -- a concrete instance of the rule that NT72-and-friends must be budgeted for the
+*corrupt* case: a wrong run is ~2-3x slower per tile, so 24 tiles that need ~1.3M clean needed >2.5M here.
+The refutation is unaffected -- truncation removes only *trailing* images, and an onset of 7 is nowhere
+near the tail. But it is exactly how a short image count gets mistaken for a result.)
 
 **The control behaves as required** -- `OVL_QK` on this exact base does fail (onset 17), so the comparison
 is valid and `stY24`'s older-base result was not an artifact. **And the treatment is worse than the
