@@ -21,7 +21,7 @@ error):
 |---|---|---|---|
 | **Full gate passed** | `FA_ST_NOOVL` | 28.68% | NT6, NT8, NT24, **NT72 144/144**, `PHASE1/2/3`, `PHASE_BOTH` x2 |
 | **NT72 + >=30%, simplest** | **`stQ`** = `+ FA_SM_2P FA_SM_2PRAW` | **30.49%** | **NT72 144/144**, NT24 48/48, `PHASE2` 48/48; NT6/NT8/`PHASE1`/`PHASE3`/`BOTH` x2 in flight |
-| **Recommended / best admissible** | **`stF24`** (below) | **32.26%** | NT6, NT8, NT24, `PHASE1/2/3`, `PHASE_BOTH` x2 -- **all 48/48, every phase point passes**; only **NT72** (`stF72`) outstanding |
+| **Recommended / best admissible** | **`stF24`** (below) | **32.26%** | NT6, NT8, NT24, **`PHASE1` through `PHASE5`**, `PHASE_BOTH` x2 -- **all 48/48**; only **NT72** (`stF72`) outstanding |
 
 ```
 # the recommended stable config (stF24) -- only the QK/SIMT overlap is removed
@@ -108,6 +108,12 @@ Two things this does **not** say. It is one seed (12345) -- and the simulator is
 so a second seed only randomises uninitialised state and is *not* a second test of the schedule;
 `FA_PHASE` and more tiles are. And `FA_PHASE` swept `k = 1,2,3` at the time this was written.
 
+> **CLOSED. `k = 4` and `k = 5` both pass 48/48** (`stF24p4`, `stF24p5`, full 24/24 on both clusters).
+> So the recommended config is now swept across **the entire `k` range the harness implements** --
+> `FA_PHASE1` through `FA_PHASE5`, plus `FA_PHASE_BOTH` at `k = 1` and `k = 2` -- where the gate asks only
+> for `k = 1,2,3`. That is the most thorough perturbation evidence any configuration in this campaign has,
+> and it removes the caveat rather than restating it. Original note follows.
+>
 > **The `k > 3` gap is being closed rather than caveated.** The harness supports `k = 4` and `k = 5`
 > (`mxgemm_core.hpp:192-201`) and there was no reason to leave the sweep short, so `stF24p4` and
 > `stF24p5` are running at NT24 on the recommended config. Budgets were raised to 3.0M/3.2M because
@@ -820,6 +826,8 @@ inherited from `FA_ST_NOOVL`:
 | NT6 | `stF6` | **12/12**, 51,450 cyc/tile, 31.91% |
 | NT8 | `stF8` | **16/16**, 51,225 cyc/tile, 32.05% |
 | NT24 + `PHASE3` | `stF24p3` | **48/48**, full 24/24 both clusters (cycles void) |
+| NT24 + `PHASE4` | `stF24p4` | **48/48** (beyond what the gate asks) |
+| NT24 + `PHASE5` | `stF24p5` | **48/48** (beyond what the gate asks) |
 | NT24 + `PHASE1`+`BOTH` | `stF24b1` | **48/48**, full 24/24 both clusters (cycles void) |
 | NT24 + `PHASE2`+`BOTH` | `stF24b2` | **48/48**, full 24/24 both clusters (cycles void) |
 | **NT72** | `stF72` | in flight (self-dispatched) |
