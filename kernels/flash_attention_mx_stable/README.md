@@ -763,7 +763,7 @@ inherited from `FA_ST_NOOVL`:
 | NT6 | `stF6` | **12/12**, 51,450 cyc/tile, 31.91% |
 | NT8 | `stF8` | **16/16**, 51,225 cyc/tile, 32.05% |
 | NT24 + `PHASE3` | `stF24p3` | **48/48**, full 24/24 both clusters (cycles void) |
-| NT24 + `PHASE1`+`BOTH` | `stF24b1` | in flight |
+| NT24 + `PHASE1`+`BOTH` | `stF24b1` | **48/48**, full 24/24 both clusters (cycles void) |
 | NT24 + `PHASE2`+`BOTH` | `stF24b2` | in flight |
 | **NT72** | `stF72` | in flight (self-dispatched) |
 
@@ -870,6 +870,17 @@ is wrong in general, because `BANKA` is not a surgical change -- it also relocat
 2, so it could be removing the Q/`SP_C` collision while creating a different one. Those two readings
 cannot be separated by this experiment. What is certain is the direction: this remap costs more than it
 buys, and the SMEM-bank-arbitration story no longer has a working prediction behind it.
+
+**And a surgical version of this test is not available**, which is why the ambiguity above has to stand
+rather than being resolved by a follow-up. SMEM is exactly full -- V 32K + P8 16K + S/O 32K + scratch 8K +
+Q 8K + K^T 32K = 128K -- so Q cannot be relocated out of bank 2 without displacing something (K^T occupies
+all of bank 3), and `SP_C` cannot be made bank-1-only without colliding with P8 where it currently sits.
+`FA_SP_BANKA` moving both is not sloppiness; it is the only reachable rearrangement. So "collision removed
+but a worse one created" and "collision was never the mechanism" cannot be separated by a memory-map
+experiment at all. Separating them would need the *other* side: reduce the concurrent SIMT SMEM read
+pressure during the overlap (e.g. finalize on fewer warps) and see whether the onset moves. Not run here --
+the mechanism hunt belongs to the peak track under the current split, and the remaining slots are carrying
+NT72 confirmations.
 
 **Cost of being wrong here: three runs.** That is what the same-base control bought -- without `stY2b` I
 could have read `stB24`'s onset 8 as "BANKA fails" without knowing whether `OVL_QK` failed on this base at
