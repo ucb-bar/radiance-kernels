@@ -864,6 +864,7 @@ same-base control:
 |---|---|---|---|
 | `stY2b` | `OVL_QK`, **no** `BANKA` -- the CONTROL | **17** | none(>17) |
 | `stB24` | `OVL_QK` + **`BANKA`** | **8** | 14 |
+| | *(final: 22 correct / 18 wrong of 40; cycles **VOID** by rule 1)* | | |
 | `stB24p2` | `OVL_QK` + `BANKA` + `PHASE2` | **7** | 22 |
 
 (`stB24p2` completed at 29 correct / 10 wrong of 39 images. **It hit the budget wall at exactly
@@ -883,6 +884,22 @@ is wrong in general, because `BANKA` is not a surgical change -- it also relocat
 2, so it could be removing the Q/`SP_C` collision while creating a different one. Those two readings
 cannot be separated by this experiment. What is certain is the direction: this remap costs more than it
 buys, and the SMEM-bank-arbitration story no longer has a working prediction behind it.
+
+> #### MY OWN MONITOR VIOLATED THE ADMISSIBILITY RULE, AND I NEARLY PUBLISHED THE NUMBER
+>
+> When `stB24` landed at **22 correct / 18 wrong**, the monitor printed
+> `mean 51600 ... util = 31.82%` for it. That number is **void by rule 1** and it should never have been
+> emitted. The bug: the monitor checked `.defines` for `FA_PHASE` (rule 2) but **never checked the wrong
+> count** (rule 1) -- I encoded half of a rule I had just written two commits earlier, and a
+> corrupt-run utilization figure went into a notification that reads exactly like the admissible ones.
+>
+> The run's own interval spread is the tell, and it is the reason rule 1 exists: **min 41,693, max
+> 74,969** -- a 1.8x spread against ~3% on a clean run. `31.82%` is the mean of garbage.
+>
+> Fixed: the monitor now voids cycles if the run is perturbed **or** has any wrong tile, names which
+> rule fired, and additionally flags a budget-wall truncation. Recorded rather than quietly patched,
+> because the failure mode is the one this campaign keeps repeating -- a check that looks like it
+> enforces a rule while enforcing only the easy half of it.
 
 **And a surgical version of this test is not available**, which is why the ambiguity above has to stand
 rather than being resolved by a follow-up. SMEM is exactly full -- V 32K + P8 16K + S/O 32K + scratch 8K +
