@@ -813,6 +813,51 @@ Consequence for `OVL_SCL`: its own phase evidence is 47/47 and 46/46 correct rat
 `OVL_SCL` is *inside* `stZQ24p2` (full 48/48 at `PHASE2`) and inside `stF24p1`/`p2`, so it is covered by
 supersets and does not need a re-run.
 
+## The convergence narrows the mechanism to a BANK COLLISION -- with a prediction and its control
+
+The three-way convergence says the QK/SIMT overlap is the *only* hazardous one. That is a much stronger
+constraint than it first looks, because during exactly that overlap the two parties touch very little:
+
+* **mesh:** reads Q (`SP_Q`) and K^T (`SP_K_END`) from operand spad, writes **accmem**. Under
+  `FA_SP_QKACC` the matmul is `acc_move_out=false` => `skip_stc=1`, so it performs **zero SMEM writes**
+  (`kernel.cpp:2165`).
+* **SIMT:** reads `SP_C` from SMEM, writes O to GMEM. It **never touches accmem**.
+
+So the racing pair cannot be an accumulator-ordering one -- SIMT is not on that structure at all, and the
+accumulator store happens a stage later in a quiesced window. **That demotes the last surviving candidate
+from the original four.** The only structure both parties are on is **SMEM**, and this file already
+records the rule: *the mesh may not read an operand from a bank SIMT is reading*
+(`Scratchpad.scala:220`, the hazard `FA_SP_OPV` died on).
+
+Compute the banks (32 KB each, `DIM` = 16 B/row):
+
+| region | default | `FA_SP_BANKA` |
+|---|---|---|
+| V | 0x00000-0x08000, bank 0 | bank 0 |
+| P8 | 0x08000-0x0c000, bank 1 | 0x10000-0x14000, bank 2 |
+| **S/O (`SP_C`)** -- what finalize READS | **0x0c000-0x14000, banks 1 AND 2** | **0x08000-0x10000, bank 1 exactly** |
+| **Q** -- what the mesh READS | **0x16000-0x18000, bank 2** | bank 2 |
+| K^T -- what the mesh READS | 0x18000-0x20000, bank 3 | bank 3 |
+
+**Default: finalize reads bank 2 while the mesh reads Q from bank 2 -- the forbidden condition, exactly.
+Under `FA_SP_BANKA` they are disjoint** (P8 shares bank 2 but nothing reads P8 during this overlap -- PV
+consumed it in S5).
+
+That fits the whole fingerprint: a mis-fed operand row corrupts an entire output row-block (**all 64 rows
+at once**), it is per-cluster (SMEM is per-cluster), fresh each tile, and it appears *only* when the two
+are concurrent.
+
+**PREDICTION, pre-registered: `FA_ST_OVL_QK` + `FA_SP_BANKA` is correct where `OVL_QK` alone is 45/48 and
+9/24 at `PHASE2`.** Launched `stB24` (NT24) and `stB24p2` (`PHASE2`), plus **`stY2b` as the control** --
+`OVL_QK` on this exact base *without* `BANKA`, because `stY24` was measured on an older base and a
+same-base control is what makes the comparison mean anything.
+
+**If it holds**, the QK overlap becomes recoverable, worth the ~6.2k cyc/tile it currently costs (~37%),
+and the mechanism is named. **If it does not**, the bank collision is refuted and the SMEM-arbitration
+family with it. Caveat on the record either way: `BANKA`'s history in this campaign is **non-monotone**
+(`2PBM+SMBMAX+PREPK` 2/12, `+BANKA` 12/12, `BANKA` alone 7/12), so a single unperturbed pass would be
+schedule luck -- which is why `PHASE2` is part of the test and not an afterthought.
+
 ### Convergence with the peak track, and the endpoint it implies
 
 Three independent legs now agree that **the QK/SIMT overlap is the hazard and `_DMA`/`_SCL` are not
