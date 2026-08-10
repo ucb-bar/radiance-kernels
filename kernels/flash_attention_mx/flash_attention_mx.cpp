@@ -4325,7 +4325,21 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     SMARK();                                                            // s4
     // -- S5: drain PV(t-1); accumulator -> O(t-1) @ the LOW HALF of the dead S/P[1-p].  Quiesced. -
     if (warp == 0) {
+#ifdef FA_SP_ACCRS
+        // FA_SP_ACCRS in the Sq=32 body: the SAME move that is worth -196 cyc/tile at Sq=64, applied
+        // to the PV accumulator instead of the QK one.  ReservationStation.scala's STORE branch, for
+        // an opa_is_dst entry, computes deps_ex including "additionally if ex writes, raw for st b <-
+        // ex a" -- new_entry.opb (fa_store_acc's ACCUMULATOR SOURCE) against e.opa (the PV compute's
+        // ACCUMULATOR DESTINATION) -- so the hardware interlock for this pair exists and is exact,
+        // and the pre-store fa_gfl was destroying it by draining the station to empty before the
+        // store was allocated.  The TRAILING fa_gfl is KEPT: stage S6's finalize is a *Muon* SMEM
+        // read of O, and nothing in the reservation station orders that against a gemmini write.
+        // Here the saving is smaller than at Sq=64 in absolute terms but it is per HALF-tile, so it
+        // is the same per row -- and unlike FA_SP_ACCPAD it costs nothing to try.
+        if (t > 0) { fa_store_acc<PVH>(FA_H_SP(np), tid); fa_gfl(tid); }
+#else
         if (t > 0) { fa_gfl(tid); fa_store_acc<PVH>(FA_H_SP(np), tid); fa_gfl(tid); }
+#endif
     } else { asm volatile("nop"); }
     FAP_BAR(7);
     SMARK();                                                            // s5
@@ -5323,6 +5337,38 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     //     the plain equal partition is already core-balanced and FA_SP_BALF is not needed here --
     //     which is why FA_SP_FZ6 and FA_SP_BALF are mutually exclusive.
     FA_SP_FINALIZE(tid, thr);
+#elif defined(FA_SP_NOQKOVL)
+        // ==== FA_SP_NOQKOVL -- REMOVE *ONLY* THE QK/SIMT OVERLAP, KEEPING EVERY OTHER LEVER. =====
+        // Approaching the correctness gate FROM THE FAST SIDE.  The stable track reached a
+        // gate-passing config by stripping ALL overlap (FA_ST_NOOVL, 57,135 = 28.74%) and then found
+        // that re-introducing just the QK/SIMT overlap (FA_ST_OVL_QK) is refuted on BOTH axes --
+        // 45/48 unperturbed and 9-of-24 under PHASE2 -- which identifies the QK overlap as THE
+        // dangerous piece.  This flag removes that ONE construct from the FAST body instead, so the
+        // result keeps FA_SM_2P / 2PRAW / PAX / CVTX / ACCRS / PREPK, which the stripped body lacks.
+        //
+        // WHAT THE OVERLAP IS, HERE (derived from this body, not from the FA_ST_* flags -- those live
+        // in kernels/flash_attention_mx_stable and are not in this branch).  Warp 0's stage-S6 duty is
+        //     Q(t+1) mvin + Q scales + fa_cfg<QKF> + fa_mm_acc<QKF>
+        // where fa_mm_acc is COMPUTE-ONLY (acc_move_out=false, the result stays in the gemmini
+        // accumulator), and warps 1-5 run finalize(t-1) CONCURRENTLY in the `else` of the same
+        // warp-uniform if.  So the QK matmul's 8,210 mesh cycles are hidden under finalize and are
+        // only drained at the TOP OF THE NEXT ITERATION (stage S1's fa_gfl before fa_store_acc<QKF>).
+        // That is the overlap: SIMT finalize traffic runs while the mesh is mid-matmul on SMEM operands.
+        // WHAT THIS DOES: drain the QK INSIDE warp 0's region and barrier before any SIMT work, so the
+        // mesh is idle for the whole of finalize.  Same work, same warp partition, same numerics --
+        // only the concurrency is gone, which is what makes it a clean A/B.
+        // COST, PROJECTED: the QK mesh stops being free, so ~+8,210 on a 42,364 tile => ~50,570
+        // ~= 32.5%.  *** PROJECTED, NOT MEASURED. ***  If it GATES it is worth more than an ungated
+        // 38.76% for anything but a benchmark, and it is ~3.8 points faster than FA_ST_NOOVL.
+        // NOTE S1's own pre-store drain becomes a no-op under this flag (the matmul has already
+        // retired), so FA_SP_NOQKOVL and FA_SP_ACCRS compose without interacting.
+        fa_gfl(tid);                    // drain QK(t+1) HERE, before any SIMT work starts
+    } else { asm volatile("nop"); }     // MANDATORY else: an unbalanced warp-uniform region makes
+                                        // llvm duplicate later control flow (see mu_intrinsics.h)
+    // Barrier ids 1..15 are ALL taken in this file; MuonCore.scala:55 barrierBits=4 => 16 barriers,
+    // so id 0 is the one free slot.  Verified unused: no mu_barrier(0 / FAP_BAR(0 anywhere else.
+    FAP_BAR(0);
+    if (warp != 0) { FA_SP_FINALIZE(stid, sthr); } else { asm volatile("nop"); }
 #else
     } else {
         FA_SP_FINALIZE(stid, sthr);

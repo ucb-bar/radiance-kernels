@@ -593,6 +593,57 @@ static inline uint32_t e4m3_pack4_swar(uint32_t wlo, uint32_t whi, uint32_t D2,
 // ============================================================================================
 //
 // ============================================================================================
+// *** EIGHTH PASS (2026-08-07/10): FA_SP_NOQKOVL -- 50,856 cyc/tile = 32.29%, AND IT PASSES EVERY
+// GATE POINT EXCEPT NT72 (IN FLIGHT).  REMOVING *ONE* OVERLAP FROM THE FAST BODY IS WHAT MAKES A
+// FAST CONFIGURATION PHASE-ROBUST. ***
+//
+// The peak config (ACCRS+PREPK, 42,364 = 38.76%) is 16-of-16 at NT8 and FAILS FA_PHASE1.  Rather than
+// add overlap back to the stripped stable body, this removes only the QK/SIMT overlap from the fast
+// one, keeping FA_SM_2P / 2PRAW / PAX / CVTX / ACCRS / PREPK.  Measured, all scored per cluster per
+// tile, cycles quoted ONLY from the runs with no phase injection:
+//   wq6   FA_NT6                       50,979  32.21%   12 of 12
+//   wq8   FA_NT8                       50,856  32.29%   16 of 16
+//   w24   FA_NT24                      50,839  32.30%   48 of 48
+//   wp1   FA_NT6 + FA_PHASE1               --      --   12 of 12
+//   wp2   FA_NT6 + FA_PHASE2               --      --   12 of 12
+//   wp3   FA_NT6 + FA_PHASE3               --      --   12 of 12
+//   wb1   FA_NT6 + FA_PHASE1 + BOTH        --      --   12 of 12
+//   wb2   FA_NT6 + FA_PHASE2 + BOTH        --      --   12 of 12
+// *** A FA_PHASE RUN'S CYCLE COUNT IS NOT A PERFORMANCE NUMBER *** -- it contains the harness's own
+// injected delay (k x 64 dependent MMIO round trips per tile per cluster, ~2.4k cyc per k), which is
+// why wb2 reads 30.63%.  That is a SEPARATE rule from "a corrupt run's timing is void": a phase run
+// can be perfectly clean and its cycles still meaningless.  Quote wq6/wq8/w24 only.
+// Projected +8,210 -> ~50,570 = 32.47%; measured 50,856 = 32.29%, i.e. 0.6% off -- one of the few
+// projections in this campaign that survived contact, because it was arithmetic on a MEASURED stage.
+//
+// THE MECHANISM IS NOW CONFIRMED FROM TWO BODIES IN BOTH DIRECTIONS, which is worth more than the
+// number: the stable track found that re-introducing ONLY the QK/SIMT overlap into its stripped body
+// (FA_ST_OVL_QK) is refuted on both axes (45/48 unperturbed, 9-of-24 under PHASE2), while OVL_DMA
+// (56,332) and OVL_SCL (54,726) are each 48-of-48 at NT24.  Removing only that same overlap here
+// takes a PHASE1 failure to a full pass.  *** SO THE QK/SIMT OVERLAP IS THE HAZARD SOURCE AND THE
+// DMA AND SCALE OVERLAPS ARE NOT IMPLICATED. ***  The two bodies share almost nothing, so this is two
+// independent confirmations rather than one restated.  (Convergence check: 32.30% here vs the stable
+// track's OVL_SCL+2P+2PRAW at 31.68%, reached from the opposite direction -- 0.6 points apart.)
+//
+// *** AND THE PER-STAGE PROFILE SETTLES WHETHER 40% IS REACHABLE IN THIS SHAPE.  IT IS NOT. ***
+// fa_marks3.py --per 7, cluster 0, NT8 steady tiles:
+//                        yb8 (overlapped)   wq8 (NOQKOVL)
+//   S1 acc->S                  2,783              883    <- S1's drain is now a no-op (as designed)
+//   S2 softmax                 9,990           10,031
+//   S3 requant pass A          2,753            2,754
+//   S4 convert || pack        10,409           10,082
+//   S5 PV (mesh, exposed)      8,882            8,880
+//   S6 QK || finalize          9,574           18,008    <- +8,434 = THE QK MESH, FULLY EXPOSED
+// So the 8,210 QK cycles are recovered ZERO percent -- S6 is now finalize (~9,600) + QK (8,210) end
+// to end.  The de-overlapped shape therefore runs BOTH matmuls exposed: mesh 17,090 with SIMT idle,
+// plus SIMT ~32,470 with the mesh idle.  Reaching 41,050 (40%) needs -9,800, and the only two sources
+// are (a) re-hiding the QK, which IS the hazard, or (b) hiding the PV's 8,880, which structural
+// limit 1 forbids without the Sq=32 double-buffer.  *** 40% IN THIS SHAPE IS AVAILABLE ONLY BY TAKING
+// THE HAZARD.  The gate-passing ceiling is ~32.3%, and the ungated peak is 38.76%. ***
+// (Upper bound if every mesh cycle were hidden: 16,420/32,470 = 50.6%, so the headroom is real and
+// entirely blocked on overlap safety -- which is what makes the Sq=32 drain hang worth fixing.)
+// ============================================================================================
+// ============================================================================================
 // *** SEVENTH-PASS FRONTIER (2026-07-31).  PEAK UTILISATION 38.78% AT NT6 / 38.76% AT NT8, BOTH
 // BIT-EXACT, AND THE CORRECTNESS GATE IS "LARGEST TILE INDEX SURVIVED" RATHER THAN NT6/NT8. ***
 //
