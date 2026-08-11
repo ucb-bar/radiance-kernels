@@ -194,6 +194,28 @@ with a strictly stronger assumption than `stQ`. If `stF72` fails, `stZQ` becomes
 config and its six points get launched then. Spending six slots now on a fallback while the primary is
 one run from done is the wrong order.
 
+## Final audit -- every claim in this file re-scored from disk
+
+Run after the last gate point landed, re-scoring every trace with `fa_verify_tiles.py` rather than
+trusting the running notes:
+
+| config | NT6 | NT8 | NT24 | NT72 | phase points |
+|---|---|---|---|---|---|
+| **`stF24`** | 12/12 | 16/16 | 48/48 | **144/144** | `P1`-`P5` + `BOTH` x2, all **48/48** |
+| `stQ` | 12/12 | 16/16 | 48/48 | **144/144** | `P2`,`P3`,`BOTH` x2 **48/48**; `P1` 47/47 (running) |
+| `stZQ` | -- | -- | 48/48 | **144/144** | `P2` 48/48 |
+| `FA_ST_NOOVL` | 12/12 | 16/16 | 48/48 | **144/144** | `P1`-`P3` + `BOTH` x2, all 48/48 |
+| fully de-overlapped (`stM24`) | -- | -- | 48/48 | -- | -- |
+
+**Zero wrong in every row.** Across *all* runs in `/tmp/struns`: **2,686 tile-images scored, 112 wrong**
+-- and every one of the 112 belongs to a configuration deliberately run to failure (`stB24`/`stB24p2`/
+`stY2b` for the bank-collision refutation, `stN0`-`stN4` and `stN7` for the tile-0 prologue defect,
+`stE6p1`/`p2` for the `CFGPRE` refutation, `stD6p1`/`stD24`/`stY24` as reference/control points). **No
+configuration this file recommends has a single wrong tile-image anywhere on disk.**
+
+Reproduce with `./fa_runtable.sh /tmp/struns`, or re-score any single trace with
+`python3 fa_verify_tiles.py <tag> --out /tmp/struns/<tag>.out --golden ./golden_O_u16.npy`.
+
 ## A cycle number is admissible only if the run is BOTH fully correct AND unperturbed
 
 Two separate rules, and they compose into something narrower than either alone:
