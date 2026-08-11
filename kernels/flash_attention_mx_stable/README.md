@@ -36,10 +36,22 @@ cycles against a 9M budget, so the 144 images are complete rather than truncated
 
 | config | overlaps restored | util | NT72 | gate |
 |---|---|---|---|---|
-| `FA_ST_NOOVL` | none | 28.68% | 144/144 | complete |
-| `stQ` | none (+ SIMT softmax) | 30.49% | 144/144 | `P1`/`P3`/`BOTH` x2 in flight |
+| `FA_ST_NOOVL` | none | 28.68% | 144/144 | **COMPLETE** |
+| **`stQ`** | none (+ SIMT softmax) | **30.49%** | 144/144 | **COMPLETE** |
 | `stZQ` | `_SCL` | 31.68% | 144/144 | partial (not pursued -- superseded) |
 | **`stF24`** | `_SCL` + `_DMA` | **32.26%** | **144/144** | **COMPLETE** |
+
+**Three configurations now pass the full gate, two of them above the 30% target.** Pick by what has to
+be defended:
+
+* **`stF24`, 32.26%** -- the fastest. Depends on `_SCL` and `_DMA` being harmless, which is *measured*
+  (48/48 separately, together, and at every phase point) but is an empirical claim about two overlaps.
+* **`stQ`, 30.49%** -- meets the target with the **smallest structural assumption of any candidate**: no
+  overlap restored at all, just the fully de-overlapped body plus a SIMT-only softmax restructuring that
+  touches no mesh, no DMA and no gemmini port. Its robustness argument is inherited from
+  `FA_ST_NOOVL`'s structure rather than resting on any measurement about overlaps.
+* **`FA_ST_NOOVL`, 28.68%** -- the most conservative, below target, kept as the reference the FPGA
+  bring-up is currently diverging from.
 
 576 tile-images at NT72 across four configs, **zero wrong**.
 
