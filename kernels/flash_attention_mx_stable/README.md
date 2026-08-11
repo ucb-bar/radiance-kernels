@@ -17,11 +17,31 @@ Q,K,V (mvin) --[mesh: QK^T]--> S (accmem -> SMEM)
 Two claims, deliberately kept apart (see the admissibility rules below for why blending them is an
 error):
 
-| | config | utilization | evidence |
-|---|---|---|---|
-| **Full gate passed** | `FA_ST_NOOVL` | 28.68% | NT6, NT8, NT24, **NT72 144/144**, `PHASE1/2/3`, `PHASE_BOTH` x2 |
-| **NT72 + >=30%, simplest** | **`stQ`** = `+ FA_SM_2P FA_SM_2PRAW` | **30.49%** | **NT72 144/144**, NT24 48/48, `PHASE2` 48/48; NT6/NT8/`PHASE1`/`PHASE3`/`BOTH` x2 in flight |
-| **Recommended / best admissible** | **`stF24`** (below) | **32.26%** | NT6, NT8, NT24, **`PHASE1` through `PHASE5`**, `PHASE_BOTH` x2 -- **all 48/48**; only **NT72** (`stF72`) outstanding |
+### *** `stF24` PASSES THE FULL GATE AT 32.26% -- target was 30% ***
+
+| gate point | run | result |
+|---|---|---|
+| NT6 | `stF6` | **12/12** |
+| NT8 | `stF8` | **16/16** |
+| NT24 | `stF24` | **48/48** -- 50,906 cyc/tile, **32.26%** (admissible: unperturbed + all-correct) |
+| **NT72** -- one TinyLlama head | `stF72` | **144/144**, onset `none(>71)` both clusters |
+| `FA_PHASE1` / `2` / `3` | `stF24p1/p2/p3` | **48/48** each |
+| `FA_PHASE4` / `5` | `stF24p4/p5` | **48/48** each -- *beyond what the gate asks* |
+| `FA_PHASE_BOTH` k=1 / k=2 | `stF24b1/b2` | **48/48** each |
+
+Every point, plus the entire `k` range the harness implements. `stF72` terminated normally at 3,794,716
+cycles against a 9M budget, so the 144 images are complete rather than truncated.
+
+**Four configs, all NT72 144/144, utilization monotone in overlaps restored:**
+
+| config | overlaps restored | util | NT72 | gate |
+|---|---|---|---|---|
+| `FA_ST_NOOVL` | none | 28.68% | 144/144 | complete |
+| `stQ` | none (+ SIMT softmax) | 30.49% | 144/144 | `P1`/`P3`/`BOTH` x2 in flight |
+| `stZQ` | `_SCL` | 31.68% | 144/144 | partial (not pursued -- superseded) |
+| **`stF24`** | `_SCL` + `_DMA` | **32.26%** | **144/144** | **COMPLETE** |
+
+576 tile-images at NT72 across four configs, **zero wrong**.
 
 ```
 # the recommended stable config (stF24) -- only the QK/SIMT overlap is removed
