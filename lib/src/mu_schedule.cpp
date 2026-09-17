@@ -84,8 +84,18 @@ void mu_schedule(mu_schedule_callback callback, void *arg, const uint32_t occupa
     const auto core_id = vx_core_id();
     const auto thread_id = vx_thread_id();
     // update kernel launch context
-    // elect a single thread per cluster to prevent racy writes
-    if (core_id == 0 && thread_id == 0) {
+    // Elect one thread PER CORE, not one per cluster.  L0d is per-core and is not coherent
+    // across cores, and mu_fence() only retires the issuing warp's store queue -- it does not
+    // push the line to a shared level.  Writing from core 0 alone therefore left every other
+    // core reading whatever memory happened to hold at `schedule_context`, which is a NOBITS
+    // .bss symbol that nothing initialises: zeros under metasim (core 1 jalr'd to 0x0) and
+    // stale DRAM on the FPGA.  Whether the old code worked was a race between core 0's L0d
+    // eviction and core 1's read.
+    // Every core writes identical values -- callback, arg and occupancy are the same arguments
+    // on every core -- so there is no cross-core race, and each core ends up with a correct
+    // copy in its own L0d without any coherency requirement.
+    (void)core_id;
+    if (thread_id == 0) {
         schedule_context.callback = callback;
         schedule_context.arg = arg;
         schedule_context.occupancy = occupancy;

@@ -1,0 +1,4 @@
+# build products
+*.o
+*.elf
+*.dump
