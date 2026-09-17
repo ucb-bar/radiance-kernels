@@ -1,0 +1,4 @@
+# compiled golden binary (built from mx_golden.cpp via `make`) and scratch
+mx_golden
+_gen/
+__pycache__/

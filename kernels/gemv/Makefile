@@ -7,6 +7,10 @@ ifneq ($(strip $(GEMV_ILP)),)
 MU_CFLAGS += -DGEMV_ILP=$(GEMV_ILP)
 endif
 
+ifneq ($(strip $(GEMV_UNROLL)),)
+MU_CFLAGS += -DGEMV_UNROLL=$(GEMV_UNROLL)
+endif
+
 ifneq ($(strip $(GEMV_NUM_WARPS)),)
 MU_CFLAGS += -DGEMV_NUM_WARPS=$(GEMV_NUM_WARPS)
 endif

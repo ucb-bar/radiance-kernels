@@ -1,0 +1,3 @@
+__global PointerChaseNode pointerchase_nodes[] = {
+    { nullptr, 0x13579bdf },
+};

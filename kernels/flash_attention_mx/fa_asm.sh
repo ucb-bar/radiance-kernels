@@ -12,6 +12,5 @@ cd $KDIR
  -fno-rtti -fno-exceptions -fdata-sections -ffunction-sections -mllvm -inline-threshold=262144 \
  -I/scratch/yrh/radiance-kernels/lib/include -I/scratch/yrh/radiance-kernels/lib/mxgemmini \
  -DRADIANCE -DRADIANCE_DEVICE -DNDEBUG -DLLVM_VORTEX \
- -include $KG/toolchain-fix/gemmini_host_shim.h $D -S -o /tmp/fa_$TAG.s flash_attention_mx.cpp \
  2>/tmp/y_asm_$TAG.log || { echo "ASM FAIL $TAG"; tail -5 /tmp/y_asm_$TAG.log; exit 1; }
 echo "WROTE /tmp/fa_$TAG.s ($(wc -l < /tmp/fa_$TAG.s) lines)"

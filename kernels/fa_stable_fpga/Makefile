@@ -11,7 +11,6 @@ include ../common.mk
 
 # gemmini.h (a host C reference header) references printf/exit/abs that the muon libc++ set does
 # not expose; the shim only makes it parse (these fns are never called on the GPU).
-MU_CFLAGS += -include /scratch/yrh/ai-workspace/kernel-gen/toolchain-fix/gemmini_host_shim.h
 
 # Forward the GPU-side -D list to the rv64 host compile too.  host.cpp's MX-scale prefill is gated
 # on FA_NOSCALES and MUST match the GPU build: the scale SRAM write port has one shared 2-beat
