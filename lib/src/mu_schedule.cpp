@@ -8,6 +8,9 @@
 
 #include <mu_schedule.h>
 #include <mu_intrinsics.h>
+#ifdef MU_TAPEOUT_EPILOGUE
+#include <rad_tapeout.h>
+#endif
 
 #define NUM_CORES_MAX 1024
 
@@ -55,6 +58,17 @@ static void __attribute__ ((noinline)) mu_schedule_standalone() {
     auto arg = context.arg;
 
     callback(arg, tid_in_threadblock, threads_per_threadblock, threadblock_id);
+
+#ifdef MU_TAPEOUT_EPILOGUE
+    // TAPEOUT EPILOGUE.  On the taped-out part a core that asserts `finished` fires the L0d/L0i
+    // flush unit (MuonTile.scala:371-374), which wedges the L0d; and at occupancy >= 2 the core
+    // never asserts finished at all, so nothing is ever written back and the whole output stays
+    // stranded in cache even though the kernel ran to completion.  Measured on both U250 boards
+    // 2026-09-21.  The epilogue drains L0d and L1 by capacity, parks warp 0 of each core in a
+    // spin so `finished` never rises, and hands off to the host through the printBuf postbox.
+    // NEVER RETURNS -- the host soft-resets the GPU once it sees the postbox.
+    rad_tapeout_epilogue(tid_in_threadblock, threads_per_threadblock / MU_NUM_THREADS);
+#endif
 }
 
 static void mu_schedule_workers() {

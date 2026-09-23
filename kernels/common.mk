@@ -13,7 +13,10 @@ RADIANCE_INCLUDE_PATH ?= $(RADIANCE_LIB_PATH)/include
 GEMMINI_SW_PATH ?= $(realpath ../../lib/mxgemmini)
 SOC_DIR ?= $(realpath ../../soc)
 
-LLVM_MUON ?= $(realpath ../../llvm/llvm-muon)
+LLVM_MUON ?= $(realpath ../../llvm/llvm-muon-stride)
+# llvm-muon predates -riscv-stack-word-stride and rejects it outright, so the interleaved
+# stack needs the newer install.  Point LLVM_MUON back at .../llvm-muon and set
+# MU_STACK_WORD_STRIDE=1 together to build the old way.
 
 MU_CC  = $(LLVM_MUON)/bin/clang
 MU_CXX = $(LLVM_MUON)/bin/clang++
@@ -56,8 +59,36 @@ ifneq ($(MU_LIBC_INCLUDE),)
 MU_CFLAGS += -idirafter $(MU_LIBC_INCLUDE)
 endif
 
+# Lane-interleaved stack.  Must match MU_STACK_WORD_STRIDE in lib/ (mu_start.S and the archive):
+# a kernel built with a different stride than libmuonrt.a will have lanes overwrite each other's
+# stack slots.  Set MU_STACK_WORD_STRIDE=1 on both sides for the old thread-major layout.
+MU_STACK_WORD_STRIDE ?= 16
+ifneq ($(MU_STACK_WORD_STRIDE),1)
+MU_CFLAGS += -mllvm -riscv-stack-word-stride=$(MU_STACK_WORD_STRIDE)
+endif
+
 MU_LDFLAGS += -nodefaultlibs -nostartfiles -Wl,-Bstatic,-T,$(RADIANCE_LIB_PATH)/linker/mu_link.ld,-z,norelro -fuse-ld=lld
+# RAD_TAPEOUT=1 links the TAPEOUT runtime: mu_schedule ends in rad_tapeout_epilogue() instead of
+# letting a core assert `finished`.  On the taped-out part the finish edge fires the L0d flush unit
+# (MuonTile.scala:371-374), which wedges the L0d, and at occupancy >= 2 `finished` never asserts at
+# all, so the entire output stays stranded in cache -- measured on both U250 boards 2026-09-21.
+# The host side must poll the printBuf postbox and soft-reset; see rad_host_wait_epilogue() in
+# lib/include/rad_tapeout.h, and note that all_finished will NEVER assert by design.
+# VERIFIED 2026-09-22 on the U250 tapeout bitstream fe4dc316: RAD_TAPEOUT=1 gives done_cores=2,
+# soft reset asserted and still_poison=0/4096, with no kernel edit at all.  It used to lose 64-160
+# words; that was NOT a writeback defect but a hang -- the epilogue opened with an all-warp
+# mu_fence() (only one warp per core may fence on this part) and never reached its drains, so the
+# words that did reach DRAM were ordinary capacity eviction and the rest was residue.  Fixed in
+# rad_tapeout.h, together with -mllvm -vortex-branch-divergence=1 for the tapeout objects.
+# NOTE: output is correct but not bit-identical to the kernel-source call site (code_sumabs
+# 3651795 vs 3651536, 360 vs 364 exact halfwords) -- both at the MX-FP8 floor, cause not yet
+# established.  Default stays off until that is understood.
+RAD_TAPEOUT ?= 0
+ifeq ($(RAD_TAPEOUT),1)
+MU_LDFLAGS += $(RADIANCE_LIB_PATH)/libmuonrt-tapeout.a $(RADIANCE_LIB_PATH)/tohost.S
+else
 MU_LDFLAGS += $(RADIANCE_LIB_PATH)/libmuonrt.a $(RADIANCE_LIB_PATH)/tohost.S
+endif
 
 ifdef MU_USE_LIBC
 # Link in libc + compiler builtins; not sure why it doesn't know about them already
@@ -74,6 +105,9 @@ HOST_OBJDUMP ?= $(HOST_TOOLCHAIN_PREFIX)-objdump
 HOST_OBJCOPY ?= $(HOST_TOOLCHAIN_PREFIX)-objcopy
 HOST_READELF ?= readelf
 
+# NOTE (bitten twice: fpga_bringup and fa_stable_fpga): this is `?=`, so setting HOST_CFLAGS or
+# HOST_CXXFLAGS in the ENVIRONMENT REPLACES it wholesale and silently drops -march/-mabi/-I.
+# To add host-side defines, append AFTER including this file (e.g. HOST_CXXFLAGS += $(FB_HOST_DEFS)).
 HOST_CFLAGS ?= -march=rv64imafd -mabi=lp64d -mcmodel=medany -ffreestanding -fno-common -fno-builtin-printf \
 	       -I$(RADIANCE_INCLUDE_PATH) -I$(GEMMINI_SW_PATH)
 HOST_CXXFLAGS ?= $(HOST_CFLAGS)

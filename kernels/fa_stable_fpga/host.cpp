@@ -54,6 +54,8 @@
 
 #pragma GCC optimize("O2")
 
+#define RAD_TAPEOUT_HOST 1
+#include <rad_tapeout.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -952,6 +954,29 @@ int main() {
   // nothing.  Do not interpret the post-run number unless this one is 0.
   fa_guard_check("pre_launch ");
 #endif
+#ifdef FA_DRAM_NOISE
+  // ---- EMULATE STALE DRAM.  The metasim starts with ZEROED DRAM; the board does not, and FA's
+  // .bss is NOBITS so nothing initialises it.  Readelf on this image:
+  //     LOAD 0x10001000  FileSiz 0x048  MemSiz 0x8c0   RW
+  // so bytes 0x10001048..0x100018c0 are never written by the loader, and that window contains
+  // BOTH orphaned statics -- C_scale_factors (0x10001060) and schedule_context (0x10001880).
+  // That 2168-byte window is the ONLY confirmed difference between the metasim and the board, so
+  // filling it with a seeded LCG makes the two comparable in the one input that differs.
+  // Written by the HOST before the GPU is released, so it works identically in both.
+  {
+    const uint64_t lo = 0x100000000ull + 0x10001048ull, hi = 0x100000000ull + 0x100018c0ull;
+    uint32_t x = (uint32_t)(FA_DRAM_NOISE);
+    for (uint64_t a = lo; a < hi; a += 4) {
+      x = x * 1664525u + 1013904223u;          // Numerical Recipes LCG
+      *(volatile uint32_t *)a = x;
+    }
+    asm volatile("fence" ::: "memory");
+    faf_s("FA_FPGA: dram_noise seed="); faf_x((uint32_t)(FA_DRAM_NOISE));
+    faf_s(" window=0x10001048..0x100018c0 readback=");
+    faf_x(*(volatile uint32_t *)(0x100000000ull + 0x10001060ull));   // C_scale_factors[0]
+    faf_s("\n"); faf_flush();
+  }
+#endif
   faf_s("FA_FPGA: S4 about to touch GPU_RESET\n"); faf_flush();
   WRITE_MMIO_32(RAD_HOST_GPU_RESET, 1);
   { const uint64_t u = faf_cyc() + 200000ull; while (faf_cyc() < u) asm volatile("" ::: "memory"); }
@@ -1021,6 +1046,32 @@ int main() {
   asm volatile("fence" ::: "memory");
 
   // Frobenius over the whole window, exactly fa_verify_out.py's metric.
+#ifdef FA_EPILOGUE
+  // EPILOGUE HANDSHAKE.  The GPU never asserts finished by design -- do not wait on it.
+  {
+    const int nc = 2;
+    const int dn = rad_host_wait_epilogue(nc, 20000000ull);
+    faf_s("FA_FPGA: epilogue done_cores="); faf_u(dn); faf_s(" of "); faf_u(nc);
+    for (int c = 0; c < nc; c++) {
+      faf_s(" done["); faf_u(c); faf_s("]=");
+      faf_x((uint32_t)*(volatile unsigned long long *)RAD_PB_HOST(0, RAD_PB_EPI_CORE + c));
+      faf_s(" trace["); faf_u(c); faf_s("]=");
+      faf_x((uint32_t)*(volatile unsigned long long *)RAD_PB_HOST(0, RAD_PB_EPI_TRACE + c));
+    }
+    faf_s(" preO=");
+    for (int i = 32; i <= 55; i++) { faf_x((uint32_t)*(volatile unsigned long long *)RAD_PB_HOST(0,i)); faf_s(","); }
+    faf_s(" postO=");
+    faf_x(((const volatile uint32_t *)0x11F000000ull)[3104]); faf_s(",");
+    faf_x(((const volatile uint32_t *)0x11F000000ull)[3160]);
+    faf_s(" warpstop=");
+    for (int w = 0; w < 8; w++)
+      faf_x((uint32_t)*(volatile unsigned long long *)RAD_PB_HOST(0, RAD_PB_EPI_WARP + w) != 0 ? 1u : 0u);
+    faf_s("\n"); faf_flush();
+    if (dn == nc) { rad_host_gpu_soft_reset(); faf_s("FA_FPGA: soft reset asserted\n"); }
+    else          { faf_s("FA_FPGA: EPILOGUE TIMEOUT\n"); }
+    faf_flush();
+  }
+#endif
   faf_s("FA_FPGA: S6 poll exited, scoring\n"); faf_flush();
   uint32_t still_poison = 0, exact = 0;
   uint64_t sumabs = 0;            // sum over halfwords of |bf16 code difference|
@@ -1046,11 +1097,29 @@ int main() {
   {
     volatile uint32_t *mk = (volatile uint32_t *)(FAF_O_BASE + 0x100000ull);
     faf_s("FA_FPGA: marks ="); 
-    for (int k = 0; k < 16; k++) { faf_s(" "); faf_x(mk[k]); }   /* 0..14 stage marks, 15 = ENTRY stamp */
+    /* 22 marks are emitted: 1 entry + 4 key-blocks x 5 + 1 final.  Printing only 16 cut the
+     * run off inside key-block j=2 and made a 4x error in the cycles-per-tile arithmetic
+     * possible -- one MARK period is one Bk=64 KEY BLOCK, not one attention tile. */
+    for (int k = 0; k < 24; k++) { faf_s(" "); faf_x(mk[k]); }
     faf_s("\n  (slot15=e47e4e47 means fa_entry WAS entered; deadbeef there means it never was)\n");
   }
 #if defined(FA_SCALE_GUARD) && defined(FA_GUARD_ADDR)
   fa_guard_check("post_run   ");
+#endif
+#ifdef FA_PB
+  // ---- UNCACHED BEACON READ (printBuf, device 0x80000 -> host 0x40080000).
+  // Read this BEFORE the cores_finished line: it is the only progress signal that does not depend
+  // on the core-finish writeback, so on a hung run it is the only line in this report with content.
+  {
+    static const char *nm[8] = {"entry","stage","tile","preret","predrain","postdrain","retire","warps"};
+    faf_s("FA_FPGA: pb_beacon\n");
+    for (int i = 0; i < 8; i++) {
+      const uint64_t v = *(volatile uint64_t *)(0x40080000ull + 8ull * i);
+      faf_s("  pb["); faf_u(i); faf_s("] "); faf_s(nm[i]); faf_s(" = ");
+      faf_x((uint32_t)v); faf_s(" / "); faf_x((uint32_t)(v >> 32)); faf_s("\n");
+    }
+    faf_flush();
+  }
 #endif
   faf_s("FA_FPGA: cores_finished_after_run =");
   for (int g = 0; g < 4; g++) { faf_s(" "); faf_u(READ_MMIO_32(RAD_HOST_GPU_CORES + 4 * g)); }
@@ -1064,6 +1133,18 @@ int main() {
   faf_s("FA_FPGA: golden[0..3]=");
   for (int k = 0; k < 4; k++) { faf_s(" "); faf_x(((uint32_t)FA_GOLDEN_O[k*2+1] << 16) | FA_GOLDEN_O[k*2]); }
   faf_s("\n");
+  // Compact poison LOCATION report.  The full O dump is truncated by the UART (~2592 of 4096
+  // words), and the missing words turned out to be past the cut -- so print the indices directly.
+  if (still_poison) {
+    uint32_t shown = 0, firsts[8], lastp = 0;
+    for (uint32_t w = 0; w < FAF_O_WORDS; w++) {
+      if (Ow[w] == FAF_POISON) { if (shown < 8) firsts[shown++] = w; lastp = w; }
+    }
+    faf_s("FA_FPGA: poison_at first=");
+    for (uint32_t i = 0; i < shown; i++) { faf_u(firsts[i]); faf_s(","); }
+    faf_s(" last="); faf_u(lastp);
+    faf_s(" (O words=4096, row=64 words)\n"); faf_flush();
+  }
   faf_s("FA_FPGA: still_poison="); faf_u(still_poison); faf_s("/"); faf_u(FAF_O_WORDS);
   faf_s(" exact_halfwords="); faf_u(exact); faf_s("/"); faf_u(FAF_O_WORDS * 2); faf_s("\n");
   faf_s("FA_FPGA: code_sumabs="); faf_u(sumabs);

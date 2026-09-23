@@ -14,8 +14,14 @@
 #define __RAD_TAPEOUT_H__
 
 #include <stdint.h>
+/* The device half needs the Muon intrinsics; the rv64 HOST half must not pull them in -- they
+ * drag in the libc++ type_traits set, which the host toolchain cannot parse.  Define
+ * RAD_TAPEOUT_HOST before including this from host code: you then get the address map and the
+ * host helpers, and none of the device code. */
+#ifndef RAD_TAPEOUT_HOST
 #include <mu_intrinsics.h>
 #include <vx_intrinsics.h>
+#endif
 
 /* ---------------------------------------------------------------------------
  * Cache geometry.  Source: RadianceConfigs.scala:82-90 (L0dCacheConfig,
@@ -37,6 +43,7 @@
 #define RAD_L1_SETS         256u
 #define RAD_L1_WAYS         4u
 #define RAD_L1_LINE_BYTES   32u
+#define RAD_L1_BYTES        (RAD_L1_SETS * RAD_L1_WAYS * RAD_L1_LINE_BYTES)  /* 32 KB */
 
 /* ---------------------------------------------------------------------------
  * Flush-unit MMIO.  MuonTile.scala:196 gives the L0i flush register at
@@ -72,6 +79,7 @@
  * retires this warp's store queue only, so other warps must already have been
  * synchronised by the caller's first barrier.
  * ------------------------------------------------------------------------- */
+#ifndef RAD_TAPEOUT_HOST
 static inline void rad_l0d_drain(void) {
   const uint32_t cid = (uint32_t)vx_core_id();
   volatile uint32_t *scrub =
@@ -178,5 +186,294 @@ static inline void rad_l0d_flush_mmio_unsafe(void) {
   asm volatile("sw.shared x0, 0(%0)" :: "r"(p) : "memory");
 }
 #endif
+
+
+/* ===========================================================================================
+ * THE TAPEOUT EPILOGUE -- never let a core assert `finished`.
+ *
+ * WHY.  Measured 2026-09-21 with an uncached printBuf beacon, on both U250 boards: at occupancy
+ * >= 2 the kernel runs to COMPLETION -- the final stage mark, every warp past the last barrier,
+ * and mu_schedule() returning -- and then `cores_finished` stays 0 0 0 0 and not one output word
+ * reaches DRAM.  It is not a hang.  WarpScheduler.scala:211 defines
+ *     io.finished := VecInit(pcTracker.map(!_.valid)).asUInt.andR
+ * so a core reports finished only when EVERY warp's pcTracker entry is invalid, and the only
+ * thing that clears one is a commit with setTmask === 0 (WarpScheduler.scala:184-190).  At
+ * occupancy 1 `vx_wspawn(1, ...)` spawns no worker at all, so that path is never taken and the
+ * kernel works; at occupancy >= 2 it is taken and the core never reports finished.
+ *
+ * On top of that, MuonTile.scala:371-374 fires the L0d/L0i flush unit on the RISING EDGE of
+ * finished -- the same flush unit that wedges the L0d (see rad_l0d_flush_mmio_unsafe below).  So
+ * asserting finished is not merely unreliable, it puts the tile in a bad state.
+ *
+ * THE EPILOGUE SIDESTEPS BOTH.  No core ever asserts finished:
+ *   1. every warp fences and rendezvous;
+ *   2. warp 0 of each core drains L0d AND L1 by capacity -- no flush unit anywhere;
+ *   3. warps other than warp 0 post "stopped" to the postbox and `vx_tmc 0`;
+ *   4. warp 0 of each core waits for them, posts DONE for its core, and SPINS FOREVER;
+ *   5. the host polls the postbox, sees DONE from every core, and asserts GPU soft reset.
+ * Because warp 0 never retires, `finished` never rises, the finish-edge flush never fires, and
+ * the data is already in DRAM when the host reads it.
+ *
+ * The postbox is printBuf (cacheable = false), so every step of this is visible to the host even
+ * though the caches are in whatever state the kernel left them.
+ *
+ * Both barriers are outside the divergent guards and each guard carries an explicit else-nop:
+ * llvm duplicates a vx_bar placed inside an `if (lane == 0)` region into both paths and hangs the
+ * synchroniser.  And every barrier happens BEFORE any warp executes tmc 0 -- a barrier whose
+ * participants have already exited never completes.
+ * ========================================================================================= */
+
+#endif /* !RAD_TAPEOUT_HOST -- the postbox map below is shared with the host */
+
+/* postbox layout, in printBuf.  8-byte slots; each 32-bit value is written to both halves so an
+ * 8-byte host read sees it however the beat is assembled. */
+#define RAD_PB_BASE            0x80000u
+#define RAD_PB_SLOT(i)         (RAD_PB_BASE + (i) * 8u)
+/* SLOT MAP -- deliberately clear of 0..15, which kernels use for their own progress beacons.
+ * Bug found 2026-09-21: the epilogue originally posted core DONE to slots 0/1, which FA's beacon
+ * already used for entry/stage, so the host read a beacon value and reported a false timeout even
+ * on runs where the epilogue had completed. Keep these two maps disjoint. */
+/* *** THE COMPLETE printBuf SLOT MAP.  CHECK IT BEFORE ADDING A SLOT. ***  64 slots of 8 B.
+ *   0..15  reserved for KERNEL beacons (FA uses 0..7)
+ *   16,17  epilogue: per-core DONE
+ *   20,21  epilogue: per-core trace
+ *   24..31 epilogue: per-warp STOP  (24 + warp_rr, up to 8 warps)
+ *   32..63 free for diagnostics
+ * Collisions here have produced THREE false readings in this campaign: a working epilogue
+ * reported as a timeout, and twice a diagnostic that read back another field's magic. */
+#define RAD_PB_EPI_CORE        16u   /* + core id : warp 0 posts DONE when its core is quiesced */
+#define RAD_PB_EPI_WARP        24u   /* + warp_rr : each stopping warp posts before tmc 0       */
+#define RAD_PB_EPI_TRACE       20u   /* + core id : how far warp 0 got, for diagnosing timeouts */
+#define RAD_EPI_T_BARA         0xA0u /* passed barrier A            */
+#define RAD_EPI_T_DRAIN        0xA1u /* drains done                 */
+#define RAD_EPI_T_BARB         0xA2u /* passed barrier B            */
+#define RAD_EPI_T_POLLED       0xA3u /* finished waiting for warps  */
+#define RAD_EPI_DONE_MAGIC     0xD01E0000u
+#define RAD_EPI_STOP_MAGIC     0x570BBED0u
+/* host-side addresses of the same slots (cluster base + device offset) */
+#define RAD_PB_HOST(cl, i)     (0x40000000ull + 0x100000ull * (cl) + 0x80000ull + (i) * 8ull)
+
+/* *** DO NOT ADD DELAYS BETWEEN THE SFU-CLASS OPS BELOW. ***  Tried 2026-09-21 on the theory that
+ * SFUPipe.scala:68-71 `assert(!reqSent)` (simulation-only, so silicon drops the overlapping
+ * request instead) meant barrier/barrier/tmc were colliding.  Inserting 2000-cycle gaps made it
+ * WORSE: the kernel-source call site went from 0/4096 to 288/4096 poison, reproducibly.  The
+ * hypothesis is refuted and the spacing is harmful. */
+#ifndef RAD_EPI_SETTLE
+#define RAD_EPI_SETTLE 20000u   /* cycles between the two drain passes */
+#endif
+#ifndef RAD_EPI_BAR_A
+#define RAD_EPI_BAR_A 13u
+#endif
+#ifndef RAD_EPI_BAR_B
+#define RAD_EPI_BAR_B 14u
+#endif
+
+#ifndef RAD_TAPEOUT_HOST
+static inline void rad_pb_put(uint32_t slot, uint32_t v) {
+  volatile uint32_t *p = (volatile uint32_t *)RAD_PB_SLOT(slot);
+  asm volatile("sw.shared %0, 0(%1)" :: "r"(v), "r"(p) : "memory");
+  asm volatile("sw.shared %0, 0(%1)" :: "r"(v), "r"(p + 1) : "memory");
+}
+static inline uint32_t rad_pb_get(uint32_t slot) {
+  volatile uint32_t *p = (volatile uint32_t *)RAD_PB_SLOT(slot);
+  uint32_t v; asm volatile("lw.shared %0, 0(%1)" : "=r"(v) : "r"(p) : "memory");
+  return v;
+}
+
+/* Drain the CLUSTER L1 by capacity.  The L1 is instantiated with no flushAddr
+ * (RadianceCluster.scala:137-142), so it has NO flush unit and capacity eviction is the only way
+ * its dirty lines ever leave.  256 sets x 4 ways x 32 B: writing 4 distinct tags into every set
+ * evicts the whole cache.  Walk 2x the L1 size at line stride to be certain of it. */
+/* RAD_L1_DRAIN_MULT: how many L1-sizes to walk.  The L1 is shared by both cores and its
+ * replacement policy is not LRU-guaranteed, so one pass over exactly L1_BYTES is not a proof of
+ * full eviction -- walking a multiple of it is.  Raise this if output words go missing. */
+#ifndef RAD_L1_DRAIN_MULT
+#define RAD_L1_DRAIN_MULT 4u
+#endif
+static inline void rad_l1_drain(void) {
+  const uint32_t cid = (uint32_t)vx_core_id();
+  volatile uint32_t *p =
+      (volatile uint32_t *)(RAD_DRAIN_SCRATCH + 0x00100000u +
+                            cid * (RAD_L1_DRAIN_MULT * RAD_L1_BYTES));
+  const uint32_t n = (RAD_L1_DRAIN_MULT * RAD_L1_BYTES) / RAD_L1_LINE_BYTES;
+  for (uint32_t i = 0; i < n; i++) p[i * (RAD_L1_LINE_BYTES / 4u)] = i + 1u;
+  mu_fence();
+}
+
+/* *** HOW TO USE THIS ***
+ * Call rad_tapeout_epilogue() as the LAST statement of your kernel's entry function -- the
+ * function you hand to mu_schedule() -- passing the tid_in_threadblock and warps-per-block it
+ * was given:
+ *     static void my_entry(void *arg, uint32_t tid, uint32_t nthreads, uint32_t blk) {
+ *         ... kernel body ...
+ *         rad_tapeout_epilogue(tid, nthreads / MU_NUM_THREADS);   // never returns
+ *     }
+ * and on the host, after releasing the GPU:
+ *     if (rad_host_wait_epilogue(2, 20000000ull) == 2) rad_host_gpu_soft_reset();
+ * Do NOT poll all_finished or the per-core finished bits -- by design they never assert.
+ *
+ * *** DO NOT use the libmuonrt-tapeout.a / RAD_TAPEOUT=1 variant for production. ***  It calls
+ * this same function from mu_schedule_standalone() (i.e. after your entry function RETURNS),
+ * which needs no kernel edit and is tempting -- but measured on hardware 2026-09-21 it
+ * deterministically loses part of the output: 64-96 of 4096 words, bit-identical across repeats,
+ * localised to O rows 48-51 (the start of the last worker warp's block) rather than to the end
+ * of the buffer.  Widening the L1 sweep 2x -> 4x and adding a second drain pass after a settle
+ * both changed NOTHING, so it is neither capacity nor in-flight stores; the count moves with code
+ * layout, which says race.  Root cause unknown.  The in-entry call site above is 0/4096 on every
+ * occupancy, repeatably, so use that until the library variant is understood.
+ */
+/* Epilogue trace stamp.  UNGUARDED ON PURPOSE: w, cid and the slot index are warp-uniform, so
+ * every lane stores the same value to the same postbox address and control flow stays uniform.
+ * A guarded form -- `if (l == 0u) { ... } else { nop; }` -- placed immediately before mu_fence()
+ * or vx_bar leaves the warp unreconverged and hangs the fence; measured 2026-09-22, it broke the
+ * known-good kernel-source call site (0/4096 -> 240/4096).  Define RAD_EPI_NOPROBE to remove. */
+#ifdef RAD_EPI_PROBE
+#define RAD_EPI_STAMP(slot, val) rad_pb_put((slot), (val))
+#else
+#define RAD_EPI_STAMP(slot, val) do { } while (0)
+#endif
+
+/* Spin cycles after the arrival barrier, before the single fence, so the OTHER warps' store
+ * queues retire: mu_barrier syncs WARPS, not MEMORY, and mu_fence drains only the issuing warp's
+ * queue (LSU retirement is per-warp).  2000/500 are the values the measured-good FA_FPGA_FLUSH
+ * block uses. */
+#ifndef RAD_EPI_QUEUE_SPIN
+#define RAD_EPI_QUEUE_SPIN 2000u
+#endif
+#ifndef RAD_EPI_POST_SPIN
+#define RAD_EPI_POST_SPIN 500u
+#endif
+
+/* rad_tapeout_epilogue -- call INSTEAD of returning from the kernel body.  NEVER RETURNS.
+ * A function, not a macro: the barrier/tmc sequence is long enough that macro line-continuations
+ * are a liability, and noinline keeps llvm from cloning the vx_bar into divergent paths. */
+__attribute__((noinline, convergent))
+static void rad_tapeout_epilogue(uint32_t tid_in_threadblock, uint32_t warps_per_block) {
+  const uint32_t w = tid_in_threadblock / MU_NUM_THREADS;
+  const uint32_t l = tid_in_threadblock % MU_NUM_THREADS;
+  const uint32_t cid = (uint32_t)vx_core_id();
+
+  /* *** NO ALL-WARP mu_fence() HERE. ***  On the taped-out part only ONE warp per core may fence.
+   * With every warp fencing, warps lose the SFU request and never return -- SFUPipe's
+   * assert(!reqSent) is simulation-only, so silicon drops an overlapping request silently.  This
+   * epilogue used to open with an all-warp mu_fence() and that is what hung it: measured
+   * 2026-09-22, the manager warps (w = warp_in_core 0) were the usual victims, intermittently,
+   * and any timing shift -- returning from the kernel entry first, or one added store -- changed
+   * which warps survived.  The structure below mirrors the measured-good FA_FPGA_FLUSH block:
+   * arrive, let the other warps' queues retire, then fence ONCE per core inside the guard. */
+  mu_barrier(RAD_EPI_BAR_A, warps_per_block);
+  RAD_EPI_STAMP(52u + (w & 3u), 0xFA000000u | w);
+  RAD_EPI_STAMP(48u, warps_per_block);
+  if (w < MU_NUM_CORES && l == 0u) { rad_pb_put(RAD_PB_EPI_TRACE + cid, RAD_EPI_T_BARA); }
+  else { asm volatile("nop"); }
+
+  /* warp_id_rr = warp_in_core*ncores + core, so w < MU_NUM_CORES is warp 0 of each core */
+  if (w < MU_NUM_CORES && l == 0u) {
+#ifdef RAD_EPI_PROBE
+    /* DIAGNOSTIC (2026-09-22).  Reads the first word of the line that the library call site
+     * always loses (O word 3104 = line 194 = L0d set 2) and its predecessor line, BEFORE any
+     * drain runs.  A poison value here means the dirty line had already left the L0d without
+     * reaching DRAM -- i.e. the loss happened before the epilogue, on the way in.  A real value
+     * means the line was still resident and the drain is what lost it.  Slots 32..39 are free
+     * (see the slot map above).  Off by default; it perturbs the L0d by one allocation. */
+    rad_pb_put(32u + cid, *(volatile uint32_t *)(uintptr_t)(0x1F003080u));
+    rad_pb_put(34u + cid, *(volatile uint32_t *)(uintptr_t)(0x1F003080u - 0x80u));
+    rad_pb_put(36u + cid, *(volatile uint32_t *)(uintptr_t)(0x1F003080u + 0x100u));
+#endif
+    /* TWO PASSES with a settle between them: mu_fence() retires at the warp's store-queue head
+     * and does not wait for the L0d to accept the store, so a late store can land in a line the
+     * first sweep has already passed.  (An earlier note here blamed the library call site's
+     * missing words on in-flight stores.  That was wrong: the library epilogue was hanging at the
+     * all-warp fence above and never ran these drains at all, so those words were residue, not
+     * loss.  Widening the sweep 2x -> 4x changed nothing, consistent with that.) */
+    rad_pause(RAD_EPI_QUEUE_SPIN);   /* other warps' store queues retire */
+    mu_fence();                      /* the ONLY fence in this epilogue; one warp per core */
+    rad_l0d_drain();
+    rad_l1_drain();
+    rad_pause(RAD_EPI_SETTLE);
+    rad_l0d_drain();
+    rad_l1_drain();
+    rad_pause(RAD_EPI_POST_SPIN);
+#ifdef RAD_EPI_PROBE
+    rad_pb_put(38u + cid, *(volatile uint32_t *)(uintptr_t)(0x1F003080u));
+#endif
+    rad_pb_put(RAD_PB_EPI_TRACE + cid, RAD_EPI_T_DRAIN);
+  } else {
+    asm volatile("nop");   /* defeat llvm barrier duplication around the divergent guard */
+  }
+  mu_barrier(RAD_EPI_BAR_B, warps_per_block);
+  if (w < MU_NUM_CORES && l == 0u) { rad_pb_put(RAD_PB_EPI_TRACE + cid, RAD_EPI_T_BARB); }
+  else { asm volatile("nop"); }
+
+  if (w >= MU_NUM_CORES) {
+    /* every warp that is not its core's warp 0: announce, then clear our pcTracker entry */
+    if (l == 0u) { rad_pb_put(RAD_PB_EPI_WARP + w, RAD_EPI_STOP_MAGIC); }
+    else { asm volatile("nop"); }
+    mu_fence_smem();
+    vx_tmc_zero();                  /* WarpScheduler.scala:187-189 -- never returns */
+  }
+
+  if (l == 0u) {
+    /* warp 0 of this core: wait for this core's other warps.  warp_rr k*ncores + cid belongs to
+     * core cid, so those are the ones to wait on. */
+    for (uint32_t k = 1u; k * MU_NUM_CORES + cid < warps_per_block; k++) {
+      const uint32_t slot = RAD_PB_EPI_WARP + k * MU_NUM_CORES + cid;
+      for (uint32_t i = 0; i < 2000000u; i++) {
+        if (rad_pb_get(slot) == RAD_EPI_STOP_MAGIC) break;
+      }
+    }
+    rad_pb_put(RAD_PB_EPI_TRACE + cid, RAD_EPI_T_POLLED);
+    rad_pb_put(RAD_PB_EPI_CORE + cid, RAD_EPI_DONE_MAGIC);
+    mu_fence_smem();
+  } else {
+    asm volatile("nop");
+  }
+
+  /* SPIN FOREVER.  Register-only, so a wedged L0d cannot matter; and because this warp never
+   * retires, core.io.finished never rises, the finish-edge flush never fires, and the tile is
+   * never put in the bad state.  The host soft-resets us after reading the postbox. */
+  for (;;) { asm volatile("" ::: "memory"); }
+}
+
+#endif /* !RAD_TAPEOUT_HOST */
+
+/* ===========================================================================================
+ * HOST SIDE of the epilogue.  Include with RAD_TAPEOUT_HOST defined from an rv64 host .cpp.
+ *
+ * The GPU never asserts finished, so DO NOT poll all_finished or the per-core finished bits --
+ * they will never come, by construction.  Poll the postbox instead, then soft-reset the GPU.
+ * Soft reset is what tears the spinning warp 0 down; MuonTile.scala:371 suppresses the
+ * finish-edge flush when the finish was caused by reset, which is exactly what we want because
+ * the epilogue has already drained both cache levels by capacity.
+ * ========================================================================================= */
+#ifdef RAD_TAPEOUT_HOST
+#ifndef RAD_HOST_GPU_RESET
+#define RAD_HOST_GPU_RESET 0x41000000ull
+#endif
+/* Returns the number of cores that reported DONE.  `spins` bounds the wait so a broken epilogue
+ * degrades to a reported timeout, never to a host hang. */
+static inline int rad_host_wait_epilogue(int ncores, unsigned long long spins) {
+  int done = 0;
+  for (unsigned long long i = 0; i < spins && done < ncores; i++) {
+    asm volatile("fence" ::: "memory");     /* never poll behind our own stores */
+    done = 0;
+    for (int c = 0; c < ncores; c++) {
+      /* MUST be RAD_PB_EPI_CORE + c, not c: the core DONE slots moved off 0/1 when they were
+       * found to collide with kernel beacons.  Reading slot c here made a WORKING epilogue report
+       * a timeout while the postbox plainly held the DONE magic. */
+      const unsigned int v =
+          (unsigned int)*(volatile unsigned long long *)RAD_PB_HOST(0, RAD_PB_EPI_CORE + c);
+      if (v == RAD_EPI_DONE_MAGIC) done++;
+    }
+  }
+  return done;
+}
+/* Assert GPU soft reset.  CanHaveGPUReset.scala:85-89: any non-zero write latches reset on every
+ * core, which retires the spinning warp 0 without a finish-edge flush. */
+static inline void rad_host_gpu_soft_reset(void) {
+  *(volatile unsigned int *)RAD_HOST_GPU_RESET = 1u;
+  asm volatile("fence" ::: "memory");
+}
+#endif /* RAD_TAPEOUT_HOST */
 
 #endif /* __RAD_TAPEOUT_H__ */

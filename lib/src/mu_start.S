@@ -20,6 +20,32 @@
 #define STACK_LOG2_SIZE 13
 #define CSR_WMASK 0xCC3
 
+// Stack layout.
+//
+// MU_STACK_WORD_STRIDE == 1 gives the thread-major layout: every
+// thread owns a contiguous STACK_SIZE region, and the 16 lanes of a warp are
+// 8208 bytes apart.  Because 8208 mod 4096 is 16, the 16 lanes land in only
+// four distinct L0d sets, so one warp-wide stack access touches four cache
+// lines.
+//
+// MU_STACK_WORD_STRIDE == 16 (the default since 2026-09-16) gives the lane-interleaved layout,
+// and must be
+// paired with clang -mllvm -riscv-stack-word-stride=16, which multiplies every
+// stack byte offset by 16.  A warp then owns one region of 16 * STACK_SIZE and
+// lane L starts 4*L bytes into it, so the 16 lanes of one stack word occupy a
+// single 64-byte line.  Total stack footprint is unchanged.
+//
+// The interleaved layout requires every stack access to be a naturally aligned
+// 4-byte access.  A sub-word stack object, or a stack object whose address
+// escapes to code that walks it contiguously (memcpy of a local struct, for
+// example), will read or write a neighbouring lane's slot.
+#ifndef MU_STACK_WORD_STRIDE
+#define MU_STACK_WORD_STRIDE 16
+#endif
+#ifndef MU_LOG2_LANES
+#define MU_LOG2_LANES 4
+#endif
+
 .section .init, "ax"
 .global _start
 .type   _start, @function
@@ -84,10 +110,22 @@ init_regs:
   # set stack pointer register
   li    sp, STACK_BASE_ADDR # load stack base address
   csrr  t0, mhartid
+#if MU_STACK_WORD_STRIDE > 1
+  # warp region = (1 << MU_LOG2_LANES) * STACK_SIZE, one per warp
+  srl   t1, t0, MU_LOG2_LANES
+  sll   t1, t1, (STACK_LOG2_SIZE + MU_LOG2_LANES)
+  sub   sp, sp, t1
+  # lane L starts 4*L bytes into the region's topmost line
+  addi  sp, sp, -(1 << (MU_LOG2_LANES + 2))
+  andi  t2, t0, ((1 << MU_LOG2_LANES) - 1)
+  sll   t2, t2, 2
+  add   sp, sp, t2
+#else
   sll   t1, t0, STACK_LOG2_SIZE
   sll   t2, t0, 4
   add   t1, t1, t2
   sub   sp, sp, t1
+#endif
 
   # set thread pointer register
   # use address space after BSS region

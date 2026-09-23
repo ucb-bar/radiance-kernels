@@ -10,6 +10,50 @@
 #include <mu_schedule.h>
 #include <rad_tapeout.h>   // tapeout cache geometry + the capacity-eviction L0d drain
 
+// ---- FA_PB: UNCACHED PROGRESS BEACON (printBuf) ---------------------------------------------
+// Every other probe in this kernel writes GMEM, and a GMEM store is invisible until the
+// core-finish writeback (MuonTile.scala:370-374): L0d is writeback, rad_l0d_drain only pushes to
+// L1, and L1 is writeback too -- O is 16 KB against a 32 KB L1, so it never even evicts by
+// capacity.  Consequence: in ANY hang every mark reads poison no matter how far the kernel got,
+// AND a kernel that computed everything correctly but never retired is indistinguishable from one
+// that never started.  That ambiguity is the whole reason this beacon exists.
+//
+// printBuf (RadianceCluster.scala:96-103) is TLRAM with *** cacheable = false ***, 512 B at
+// device 0x80000 (host 0x40080000), disjoint from the per-tile flush regs at 0x80200+.  A store
+// bypasses L0d and L1 and is host-visible immediately, with no writeback and no finish edge.
+#ifdef FA_PB
+#ifndef FA_PB_BASE
+#define FA_PB_BASE 0x80000u
+#endif
+// slot map -- 64 slots of 8 B.  Low half and high half get the same word so an 8-byte host read
+// sees it whichever way the beat is assembled.
+#define FA_PB_ENTRY     0   /* fa_entry reached                        */
+#define FA_PB_STAGE     1   /* highest stage index reached (monotonic) */
+#define FA_PB_TILE      2   /* highest tile index started              */
+#define FA_PB_PRERET    3   /* body done, about to leave fa_entry      */
+#define FA_PB_PREDRAIN  4   /* about to run the L0d drain              */
+#define FA_PB_POSTDRAIN 5   /* drain returned                          */
+#define FA_PB_RETIRE    6   /* last instruction before the warp exits  */
+#define FA_PB_WARPS     7   /* bitmask of warps that reached PRERET    */
+static inline void fa_pb(uint32_t slot, uint32_t val) {
+    volatile uint32_t *p = (volatile uint32_t *)(FA_PB_BASE + slot * 8u);
+    asm volatile("sw.shared %0, 0(%1)" :: "r"(val), "r"(p) : "memory");
+    asm volatile("sw.shared %0, 0(%1)" :: "r"(val), "r"(p + 1) : "memory");
+}
+// OR a bit in, read-modify-write from one lane; races between warps are acceptable here because
+// each warp sets a distinct bit and the failure mode (a lost bit) is conservative.
+static inline void fa_pb_or(uint32_t slot, uint32_t bit) {
+    volatile uint32_t *p = (volatile uint32_t *)(FA_PB_BASE + slot * 8u);
+    uint32_t v; asm volatile("lw.shared %0, 0(%1)" : "=r"(v) : "r"(p) : "memory");
+    v |= bit;
+    asm volatile("sw.shared %0, 0(%1)" :: "r"(v), "r"(p) : "memory");
+    asm volatile("sw.shared %0, 0(%1)" :: "r"(v), "r"(p + 1) : "memory");
+}
+#else
+static inline void fa_pb(uint32_t, uint32_t) {}
+static inline void fa_pb_or(uint32_t, uint32_t) {}
+#endif
+
 // MARK DRAIN THAT SURVIVES A HANG.  The (cid<<9)+0x80300 flush after a mark store is not enough
 // on this RTL when the core later wedges: the sweep starts immediately, so a store still moving
 // through the LSU/coalescer lands after it and stays dirty forever.  Measured 2026-09-15:
@@ -214,7 +258,8 @@ static constexpr uint32_t MARK_GMEM = FA_MARK_GMEM_ADDR;
 #define BAR_PAD4() BAR_PAD_FAST()
 #endif
 #define MARK() do { if (tid == 0) { uint32_t _c; asm volatile("csrr %0, mcycle" : "=r"(_c)); \
-                                    ((volatile uint32_t *)MARK_GMEM)[mki++] = _c; } } while (0)
+                                    ((volatile uint32_t *)MARK_GMEM)[mki++] = _c; \
+                                    fa_pb(FA_PB_STAGE, 0x57A60000u | mki); } } while (0)
 // PER-STAGE mark.  *** THESE ARE NOT FREE. ***  MARK() is a single-thread store to GMEM, i.e. to
 // DRAM, and mxgemm_core.hpp already measured a single such store at ~400 cycles on this machine
 // (four stamps per tile were worth 1.6k of steady-state slope).  The FA_SP body emits SEVEN per
@@ -3881,6 +3926,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
   // with the per-stage marks.  Distinguishes "never entered fa_entry" from "entered and stalled
   // before the first stage mark".  All 12 per-stage marks came back poison on hardware, which on
   // its own cannot tell those two apart.
+  fa_pb(FA_PB_ENTRY, 0xE47E4E47u);          // uncached: survives a hang, unlike slot 15 below
   if (tid_in_threadblock == 0) {
     ((volatile uint32_t *)MARK_GMEM)[15] = 0xE47E4E47u;
     // MANUAL L0d->L1 FLUSH, or this probe is unfalsifiable.  A GMEM store only becomes
@@ -6367,6 +6413,7 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 #ifndef FA_FPGA_NCORES
 #define FA_FPGA_NCORES 2   /* 1-cluster part; cores_finished_at_reset reads 1 1 0 0 */
 #endif
+  fa_pb(FA_PB_PREDRAIN, 0xD8A10000u);
   mu_barrier(1, wpb);
   {
     const uint32_t fl_warp = tid_in_threadblock / MU_NUM_THREADS;
@@ -6393,6 +6440,26 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
   }
   mu_barrier(2, wpb);
 #endif
+#if defined(FA_EPILOGUE) && !defined(RAD_TAPEOUT_LIB)
+  // THE TAPEOUT EPILOGUE.  Replaces "return and let the core assert finished", which at occupancy
+  // >= 2 leaves cores_finished at 0 0 0 0 with every output word stranded in cache even though the
+  // kernel ran to completion (measured with the printBuf beacon, 2026-09-21).  Never returns; the
+  // host polls the postbox and soft-resets.  Must be the LAST thing in fa_entry.
+  rad_tapeout_epilogue(tid_in_threadblock, wpb);
+#endif
+#ifdef FA_PB
+  // *** THE CASE THIS IS BUILT FOR. ***  If the kernel computed everything and only wedges when a
+  // core asserts finish, then PRERET/PREDRAIN/POSTDRAIN/RETIRE are set while cores_finished stays
+  // 0 0 0 0 and every GMEM mark still reads poison.  Without these four slots that outcome is
+  // indistinguishable from "the kernel never ran", which is how it has been reported until now.
+  {
+    const uint32_t _w = tid_in_threadblock / MU_NUM_THREADS;
+    if ((tid_in_threadblock % MU_NUM_THREADS) == 0u) {
+      fa_pb(FA_PB_PRERET, 0x5E7D0000u | _w);
+      fa_pb_or(FA_PB_WARPS, 1u << (_w & 31u));
+    } else { asm volatile("nop"); }
+  }
+#endif
 #ifdef FA_POSTSPIN
   // METASIM SCORING AID.  CanHaveGPUReset.scala:104-107 stops the simulation 1024 cycles after
   // all_finished rises, which is long before the host can poll it over TSI and read O back -- so
@@ -6417,6 +6484,18 @@ static void fa_noop_entry(void *, uint32_t, uint32_t, uint32_t) { }
 __attribute__((section(".text.faearly")))
 #endif
 int main() {
+#ifdef FA_PB
+  // *** CLEAR THE BEACON FIRST. ***  printBuf is a TLRAM and NOTHING clears it between runs, so a
+  // slot left set by the PREVIOUS run reads back as if this run had set it.  That is not
+  // hypothetical: slot 7 (an OR-accumulator) came back 0x2d on an occ2 run whose warp indices only
+  // reach 3 -- bits from the occ3 run before it on the same board.  Without this clear, "retire is
+  // set" is unfalsifiable, which is the exact failure this project keeps repeating.
+  // Cleared from the single thread live at kernel entry, before anything else can stamp.
+  {
+    for (uint32_t i = 0; i < 58u; i++) fa_pb(i, 0u);
+    fa_pb(FA_PB_ENTRY, 0xC1EA0000u);   // "cleared, this run" -- overwritten by the real entry stamp
+  }
+#endif
 #ifdef FA_FPGA_MAINMARK
   // Stamp BEFORE mu_schedule, from the single thread that is live at kernel entry (the reset
   // vector leaves only warp 0 / lane 0 active).  Slot 14, distinct from the fa_entry stamp in 15.
@@ -6556,6 +6635,14 @@ int main() {
     mu_schedule(fa_entry, nullptr, 4);
 #else
     mu_schedule(fa_entry, nullptr, 3);  // occ=3 default
+#endif
+#ifdef FA_PB
+  // mu_schedule has RETURNED: every spawned warp retired and the manager came back.  If this is
+  // set and cores_finished is still 0 0 0 0, the fault is downstream of all kernel work -- in the
+  // finish/retire path itself, which is exactly the case GMEM marks can never show.
+  fa_pb(FA_PB_RETIRE, 0x5E7126D0u);
+#endif
+#if 0
 #endif
                                         // occ=4 overflowed the 256 phys-reg file.  occ=3 has margin,
                                         // but NOT by the arithmetic that used to be written here
