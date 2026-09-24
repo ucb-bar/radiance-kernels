@@ -13,10 +13,10 @@ RADIANCE_INCLUDE_PATH ?= $(RADIANCE_LIB_PATH)/include
 GEMMINI_SW_PATH ?= $(realpath ../../lib/mxgemmini)
 SOC_DIR ?= $(realpath ../../soc)
 
-LLVM_MUON ?= $(realpath ../../llvm/llvm-muon-stride)
-# llvm-muon predates -riscv-stack-word-stride and rejects it outright, so the interleaved
-# stack needs the newer install.  Point LLVM_MUON back at .../llvm-muon and set
-# MU_STACK_WORD_STRIDE=1 together to build the old way.
+LLVM_MUON ?= $(realpath ../../llvm/llvm-muon)
+# The toolchain must support -riscv-stack-word-stride (llvm-src d2f676d or later, built with
+# scripts/llvm.sh).  An older install rejects the flag outright; to build with one, set
+# LLVM_MUON to it and MU_STACK_WORD_STRIDE=1 together.
 
 MU_CC  = $(LLVM_MUON)/bin/clang
 MU_CXX = $(LLVM_MUON)/bin/clang++
