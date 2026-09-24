@@ -1100,7 +1100,10 @@ int main() {
     /* 22 marks are emitted: 1 entry + 4 key-blocks x 5 + 1 final.  Printing only 16 cut the
      * run off inside key-block j=2 and made a 4x error in the cycles-per-tile arithmetic
      * possible -- one MARK period is one Bk=64 KEY BLOCK, not one attention tile. */
-    for (int k = 0; k < 24; k++) { faf_s(" "); faf_x(mk[k]); }
+#ifndef FA_FPGA_NMARKS
+#define FA_FPGA_NMARKS 24
+#endif
+    for (int k = 0; k < FA_FPGA_NMARKS; k++) { faf_s(" "); faf_x(mk[k]); }
     faf_s("\n  (slot15=e47e4e47 means fa_entry WAS entered; deadbeef there means it never was)\n");
   }
 #if defined(FA_SCALE_GUARD) && defined(FA_GUARD_ADDR)
@@ -1167,6 +1170,47 @@ int main() {
     faf_s("FA_FPGA: vs_flash exact="); faf_u(fexact); faf_s("/"); faf_u(FAF_O_WORDS * 2);
     faf_s(" sumabs="); faf_u(fsum);
     faf_s(" worst="); faf_u(fworst); faf_s("\n");
+  }
+  // Frobenius over DECODED values, ||O - G|| / ||G||, in parts per million, against both goldens.
+  // This is fa_verify_out.py's metric, computed on the host so no O dump is needed.
+  // Correct FULL_ATTN2 (dense) output scores ~35666 ppm against golden_O (FA_GOLDEN_O);
+  // the streaming body scores ~45800 against golden_O and ~34100 against golden_O_flash.
+  // INTEGER ONLY: the host core runs with mstatus.FS off, so any FP instruction -- including the
+  // fsd/fld spills gcc adds to main's prologue once main holds a double -- traps before the first
+  // print.  bf16 is decoded to fixed point at 2^-16 (exact to that resolution for |v| < 256), so
+  // each squared term is < 2^48 and 8192 of them fit in uint64.
+  {
+    auto fx = [](uint16_t h) -> int64_t {           // bf16 -> round-toward-zero(v * 2^16)
+      const int e = (h >> 7) & 0xff;
+      if (e == 0) return 0;
+      const int64_t m = 128 + (h & 0x7f);           // value = m * 2^(e - 134)
+      const int sh = e - 118;                       // times 2^16
+      const int64_t v = sh >= 0 ? (sh > 30 ? (int64_t)1 << 40 : m << sh) : (sh < -8 ? 0 : m >> -sh);
+      return (h & 0x8000u) ? -v : v;
+    };
+    auto isqrt = [](uint64_t x) -> uint64_t {
+      uint64_t r = 0, bit = (uint64_t)1 << 62;
+      while (bit > x) bit >>= 2;
+      while (bit) { if (x >= r + bit) { x -= r + bit; r = (r >> 1) + bit; } else r >>= 1; bit >>= 2; }
+      return r;
+    };
+    uint64_t d2 = 0, g2 = 0, fd2 = 0, fg2 = 0;
+    uint32_t nonfinite = 0;
+    for (uint32_t w = 0; w < FAF_O_WORDS; w++) {
+      const uint32_t v = Ow[w];
+      for (int h = 0; h < 2; h++) {
+        const uint16_t got = (uint16_t)(h ? (v >> 16) : (v & 0xffffu));
+        if ((got & 0x7f80u) == 0x7f80u) { nonfinite++; continue; }
+        const int64_t o = fx(got), g = fx(FA_GOLDEN_O[w * 2 + h]), gf = fx(FA_GOLDEN_OF[w * 2 + h]);
+        d2 += (uint64_t)((o - g) * (o - g));    g2 += (uint64_t)(g * g);
+        fd2 += (uint64_t)((o - gf) * (o - gf)); fg2 += (uint64_t)(gf * gf);
+      }
+    }
+    const uint64_t sg = isqrt(g2), sfg = isqrt(fg2);
+    faf_s("FA_FPGA: frob_ppm vs_golden="); faf_u(sg ? (uint32_t)(isqrt(d2) * 1000000ull / sg) : 0u);
+    faf_s(" vs_flash="); faf_u(sfg ? (uint32_t)(isqrt(fd2) * 1000000ull / sfg) : 0u);
+    faf_s(" nonfinite="); faf_u(nonfinite); faf_s("\n");
+    faf_flush();
   }
 #ifdef FA_DUMP_O
   // Dump the whole O window so the error can be computed properly offline.  The bf16-CODE

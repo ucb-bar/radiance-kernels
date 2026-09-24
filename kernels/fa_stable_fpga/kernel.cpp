@@ -6388,6 +6388,9 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         reinterpret_cast<uint32_t *>(O_GMEM), tid, thr);
     MARK();  // final
 #endif
+#if defined(FA_FPGA) && defined(FULL_ATTN2)
+    MARK();  // end of kernel work: the FULL_ATTN2 bodies emit no final mark of their own
+#endif
 #ifdef FA_FPGA_TAILSPIN
   // POST-STORE TAIL SPIN.  Measured on the bring-up kernel: with no spin the host sees 0 of 4096
   // words; a register-only spin of 13,000 iterations (~26,000 instructions) recovers 4,048 of
