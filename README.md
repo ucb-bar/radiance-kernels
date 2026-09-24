@@ -15,11 +15,13 @@ differences.
 
 There are two ways to install the Muon LLVM toolchain.
 
-* Prebuilt: run `./scripts/llvm_prebuilt.sh`, which will decompress the
-  existing archived LLVM binaries at `llvm/llvm-muon.tar.xz`. This is compiled
-  on an Ubuntu 24.04 system with GLIBC 2.39, meaning there's a good chance it
-  won't work on older systems. You will also need ZSTD. If for any reason the
-  prebuilt toolchain doesn't work, use the second method.
+* Prebuilt: run `./scripts/llvm_prebuilt.sh`, which downloads `llvm-muon.tar.xz`
+  from the [ucb-bar/muon-llvm](https://github.com/ucb-bar/muon-llvm/releases)
+  release that matches the `llvm/llvm-src` submodule commit, checks its md5, and
+  extracts it to `llvm/llvm-muon`. It is compiled on an Ubuntu 24.04 system with
+  GLIBC 2.39, meaning there's a good chance it won't work on older systems. You
+  will also need `libzstd` and `libz` at runtime. If for any reason the prebuilt
+  toolchain doesn't work, use the second method.
 
 * Build from scratch: run `./scripts/llvm.sh`. This will initialize the
   submodule located at `llvm/llvm-src`, which is not cloned by default due to
