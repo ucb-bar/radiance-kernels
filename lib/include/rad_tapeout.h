@@ -236,6 +236,7 @@ static inline void rad_l0d_flush_mmio_unsafe(void) {
 /* *** THE COMPLETE printBuf SLOT MAP.  CHECK IT BEFORE ADDING A SLOT. ***  64 slots of 8 B.
  *   0..15  reserved for KERNEL beacons (FA uses 0..7)
  *   16,17  epilogue: per-core DONE
+ *   18,19  rad_tapeout_begin(): per-core start generation (incremented every run)
  *   20,21  epilogue: per-core trace
  *   24..31 epilogue: per-warp STOP  (24 + warp_rr, up to 8 warps)
  *   32..63 free for diagnostics
@@ -244,6 +245,9 @@ static inline void rad_l0d_flush_mmio_unsafe(void) {
 #define RAD_PB_EPI_CORE        16u   /* + core id : warp 0 posts DONE when its core is quiesced */
 #define RAD_PB_EPI_WARP        24u   /* + warp_rr : each stopping warp posts before tmc 0       */
 #define RAD_PB_EPI_TRACE       20u   /* + core id : how far warp 0 got, for diagnosing timeouts */
+#define RAD_PB_EPI_START       18u   /* + core id : start generation, see rad_tapeout_begin() */
+/* The generation that follows `g`.  Tolerates any initial slot contents. */
+#define RAD_EPI_NEXT_GEN(g)    ((((g) + 1u) & 0x00FFFFFFu) | 0xAC000000u)
 #define RAD_EPI_T_BARA         0xA0u /* passed barrier A            */
 #define RAD_EPI_T_DRAIN        0xA1u /* drains done                 */
 #define RAD_EPI_T_BARB         0xA2u /* passed barrier B            */
@@ -278,6 +282,21 @@ static inline uint32_t rad_pb_get(uint32_t slot) {
   volatile uint32_t *p = (volatile uint32_t *)RAD_PB_SLOT(slot);
   uint32_t v; asm volatile("lw.shared %0, 0(%1)" : "=r"(v) : "r"(p) : "memory");
   return v;
+}
+
+/* rad_tapeout_begin -- call once per core at the top of main(), before mu_schedule().
+ * printBuf keeps its contents across runs and reprograms, so a DONE left by the previous run would
+ * look like this run finishing.  This clears the core's epilogue slots, then advances the core's
+ * start generation (RAD_PB_EPI_START + core) by one.  The host reads the generation before it
+ * launches and waits for the next value (rad_host_run() in rad_host.h), which proves THIS run's
+ * image started.  The counter lives in printBuf because GPU DRAM written by the host does not
+ * reliably keep its value from one run to the next. */
+static inline void rad_tapeout_begin(void) {
+  const uint32_t cid = (uint32_t)vx_core_id();
+  rad_pb_put(RAD_PB_EPI_CORE + cid, 0u);
+  rad_pb_put(RAD_PB_EPI_TRACE + cid, 0u);
+  for (uint32_t w = cid; w < 8u; w += MU_NUM_CORES) rad_pb_put(RAD_PB_EPI_WARP + w, 0u);
+  rad_pb_put(RAD_PB_EPI_START + cid, RAD_EPI_NEXT_GEN(rad_pb_get(RAD_PB_EPI_START + cid)));
 }
 
 /* Drain the CLUSTER L1 by capacity.  The L1 is instantiated with no flushAddr
