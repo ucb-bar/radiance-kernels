@@ -71,7 +71,7 @@ for line in "${LOADS[@]}"; do
 
   # extract bytes for this segment
   bin="${WRK}/seg_${idx}.bin"
-  dd if="${RV32_ELF}" of="${bin}" bs=1 skip=${off} count=${filesz} status=none
+  dd if="${RV32_ELF}" of="${bin}" bs=1M iflag=skip_bytes,count_bytes skip=${off} count=${filesz} status=none
 
   # 3) turn raw bytes into a *binary object* with no ABI: ld -r -b binary
   #    then rename its default .data section to a unique name so we can place it

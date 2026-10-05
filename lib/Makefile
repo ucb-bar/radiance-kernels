@@ -64,6 +64,9 @@ MU_CFLAGS := $(VX_CFLAGS)
 MU_STACK_WORD_STRIDE ?= 16
 ifneq ($(MU_STACK_WORD_STRIDE),1)
 MU_CFLAGS += -mllvm -riscv-stack-word-stride=$(MU_STACK_WORD_STRIDE)
+# The runtime (mu_schedule and the startup code) runs in every warp, so it must fit the smallest
+# per-warp register budget: 8 warps x 32 registers = the 256 physical registers of a core.
+MU_CFLAGS += -mllvm -riscv-max-allocatable-gprs=32
 endif
 # extra device-side defines for the runtime build (e.g. -DRAD_EPI_PROBE_O=...)
 MU_CFLAGS += $(MU_EXTRA_DEFS)
