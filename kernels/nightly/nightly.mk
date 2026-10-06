@@ -75,6 +75,11 @@ SMS ?= 1 2
 GEN_STAMP := build/gen_args.stamp
 $(shell mkdir -p build; printf '%s\n' "$(GEN_ARGS)" | cmp -s - $(GEN_STAMP) || printf '%s\n' "$(GEN_ARGS)" > $(GEN_STAMP))
 
+# DEFS stamp: the objects depend on $(DEFS_STAMP), rewritten whenever DEFS changes, so
+# `make DEFS=...` recompiles even when no source changed.
+DEFS_STAMP := build/defs.stamp
+$(shell mkdir -p build; printf '%s\n' "$(DEFS)" | cmp -s - $(DEFS_STAMP) || printf '%s\n' "$(DEFS)" > $(DEFS_STAMP))
+
 MU_OBJCOPY := $(LLVM_MUON)/bin/llvm-objcopy
 # one object per blob: build/blobs/<name>.o holds <name>.bin in section .regionN
 blob_obj = build/blobs/$(basename $(notdir $(1))).o
@@ -92,12 +97,12 @@ $(foreach b,$(BLOBS),$(eval $(call BLOB_RULE,$(b))))
 all: $(foreach s,$(SMS),build/$(s)sm/$(PROJECT).soc.elf)
 
 define SM_RULES
-build/$(1)sm/$(PROJECT).mu.o: $(MU_SRCS) $(DEPS) $(NIGHTLY_DIR)/nightly.mk $(wildcard $(LIB)/include/nightly/*.h) | build/$(1)sm
+build/$(1)sm/$(PROJECT).mu.o: $(MU_SRCS) $(DEPS) $(DEFS_STAMP) $(NIGHTLY_DIR)/nightly.mk $(wildcard $(LIB)/include/nightly/*.h) | build/$(1)sm
 	$(MU_CXX) $(MU_CFLAGS) -DNIGHTLY_CLUSTERS=$(1) $(DEFS) -c $(firstword $(MU_SRCS)) -o $$@
 build/$(1)sm/$(PROJECT).radiance.elf: build/$(1)sm/$(PROJECT).mu.o $(BLOB_OBJS)
 	$(MU_CXX) $(MU_CFLAGS) $$< $(BLOB_OBJS) $(MU_LDFLAGS) -o $$@
 	$(MU_OBJDUMP) -d $$@ > build/$(1)sm/$(PROJECT).radiance.dump
-build/$(1)sm/$(PROJECT).host.o: $(HOST_SRCS) $(DEPS) | build/$(1)sm
+build/$(1)sm/$(PROJECT).host.o: $(HOST_SRCS) $(DEPS) $(DEFS_STAMP) | build/$(1)sm
 	$(HOST_CXX) $(HOST_CFLAGS) -DNIGHTLY_CLUSTERS=$(1) $(DEFS) -c $(firstword $(HOST_SRCS)) -o $$@
 build/$(1)sm/$(PROJECT).soc.elf: build/$(1)sm/$(PROJECT).radiance.elf build/$(1)sm/$(PROJECT).host.o
 	cd build/$(1)sm && RV32_ELF=$(PROJECT).radiance.elf OUT=$(PROJECT).soc.elf \
