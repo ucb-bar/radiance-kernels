@@ -2,6 +2,12 @@
 
 Kernels written for the [Radiance GPU](https://github.com/ucb-bar/radiance).
 
+## Branches
+
+* `main`: kernels for the latest (nightly) Radiance RTL in `kernels/nightly` (see
+  `lib/include/nightly/README.md` for the RTL branches they need), plus the earlier kernels.
+* `tapeout`: kernels for the taped-out chip.
+
 ## Setup
 
 You will need a **GCC** rv32 toolchain installed from

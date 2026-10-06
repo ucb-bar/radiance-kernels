@@ -7,17 +7,19 @@ These headers support Muon + MxGemmini kernels on the "nightly" Radiance RTL. Th
 
 The nightly RTL is:
 
-* Radiance: the split-l2 branch merged with origin/main (311895c), plus these fixes:
+* Radiance: branch `split-l2` (radiance `main` plus the split host/GPU L2, one DRAM channel per L2
+  slice, and the configs `RadianceHBMConfig` (2 SMs) and `RadianceSingleSMHBMConfig` (1 SM)).
+  The kernels need these fixes, which are on `main`:
   * Muon FPPipe: the shared CVFPU returns packets of different operation groups out of order.
     The fix tags the fp32-to-bf16 convert and allows one operation group in flight per pipe.
   * Muon SFUPipe: `fence.s` waits for the shared-memory queue of its own warp only.
   * CollectorNode: one request fires when all 16 lanes are valid (no per-source state).
-  * GemminiTile requantizer input: a beat is valid only when the response channel is ready.
-  * `RadianceSingleSMHBMConfig` (1 SM). `RadianceHBMConfig` is the 2-SM configuration.
-* Gemmini: branch `gemmini-mx-cleanup` at 0901baa, plus these fixes:
-  * Scratchpad: back-pressure on the DMA queue.
+  * GemminiTile requantizer input: a beat is valid only when its request fires.
+* Gemmini: branch `gemmini-mx-cleanup` with these fixes:
+  * Scratchpad: back-pressure shared-memory reads on room in the DMA queue.
   * ExecuteController: pop each operand read response when the mesh accepts it.
-  * StoreController and LoopMatmulStCSpad: store strides and the J bound of the store.
+  * LoopMatmulStCSpad: the store's row step comes from its own loop, not the global bounds.
+  * StoreController: a DRAM store may carry its own J bound in rs1[63:56] (MXFP4 C stores).
   * LoopMatmul: do not force the A/B load loops when they are idle.
 
 ## Headers
