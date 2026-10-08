@@ -68,14 +68,45 @@ static inline uint32_t ld32(uint32_t addr) {
   return v;
 }
 
+/* NIGHTLY_MX_WAIT_READY (opt-in): never let the INST store block.  A store to INST stalls while gemmini's command
+ * queue is full, and a stalled store holds the issuing core's memory pipeline, slowing every other warp on that core
+ * (fa_mxfp8_sr: the softmax warps sharing the producer's core ran ~2.2x slower).  So poll READY (a plain load) first,
+ * with a short non-issuing stall (dependent divides) between polls. */
+#ifdef NIGHTLY_MX_WAIT_READY
+__attribute__((noinline)) static void wait_ready() {   /* out of line: one copy, not one per command site */
+  while (ld32(READY) == 0) {
+    uint32_t x = 0xFFFFFFFFu;
+    asm volatile("divu %0, %0, %1\n\tdivu %0, %0, %1" : "+r"(x) : "r"(3u));
+  }
+}
+#endif
 static inline void cmd(uint32_t funct, uint64_t rs1, uint64_t rs2) {
   st32(RS1, (uint32_t)rs1); st32(RS1 + 4, (uint32_t)(rs1 >> 32));
   st32(RS2, (uint32_t)rs2); st32(RS2 + 4, (uint32_t)(rs2 >> 32));
+#ifdef NIGHTLY_MX_WAIT_READY
+  wait_ready();
+#endif
   st32(INST, 0x7Bu | (3u << 12) | (1u << 15) | (2u << 20) | (funct << 25));
 }
 
 /* wait until gemmini is idle (all issued commands executed, loaders done) */
 static inline void fence() { while (ld32(BUSY) != 0) asm volatile("nop"); }
+
+#ifdef NIGHTLY_MX_RETIRE
+/* NIGHTLY_MX_RETIRE (opt-in; needs a gemmini built with has_loop_retire_counter): MMIO 0x38 counts LOOP_WS that have
+ * fully retired, in issue order (all computes done, stores landed), so "retired >= n" means the n-th LOOP_WS this
+ * thread issued, and everything issued before it, is done.  Waiting for one loop this way leaves the loops queued
+ * behind it running, where fence() drains everything.  loops_issued counts this thread's LOOP_WS (the issuing thread
+ * only); the n of a loop is loops_issued right after issuing it. */
+constexpr uint32_t RETIRED = CTRL + 0x38;
+inline uint32_t loops_issued = 0;
+__attribute__((noinline)) static void wait_retired(uint32_t n) {
+  while ((int32_t)(ld32(RETIRED) - n) < 0) {
+    uint32_t x = 0xFFFFFFFFu;
+    asm volatile("divu %0, %0, %1\n\tdivu %0, %0, %1" : "+r"(x) : "r"(3u));
+  }
+}
+#endif
 /* number of LOOP_WS accepted but not yet fully unrolled */
 static inline uint32_t occupancy() { return ld32(OCCUPANCY); }
 
@@ -152,6 +183,9 @@ static inline void loop_ws_spad(uint32_t I, uint32_t J, uint32_t K, uint32_t a_s
   cmd(LOOP_WS_CONFIG_SPAD_AB, a_start, b_end);
   const uint64_t rs2 = ((uint64_t)c_spad << 32) | (1ull << 9) | ((uint64_t)inc_acc << 8) | skip_bits(s);
   cmd(LOOP_WS, (uint64_t)accumulate, rs2);
+#ifdef NIGHTLY_MX_RETIRE
+  loops_issued++;
+#endif
 }
 /* Loop-managed scales (gemmini 0901baa): the next LOOP_WS loads its own A/B scale slices -- A: K/32
  * rows of I*16 bytes at `a_pitch`, B: K/32 rows of J*16 bytes at `b_pitch` -- into the scale half of its
