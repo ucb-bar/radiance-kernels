@@ -20,8 +20,8 @@
 #include <mu_schedule.h>
 #include <nightly/pb.h>
 
-/* Number of clusters (SMs) the kernel is built for: 1 = RadianceSingleSMHBMConfig,
- * 2 = RadianceHBMConfig.  Set by the kernel Makefile per ELF. */
+/* Number of clusters (SMs) the kernel uses on RadianceHBMConfig (2 clusters): 1 = cluster 0 only
+ * (the host does not launch cluster 1), 2 = both.  Set by the kernel Makefile per ELF. */
 #ifndef NIGHTLY_CLUSTERS
 #define NIGHTLY_CLUSTERS 1
 #endif

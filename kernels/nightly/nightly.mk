@@ -5,10 +5,18 @@
 # DEPS (generated headers), then includes this file.  Every kernel is built once per cluster
 # count, into its own directory so the objects never mix:
 #
-#   build/1sm/$(PROJECT).soc.elf   NIGHTLY_CLUSTERS=1  (RadianceSingleSMHBMConfig)
-#   build/2sm/$(PROJECT).soc.elf   NIGHTLY_CLUSTERS=2  (RadianceHBMConfig)
+#   build/1sm/$(PROJECT).soc.elf   NIGHTLY_CLUSTERS=1  (RadianceHBMConfig, cluster 0 only)
+#   build/2sm/$(PROJECT).soc.elf   NIGHTLY_CLUSTERS=2  (RadianceHBMConfig, both clusters)
 #
 # `make` builds both.  `make SMS=1` builds one.  Extra defines: DEFS="-DFOO=1 -DBAR".
+# With NIGHTLY_CLUSTERS=1 the host launches cluster 0 only; cluster 1 waits for LAUNCH forever.
+#
+# MU_ADDR_HASH (default 1): RadianceHBMConfig hashes GPU memory over the 4 L2 slices / DRAM
+# channels (radiance WithGPUAddressHash).  SimDRAM +loadmem and FireSim LoadMem write DRAM
+# directly, so the GPU load segments are scrambled into the hashed layout before the fuse step
+# (soc/scramble_gpu_elf.py).  Use MU_ADDR_HASH=0 only for a loader that goes through the hash
+# (TSI, RadianceHBMTSIConfig) or for an unhashed config.  The flag is part of the DEFS stamp, so
+# switching it rebuilds.
 #
 # BLOBS: raw binary files named <anything>.regionN.bin (N = 0..3) are linked into section
 # .regionN of the device image (see lib/linker/mu_link_nightly.ld for the addresses).  Use them
@@ -77,8 +85,11 @@ $(shell mkdir -p build; printf '%s\n' "$(GEN_ARGS)" | cmp -s - $(GEN_STAMP) || p
 
 # DEFS stamp: the objects depend on $(DEFS_STAMP), rewritten whenever DEFS changes, so
 # `make DEFS=...` recompiles even when no source changed.
+MU_ADDR_HASH ?= 1
+MU_ADDR_HASH_ARGS := --base 0x0 --size 0x80000000 --unit 32 --slices 4
 DEFS_STAMP := build/defs.stamp
-$(shell mkdir -p build; printf '%s\n' "$(DEFS)" | cmp -s - $(DEFS_STAMP) || printf '%s\n' "$(DEFS)" > $(DEFS_STAMP))
+STAMP_TEXT := $(DEFS) MU_ADDR_HASH=$(MU_ADDR_HASH)
+$(shell mkdir -p build; printf '%s\n' "$(STAMP_TEXT)" | cmp -s - $(DEFS_STAMP) || printf '%s\n' "$(STAMP_TEXT)" > $(DEFS_STAMP))
 
 MU_OBJCOPY := $(LLVM_MUON)/bin/llvm-objcopy
 # one object per blob: build/blobs/<name>.o holds <name>.bin in section .regionN
@@ -104,12 +115,23 @@ build/$(1)sm/$(PROJECT).radiance.elf: build/$(1)sm/$(PROJECT).mu.o $(BLOB_OBJS)
 	$(MU_OBJDUMP) -d $$@ > build/$(1)sm/$(PROJECT).radiance.dump
 build/$(1)sm/$(PROJECT).host.o: $(HOST_SRCS) $(DEPS) $(DEFS_STAMP) | build/$(1)sm
 	$(HOST_CXX) $(HOST_CFLAGS) -DNIGHTLY_CLUSTERS=$(1) $(DEFS) -c $(firstword $(HOST_SRCS)) -o $$@
-build/$(1)sm/$(PROJECT).soc.elf: build/$(1)sm/$(PROJECT).radiance.elf build/$(1)sm/$(PROJECT).host.o
-	cd build/$(1)sm && RV32_ELF=$(PROJECT).radiance.elf OUT=$(PROJECT).soc.elf \
+build/$(1)sm/$(PROJECT).fuse.elf: build/$(1)sm/$(PROJECT).radiance.elf $(DEFS_STAMP) $(SOC)/scramble_gpu_elf.py
+ifeq ($(MU_ADDR_HASH),1)
+	python3 $(SOC)/scramble_gpu_elf.py $$< $$@ $(MU_ADDR_HASH_ARGS) > /dev/null
+else
+	cp $$< $$@
+endif
+build/$(1)sm/$(PROJECT).soc.elf: build/$(1)sm/$(PROJECT).fuse.elf build/$(1)sm/$(PROJECT).host.o
+	cd build/$(1)sm && RV32_ELF=$(PROJECT).fuse.elf OUT=$(PROJECT).soc.elf \
 	  RV64_START=$(SOC)/start.S RV64_MAIN= RV64_OBJS=$(PROJECT).host.o \
 	  RV64_CFLAGS="$(HOST_CFLAGS)" RV64_LDFLAGS="$(HOST_LDFLAGS)" RV64_LIBS= \
 	  CC=$(HOST_CC) LD=$(HOST_LD) RV64_LINK=$(HOST_CC) OBJCOPY=$(HOST_OBJCOPY) READELF=readelf \
 	  $(SOC)/fuse_rv32_into_rv64.sh > /dev/null
+ifeq ($(MU_ADDR_HASH),1)
+	echo "unit=32 slices=4 size=0x80000000 gpu_base=0x100000000" > $$@.addrhash
+	$(HOST_OBJCOPY) --add-section .radiance_addr_hash=$$@.addrhash $$@
+	rm -f $$@.addrhash
+endif
 build/$(1)sm:
 	mkdir -p $$@
 endef

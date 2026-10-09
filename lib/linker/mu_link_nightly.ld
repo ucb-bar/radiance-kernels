@@ -5,14 +5,16 @@
  *      .data, so every zero-initialised static is part of the loaded image and really is zero.
  *      mu_link.ld's `*(.bss)` does not match `.bss.*`, and mu_start.S never clears .bss, so
  *      there such statics hold stale DRAM.
- *   2. Four fixed-address data regions for large tensors, one per GPU L2 slice / DRAM channel
- *      of RadianceHBMConfig (512 MiB each of device 0x0000_0000..0x7FFF_FFFF):
- *        .region1  0x2000_0000   (slice 1)
- *        .region2  0x4000_0000   (slice 2)
- *        .region3  0x6000_0000   (slice 3; the warp stacks sit below 0x7F00_0000)
+ *   2. Four fixed-address data regions for large tensors (512 MiB each of device
+ *      0x0000_0000..0x7FFF_FFFF):
+ *        .region1  0x2000_0000
+ *        .region2  0x4000_0000
+ *        .region3  0x6000_0000   (the warp stacks sit below 0x7F00_0000)
  *      Kernels put a data blob there (lib/nightly or the kernel's gen_data.py) and address
  *      tensors by fixed offsets that the host shares through a generated header.
- *      Code, small data and region 0 tensors stay at 0x1000_0000 (slice 0).
+ *      Code, small data and region 0 tensors stay at 0x1000_0000.
+ *      Without the address hash, each region is one GPU L2 slice / DRAM channel.  RadianceHBMConfig
+ *      hashes every 32 B over all 4 slices, so there a region does not select a slice.
  */
 OUTPUT_ARCH( "riscv" )
 ENTRY(_start)

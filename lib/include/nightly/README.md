@@ -8,7 +8,9 @@ These headers support Muon + MxGemmini kernels on the "nightly" Radiance RTL. Th
 The nightly RTL is:
 
 * Radiance: branch `split-l2` (radiance `main` plus the split host/GPU L2, one DRAM channel per L2
-  slice, and the configs `RadianceHBMConfig` (2 SMs) and `RadianceSingleSMHBMConfig` (1 SM)).
+  slice, and the config `RadianceHBMConfig` (2 SMs)). `RadianceHBMConfig` hashes GPU memory over
+  the 4 L2 slices at 32 B granularity, so a kernel ELF must be scrambled before `+loadmem` (see
+  "Build and run").
   The kernels need these fixes, which are on `main`:
   * Muon FPPipe: the shared CVFPU returns packets of different operation groups out of order.
     The fix tags the fp32-to-bf16 convert and allows one operation group in flight per pipe.
@@ -37,5 +39,10 @@ The nightly RTL is:
 1. Use the muon LLVM toolchain with the stack word stride (`llvm/llvm-muon`).
 2. In a kernel directory, run `make`. The build writes `build/1sm/<kernel>.soc.elf` and
    `build/2sm/<kernel>.soc.elf`.
-3. Run the 1sm ELF on `RadianceSingleSMHBMConfig` and the 2sm ELF on `RadianceHBMConfig`. The
-   host prints the mesh utilization and the result check.
+3. Run both ELFs on `RadianceHBMConfig` with `+loadmem`. The 1sm ELF launches cluster 0 only.
+   The host prints the mesh utilization and the result check.
+
+The build scrambles the GPU load segments into the hashed DRAM layout (`MU_ADDR_HASH=1`, the
+default; `soc/scramble_gpu_elf.py`). Use `MU_ADDR_HASH=0` only to load through TSI
+(`RadianceHBMTSIConfig`) or to run on a config without the hash. A scrambled ELF fails on a config
+without the hash.
