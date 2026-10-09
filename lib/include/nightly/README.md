@@ -7,8 +7,8 @@ These headers support Muon + MxGemmini kernels on the "nightly" Radiance RTL. Th
 
 The nightly RTL is:
 
-* Radiance: branch `split-l2` (radiance `main` plus the split host/GPU L2, one DRAM channel per L2
-  slice, and the config `RadianceHBMConfig` (2 SMs)). `RadianceHBMConfig` hashes GPU memory over
+* Radiance: branch `main` (the split host/GPU L2, one DRAM channel per L2 slice, and the config
+  `RadianceHBMConfig` (2 SMs)). `RadianceHBMConfig` hashes GPU memory over
   the 4 L2 slices at 32 B granularity, so a kernel ELF must be scrambled before `+loadmem` (see
   "Build and run").
   The kernels need these fixes, which are on `main`:
