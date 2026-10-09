@@ -190,18 +190,44 @@ endif
 %.host.o: %.s
 	$(HOST_CC) $(HOST_CFLAGS) -c $< -o $@
 
-%.soc.elf: %.radiance.elf $(HOST_OBJS) $(SOC_DIR)/fuse_rv32_into_rv64.sh $(SOC_DIR)/start.S
+# GPU memory address hash (radiance RadianceHBMConfig, WithGPUAddressHash): MU_ADDR_HASH=1 fuses a
+# copy of the rv32 ELF whose load segments are scrambled into the hashed physical layout
+# (soc/scramble_gpu_elf.py), for loaders that write DRAM directly (SimDRAM +loadmem, FireSim
+# LoadMem). The parameters must match the RTL; the fused ELF records them in a .radiance_addr_hash
+# section. Load an MU_ADDR_HASH=1 ELF only that way, never through TSI (the front-bus hash would
+# apply twice), and run `make clean` when switching the flag (it is not a file dependency).
+MU_ADDR_HASH ?= 0
+MU_ADDR_HASH_SIZE ?= 0x80000000
+MU_ADDR_HASH_UNIT ?= 32
+MU_ADDR_HASH_SLICES ?= 4
+MU_ADDR_HASH_ARGS = --base 0x0 --size $(MU_ADDR_HASH_SIZE) --unit $(MU_ADDR_HASH_UNIT) --slices $(MU_ADDR_HASH_SLICES)
+ifeq ($(MU_ADDR_HASH),1)
+SOC_FUSE_INPUT := .radiance.hashed.elf
+else
+SOC_FUSE_INPUT := .radiance.elf
+endif
+
+%.radiance.hashed.elf: %.radiance.elf $(SOC_DIR)/scramble_gpu_elf.py
+	python3 $(SOC_DIR)/scramble_gpu_elf.py $< $@ $(MU_ADDR_HASH_ARGS)
+
+%.soc.elf: %$(SOC_FUSE_INPUT) $(HOST_OBJS) $(SOC_DIR)/fuse_rv32_into_rv64.sh $(SOC_DIR)/start.S
 	RV32_ELF="$<" OUT="$@" \
 	RV64_START="$(SOC_DIR)/start.S" RV64_MAIN= \
 	RV64_OBJS="$(HOST_OBJS)" RV64_CFLAGS="$(HOST_CFLAGS)" \
 	RV64_LDFLAGS="$(HOST_LDFLAGS)" RV64_LIBS="$(HOST_LIBS)" \
 	CC="$(HOST_CC)" LD="$(HOST_LD)" RV64_LINK="$(HOST_LINK)" OBJCOPY="$(HOST_OBJCOPY)" READELF="$(HOST_READELF)" \
 	$(SOC_DIR)/fuse_rv32_into_rv64.sh
+ifeq ($(MU_ADDR_HASH),1)
+	echo "unit=$(MU_ADDR_HASH_UNIT) slices=$(MU_ADDR_HASH_SLICES) size=$(MU_ADDR_HASH_SIZE) gpu_base=0x100000000" > $@.addrhash
+	$(HOST_OBJCOPY) --add-section .radiance_addr_hash=$@.addrhash $@
+	rm -f $@.addrhash
+endif
 
 clean:
 	rm -rf *.o
 	rm -rf *.host.o
 	rm -rf $(BINARIES) $(OBJDUMPS)
+	rm -rf *.radiance.hashed.elf
 
 clean-all: clean
 	rm -rf *.o
