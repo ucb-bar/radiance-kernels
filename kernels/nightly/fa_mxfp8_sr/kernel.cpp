@@ -1,6 +1,7 @@
-// MXFP8 flash attention on Radiance with SPAD_REQUANT: upstream fa_mxfp8 (gemmini mesh for QK^T and PV, SIMT softmax,
-// lazy softmax with O accumulated in the accumulator) with the Muon P feed through the requantizer window replaced by
-// gemmini's SPAD_REQUANT (funct 34): the requantizer reads P (BF16) straight from SMEM and writes the PV operand tiles
+// MXFP8 flash attention on Radiance with SPAD_REQUANT: the former fa_mxfp8 (removed; in git history up to 38b3425:
+// gemmini mesh for QK^T and PV, SIMT softmax, lazy softmax with O accumulated in the accumulator) with the Muon P feed
+// through the requantizer window replaced by gemmini's SPAD_REQUANT (funct 34): the requantizer reads P (BF16)
+// straight from SMEM and writes the PV operand tiles
 // and the resident act scales itself.  No feeder / re-tile warps, no FLAG handshake, no fp8/bf16 output-format
 // switching (SPAD_REQUANT carries its own format), and PV / QK issue back to back.  Needs a Radiance build with
 // has_spad_requant (WithRadianceE4M3MxGemmini).  Shapes, data and golden: upstream's, keys in natural order
