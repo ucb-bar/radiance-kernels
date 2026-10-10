@@ -96,10 +96,17 @@ static inline void fence() { while (ld32(BUSY) != 0) asm volatile("nop"); }
 /* NIGHTLY_MX_RETIRE (opt-in; needs a gemmini built with has_loop_retire_counter): MMIO 0x38 counts LOOP_WS that have
  * fully retired, in issue order (all computes done, stores landed), so "retired >= n" means the n-th LOOP_WS this
  * thread issued, and everything issued before it, is done.  Waiting for one loop this way leaves the loops queued
- * behind it running, where fence() drains everything.  loops_issued counts this thread's LOOP_WS (the issuing thread
- * only); the n of a loop is loops_issued right after issuing it. */
+ * behind it running, where fence() drains everything.  loops_issued() counts this cluster's LOOP_WS (issued by its one
+ * issuing thread); the n of a loop is loops_issued() right after issuing it.  The count lives in a word of the
+ * cluster's shared memory at NIGHTLY_MX_LOOPS_SMEM, which the kernel picks (a free word) and clears with
+ * loops_reset() before its first LOOP_WS: a DRAM global would be one word for every cluster's issuing thread, behind
+ * caches that are not coherent across clusters. */
+#ifndef NIGHTLY_MX_LOOPS_SMEM
+#error "NIGHTLY_MX_RETIRE needs NIGHTLY_MX_LOOPS_SMEM, the shared-memory byte address of a free word for the loop count"
+#endif
 constexpr uint32_t RETIRED = CTRL + 0x38;
-inline uint32_t loops_issued = 0;
+static inline void loops_reset() { st32(NIGHTLY_MX_LOOPS_SMEM, 0); }
+static inline uint32_t loops_issued() { return ld32(NIGHTLY_MX_LOOPS_SMEM); }
 __attribute__((noinline)) static void wait_retired(uint32_t n) {
   while ((int32_t)(ld32(RETIRED) - n) < 0) {
     uint32_t x = 0xFFFFFFFFu;
@@ -184,7 +191,7 @@ static inline void loop_ws_spad(uint32_t I, uint32_t J, uint32_t K, uint32_t a_s
   const uint64_t rs2 = ((uint64_t)c_spad << 32) | (1ull << 9) | ((uint64_t)inc_acc << 8) | skip_bits(s);
   cmd(LOOP_WS, (uint64_t)accumulate, rs2);
 #ifdef NIGHTLY_MX_RETIRE
-  loops_issued++;
+  st32(NIGHTLY_MX_LOOPS_SMEM, ld32(NIGHTLY_MX_LOOPS_SMEM) + 1);
 #endif
 }
 /* Loop-managed scales (gemmini 0901baa): the next LOOP_WS loads its own A/B scale slices -- A: K/32

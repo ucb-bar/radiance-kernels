@@ -135,7 +135,7 @@ endif
 build/$(1)sm:
 	mkdir -p $$@
 endef
-$(foreach s,1 2,$(eval $(call SM_RULES,$(s))))
+$(foreach s,$(sort 1 2 $(SMS)),$(eval $(call SM_RULES,$(s))))
 
 clean:
 	rm -rf build

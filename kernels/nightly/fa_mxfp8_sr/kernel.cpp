@@ -6,6 +6,7 @@
 // has_spad_requant (WithRadianceE4M3MxGemmini).  Shapes, data and golden: upstream's, keys in natural order
 // (gen_data.py --novperm).
 #include <nightly/device.h>
+#define NIGHTLY_MX_LOOPS_SMEM (8000u * 16u)   // mx.h's per-cluster LOOP_WS count: a free word above the stats (see map)
 #include <nightly/mx.h>
 #include <nightly/verify.h>
 #include "fa_data.h"
@@ -46,6 +47,8 @@ constexpr uint32_t LSUM[2] = {MREF[0] + 256, MREF[1] + 256};   // l f32 [64] by 
 constexpr uint32_t INV_OFF = 256;                          // 1/l f32 [64] at LSUM[p] + INV_OFF
 constexpr uint32_t DUMMY_A = 0;                            // A row of store-only and junk loops
 static_assert(MREF[1] + 768 <= mx::SPAD_ROWS * 16, "scratchpad budget");
+static_assert(NIGHTLY_MX_LOOPS_SMEM >= MREF[1] + 768 && NIGHTLY_MX_LOOPS_SMEM + 4 <= mx::SPAD_ROWS * 16,
+              "the LOOP_WS count word must not overlap the scratchpad map");
 
 enum : uint32_t { BAR_P = 3, BAR_T = 6, BAR_S = 7, BAR_O = 8, BAR_N = 9, BAR_ND = 10 };
 
@@ -324,6 +327,7 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
   };
   if (lead) {
     if (tb == 0) nightly_phase(0);
+    mx::loops_reset();                                   // before the first LOOP_WS
     mx::flush_tlb();
     mx::lut_disable();
     mx::config_ld(D, 0);
@@ -370,7 +374,7 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
           cfg_qk(false);
           qk(0);                                         // QK_2: ex 0 -> 128 (runs under softmax_1)
           store_s(SP[0]);                                // S_2 (QK_2 stores no S): after QK_2's computes, ahead of PV_0
-          n_qk = mx::loops_issued;                       // block 1 waits for this store, not for PV_0 behind it
+          n_qk = mx::loops_issued();                     // block 1 waits for this store, not for PV_0 behind it
         } else if (more) {
           mx::wait_retired(n_qk);                        // QK_{g+1} and its S_{g+1} store retired (block 1: S_2's store)
         }
@@ -413,7 +417,7 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
         // at ~50 cycles each (v7e put V's 5 ahead of QK: PV -> QK gap 509 cycles instead of 84).
         if (more2 && g > 0) {
           qk_store(((g + 2) / NB) & 1, SP[g & 1]);       // QK_{g+2}: ex 0 -> 128, S_{g+2} -> SP[g & 1]
-          n_qk = mx::loops_issued;
+          n_qk = mx::loops_issued();
         } else {
           if (g > 0) toggle();                           // no QK_{g+2} ahead of PV_g: 0 -> 128 (its legacy config also
                                                          // frees weight half 1 for V_g's gated scales)
