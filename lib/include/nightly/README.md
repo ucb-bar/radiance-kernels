@@ -10,14 +10,16 @@ The nightly RTL is:
 * Radiance: branch `main` (the split host/GPU L2, one DRAM channel per L2 slice, and the config
   `RadianceHBMConfig` (2 SMs)). `RadianceHBMConfig` hashes GPU memory over
   the 4 L2 slices at 32 B granularity, so a kernel ELF must be scrambled before `+loadmem` (see
-  "Build and run").
+  "Build and run"). Its Gemmini is the E4M3 MxGemmini: E4M3 inputs only, with SPAD_REQUANT
+  (`fa_mxfp8_sr`) and the loop retire counter. MXFP4 kernels (`gemm_mx FMT=fp4`) need a config
+  with the MX Gemmini (`WithRadianceMxGemmini`).
   The kernels need these fixes, which are on `main`:
   * Muon FPPipe: the shared CVFPU returns packets of different operation groups out of order.
     The fix tags the fp32-to-bf16 convert and allows one operation group in flight per pipe.
   * Muon SFUPipe: `fence.s` waits for the shared-memory queue of its own warp only.
   * CollectorNode: one request fires when all 16 lanes are valid (no per-source state).
   * GemminiTile requantizer input: a beat is valid only when its request fires.
-* Gemmini: branch `gemmini-mx-cleanup` with these fixes:
+* Gemmini: branch `firesim-hbm` (`gemmini-mx-cleanup` with these fixes):
   * Scratchpad: back-pressure shared-memory reads on room in the DMA queue.
   * ExecuteController: pop each operand read response when the mesh accepts it.
   * LoopMatmulStCSpad: the store's row step comes from its own loop, not the global bounds.
