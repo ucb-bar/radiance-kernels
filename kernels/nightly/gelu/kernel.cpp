@@ -3,12 +3,14 @@
 //   z = sqrt(2/pi) (x + 0.044715 x^3)
 // Every thread of every cluster handles 32-bit words (two bf16) in a grid-stride loop; UNROLL
 // independent words per iteration keep that many loads in flight per thread.
+// Runs 4 warps per core (Makefile OCC = 4): at 8 the 32-register budget made the loop spill to the
+// stack, and the spills took half of the L0d's in-flight request slots (2.2x slower).
 #include <nightly/device.h>
 #include <nightly/verify.h>
 #include "gelu_data.h"
 
 #ifndef GELU_UNROLL
-#define GELU_UNROLL 4
+#define GELU_UNROLL 8
 #endif
 
 static inline float bf16_lo(uint32_t w) { return __builtin_bit_cast(float, w << 16); }

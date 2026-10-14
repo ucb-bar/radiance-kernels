@@ -11,8 +11,8 @@ The nightly RTL is:
   `RadianceHBMConfig` (2 SMs)). `RadianceHBMConfig` hashes GPU memory over
   the 4 L2 slices at 32 B granularity, so a kernel ELF must be scrambled before `+loadmem` (see
   "Build and run"). Its Gemmini is the E4M3 MxGemmini: E4M3 inputs only, with SPAD_REQUANT
-  (`fa_mxfp8_sr`) and the loop retire counter. MXFP4 kernels (`gemm_mx FMT=fp4`) need a config
-  with the MX Gemmini (`WithRadianceMxGemmini`).
+  (`fa_mxfp8_sr`) and the loop retire counter. MXFP4 kernels (`gemm_mx FMT=fp4`) run on
+  `RadianceFP4HBMConfig`: the same memory system with an MXFP4-only Gemmini.
   The kernels need these fixes, which are on `main`:
   * Muon FPPipe: the shared CVFPU returns packets of different operation groups out of order.
     The fix tags the fp32-to-bf16 convert and allows one operation group in flight per pipe.

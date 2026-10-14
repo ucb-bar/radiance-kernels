@@ -6,8 +6,8 @@
 #   make FMT=fp8 ARGS="--M 512 --N 512 --K 512 --TK 256 --pretile --bdup"
 #     1 SM 87.6 % / 92.3 %, 2 SM 80.5 % / 91.2 %
 #   make FMT=fp4 ARGS="--M 512 --N 512 --K 1024 --TK 512 --pretile --bdup"
-#     1 SM 73.4 % / 80.0 %, 2 SM 60.9 % / 75.9 % (needs the MX Gemmini, not the E4M3 one that
-#     RadianceHBMConfig now has)
+#     on RadianceFP4HBMConfig (MXFP4-only Gemmini; RadianceHBMConfig's E4M3 Gemmini has no FP4):
+#     1 SM 74.4 % / 81.2 %, 2 SM 61.0 % / 78.4 %
 PROJECT   = gemm_mx
 MU_SRCS   = kernel.cpp
 HOST_SRCS = host.cpp
