@@ -22,6 +22,7 @@
 extern "C" void exit(int) __attribute__((noreturn));
 
 #define NIGHTLY_HOST_GPU_DRAM_BASE  0x100000000ull
+#define NIGHTLY_HOST_GPU_RESET      0x41000000ull
 #define NIGHTLY_HOST_ALL_FINISHED   0x41000008ull
 #ifndef NIGHTLY_CORES_PER_CLUSTER
 #define NIGHTLY_CORES_PER_CLUSTER 2
@@ -81,6 +82,11 @@ static inline void nightly_host_launch(uint32_t n_clusters, uint32_t arg = 0) {
     nightly_pb_write(cl, NIGHTLY_PB_STATUS, 0);
     nightly_pb_write(cl, NIGHTLY_PB_ARG, arg);
   }
+  asm volatile("fence" ::: "memory");
+  /* Release the GPU soft reset (GPUResetAggregator, CanHaveGPUReset.scala: a write of 0 clears it).  The FireSim
+   * configs hold the GPU in reset at power-on (WithGPUDefaultResetHeld); the VCS configs boot it, where this write
+   * changes nothing.  The released cores boot and wait for LAUNCH below. */
+  *(volatile uint32_t *)NIGHTLY_HOST_GPU_RESET = 0u;
   asm volatile("fence" ::: "memory");
   for (uint32_t cl = 0; cl < n_clusters; cl++) nightly_pb_write(cl, NIGHTLY_PB_LAUNCH, NIGHTLY_LAUNCH_MAGIC);
   asm volatile("fence" ::: "memory");
