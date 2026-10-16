@@ -101,7 +101,11 @@ $(printf "%s\n" "${SEG_PHDRS[@]}")
 }
 
 __rom_base  = 0x80000000;
-__stack_top = 0x80080000;
+/* The stack grows down from __stack_top.  A fixed 0x80080000 sits INSIDE any host image larger than
+   ~448 KB (a host that includes big golden headers), and the stack then overwrites live code/data:
+   the host dies silently after its first print.  Keep 0x80080000 for small images (unchanged
+   layout) and otherwise put the top 128 KB above _end. */
+__stack_top = MAX(0x80080000, ALIGN(_end + 0x20000, 16));
 
 SECTIONS
 {

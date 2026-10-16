@@ -19,6 +19,10 @@ The nightly RTL is:
   * Muon SFUPipe: `fence.s` waits for the shared-memory queue of its own warp only.
   * CollectorNode: one request fires when all 16 lanes are valid (no per-source state).
   * GemminiTile requantizer input: a beat is valid only when its request fires.
+* Radiance branch `firesim-debug` adds the Muon store fixes that `llama_e2e` needs on FireSim:
+  * Coalescer: merge sub-word stores from several lanes into one word byte by byte (68c74ef).
+  * L0d: per-byte dirty mask, write-backs as PutPartialData (579df5a).
+  * Shared memory: forward a same-cycle write to a read of the same address (ac454ac).
 * Gemmini: branch `firesim-hbm` (`gemmini-mx-cleanup` with these fixes):
   * Scratchpad: back-pressure shared-memory reads on room in the DMA queue.
   * ExecuteController: pop each operand read response when the mesh accepts it.
