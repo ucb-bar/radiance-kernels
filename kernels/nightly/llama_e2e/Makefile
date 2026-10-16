@@ -10,8 +10,8 @@
 #   make MODEL=llama7b                     Llama-2-7B shapes, synthetic weights filled on the device
 #   TAG=l1 ARGS="--layers 1"               a variant (own data dir and ELF name: llama_e2e_<MODEL>_<TAG>)
 #   make ladder                            the FireSim test ladder (see the ladder target)
-# e.g. Llama-7B, 1 layer + LM head on 2 clusters (FireSimE4M3MxGemminiTwoClusterHBMRadianceConfig):
-#   make MODEL=llama7b TAG=l1 ARGS="--layers 1" SMS=2  ->  build/2sm/llama_e2e_llama7b_l1.soc.elf
+# e.g. Llama-7B, 1 layer + LM head on 2 or 4 clusters (FireSimE4M3MxGemmini{Two,Four}ClusterHBMRadianceConfig):
+#   make MODEL=llama7b TAG=l1 ARGS="--layers 1" SMS="2 4"  ->  build/{2,4}sm/llama_e2e_llama7b_l1.soc.elf
 # The host prints per-phase cycles, mesh_util_model and PASS/FAIL, then exits through HTIF.
 # Toolchain: L=<radiance-kernels>/llvm/llvm-muon; make ... RISCV_SYSROOT=$L RISCV_TOOLCHAIN_PATH=$L
 # -> build/{1,2,4}sm/llama_e2e_<MODEL>.soc.elf.  Built for the hashed HBM configs (MU_ADDR_HASH=1, load with
