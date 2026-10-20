@@ -49,6 +49,12 @@ MU_CFLAGS += -idirafter $(MU_LIBC_INCLUDE)
 endif
 MU_CFLAGS += $(KERNEL_MU_CFLAGS)
 
+# freestanding libstdc++ headers (<type_traits> in mu_intrinsics.h)
+MU_CXX_INCLUDE ?= $(lastword $(sort $(wildcard $(MU_LIBC_INCLUDE)/c++/*)))
+ifneq ($(MU_CXX_INCLUDE),)
+MU_CFLAGS += -idirafter $(MU_CXX_INCLUDE) -idirafter $(MU_CXX_INCLUDE)/riscv64-unknown-elf
+endif
+
 # Register budget.  Muon's renamer allocates a physical register on a warp's FIRST write of an
 # architectural register and never frees it; a core has 256 (Rename.scala:123 asserts on
 # overflow).  So warps_per_core * registers_per_warp must stay <= 256.  OCC is the warps per
@@ -110,10 +116,10 @@ all: $(foreach s,$(SMS),build/$(s)sm/$(PROJECT).soc.elf)
 define SM_RULES
 build/$(1)sm/$(PROJECT).mu.o: $(MU_SRCS) $(DEPS) $(DEFS_STAMP) $(NIGHTLY_DIR)/nightly.mk $(wildcard $(LIB)/include/nightly/*.h) | build/$(1)sm
 	$(MU_CXX) $(MU_CFLAGS) -DNIGHTLY_CLUSTERS=$(1) $(DEFS) -c $(firstword $(MU_SRCS)) -o $$@
-build/$(1)sm/$(PROJECT).radiance.elf: build/$(1)sm/$(PROJECT).mu.o $(BLOB_OBJS)
+build/$(1)sm/$(PROJECT).radiance.elf: build/$(1)sm/$(PROJECT).mu.o $(BLOB_OBJS) $(LIB)/libmuonrt.a
 	$(MU_CXX) $(MU_CFLAGS) $$< $(BLOB_OBJS) $(MU_LDFLAGS) -o $$@
 	$(MU_OBJDUMP) -d $$@ > build/$(1)sm/$(PROJECT).radiance.dump
-build/$(1)sm/$(PROJECT).host.o: $(HOST_SRCS) $(DEPS) $(DEFS_STAMP) | build/$(1)sm
+build/$(1)sm/$(PROJECT).host.o: $(HOST_SRCS) $(DEPS) $(DEFS_STAMP) $(NIGHTLY_DIR)/nightly.mk $(wildcard $(LIB)/include/nightly/*.h) | build/$(1)sm
 	$(HOST_CXX) $(HOST_CFLAGS) -DNIGHTLY_CLUSTERS=$(1) $(DEFS) -c $(firstword $(HOST_SRCS)) -o $$@
 build/$(1)sm/$(PROJECT).fuse.elf: build/$(1)sm/$(PROJECT).radiance.elf $(DEFS_STAMP) $(SOC)/scramble_gpu_elf.py
 ifeq ($(MU_ADDR_HASH),1)

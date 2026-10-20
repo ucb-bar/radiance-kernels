@@ -28,10 +28,18 @@ struct __attribute__((aligned(CACHE_LINE_BYTES))) Context {
  * Must occupy its own cache line (64B) to avoid flush races with adjacent data. */
 static volatile Context schedule_context;
 
-static void __attribute__ ((noinline)) mu_schedule_standalone() {
+/* Weak so a runtime layer that knows the real index can override it: the cluster-ID CSR is only
+ * 1 bit wide in the RTL, so on 4 clusters clusters 2 and 3 read 0 and 1 (nightly/device.h reads
+ * the index from printBuf instead). */
+__attribute__((weak, noinline)) uint32_t mu_cluster_id(void) {
     uint32_t cluster_id = 0;
     // TODO: clid not supported in assembler
     asm volatile("csrr %0, %1" : "=r"(cluster_id) : "i"(MU_CSR_CLUSTER_ID));
+    return cluster_id;
+}
+
+static void __attribute__ ((noinline)) mu_schedule_standalone() {
+    const uint32_t cluster_id = mu_cluster_id();
     const auto core_id_in_cluster = vx_core_id();
     const auto cores_per_cluster = MU_NUM_CORES;
     const auto global_core_id = cluster_id * cores_per_cluster + core_id_in_cluster;

@@ -81,6 +81,7 @@ static inline void nightly_host_launch(uint32_t n_clusters, uint32_t arg = 0) {
     }
     nightly_pb_write(cl, NIGHTLY_PB_STATUS, 0);
     nightly_pb_write(cl, NIGHTLY_PB_ARG, arg);
+    nightly_pb_write(cl, NIGHTLY_PB_CLUSTER, NIGHTLY_CLUSTER_TAG | cl);   /* see nightly_cluster_id */
   }
   asm volatile("fence" ::: "memory");
   /* Release the GPU soft reset (GPUResetAggregator, CanHaveGPUReset.scala: a write of 0 clears it).  The FireSim

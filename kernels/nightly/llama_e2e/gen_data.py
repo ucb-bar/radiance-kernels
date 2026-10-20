@@ -29,7 +29,14 @@ Models:
              this quantized pipeline; top-1 agreement.
   llama7b    Llama-2-7B shapes, SYNTHETIC: random weights filled on the device before timing (one layer's
              weights shared by all 32 layers, one KV cache shared by all layers).  Performance only.
+  deepseek   DeepSeek-R1-Distill-Qwen-1.5B (Qwen2: q/k/v biases, added as the fused ROPE stages Q, K, V), REAL
+             weights; checked like tinyllama.  Uses regions 0 and 4 (nearly all 2 GiB).
+  gemma2     Gemma-2-2B shapes and math, SYNTHETIC like llama7b (2.6 GB of fp8 weights do not fit 2 GiB): head dim
+             256, GeGLU (tanh GELU), a post-norm on each residual branch (norm1 / norm2 / final normalize the branch
+             before adding it), (1 + w) gains (folded into the gammas), sqrt(D) embedding scale (folded into x0),
+             attention logit soft-capping (SOFTMAX) and final logit soft-capping (ACT after the LM head).
   smoke      small random model for RTL simulation, every stage checked against the emulation.
+  qwensmoke / gemmasmoke   small random models on the deepseek / gemma2 device paths, checked against the emulation.
 
 Memory: GEMM operands that only gemmini reads are reused across layers; every buffer that Muon reads is
 written once per run (its L0d / L1 are not coherent with writes from gemmini or other clusters), except
@@ -42,8 +49,12 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "common"))
 from nightly_data import bf16_bits, bf16_to_f32
 
-REGION_BASE = {1: 0x20000000, 2: 0x40000000, 3: 0x60000000}
-REGION_END = {1: 0x40000000, 2: 0x60000000, 3: 0x7F000000}   # warp stacks from 0x7F00_0000
+# regions 1..3 as in mu_link_nightly.ld; region0 (above the code) and region4 (below it) from mu_link_llama.ld.  Region 3
+# ends below the warp stacks: clusters 0, 1 at 0x7EC0_0000..0x7F00_0000, clusters 2, 3 16 MiB lower (mu_start.S: the
+# cluster-ID CSR is 1 bit wide, so their stacks are shifted by the printBuf cluster index).
+REGION_BASE = {4: 0x01000000, 0: 0x11000000, 1: 0x20000000, 2: 0x40000000, 3: 0x60000000}
+REGION_END = {4: 0x10000000, 0: 0x20000000, 1: 0x40000000, 2: 0x60000000, 3: 0x7DC00000}
+FILL_ORDER = (1, 2, 0, 4, 3)    # big weight tensors: first region with room
 ALIGN = 256
 TN = 64                         # GEMM n-tile (4 PE tiles)
 TK = 256                        # GEMM k-step for the activation / weight GEMMs and PV
@@ -53,13 +64,22 @@ MODELS = {
                       kind="real", hf="TinyLlama/TinyLlama-1.1B-Chat-v1.0"),
     "llama7b": dict(D=4096, F=11008, Hq=32, Hkv=32, hd=128, L=32, V=32000, eps=1e-5, theta=10000.0,
                     kind="synthetic"),
+    "deepseek": dict(D=1536, F=8960, Hq=12, Hkv=2, hd=128, L=28, V=151936, eps=1e-6, theta=10000.0,
+                     kind="real", hf="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", bias=True),
+    "gemma2": dict(D=2304, F=9216, Hq=8, Hkv=4, hd=256, L=26, V=256000, eps=1e-6, theta=10000.0,
+                   kind="synthetic", gemma=True, qpre=256, attn_cap=50.0, final_cap=30.0),
     "smoke": dict(D=256, F=512, Hq=4, Hkv=2, hd=64, L=2, V=512, eps=1e-5, theta=10000.0, kind="random"),
     # smallest model with the ATTN (flash attention) phase: hd 128, >= 6 key blocks (use --ctx 768)
     "fasmoke": dict(D=256, F=512, Hq=2, Hkv=2, hd=128, L=1, V=512, eps=1e-5, theta=10000.0, kind="random"),
+    # the deepseek path (ATTN + fused ROPE with q/k/v biases) and the gemma2 path (hd 256, post-norms, GeGLU, caps)
+    "qwensmoke": dict(D=256, F=512, Hq=2, Hkv=2, hd=128, L=2, V=512, eps=1e-6, theta=10000.0, kind="random",
+                      bias=True, ctx=768),
+    "gemmasmoke": dict(D=256, F=512, Hq=2, Hkv=1, hd=256, L=2, V=512, eps=1e-6, theta=10000.0, kind="random",
+                       gemma=True, qpre=256, attn_cap=50.0, final_cap=30.0, M=64, ctx=256),
 }
 
 OPS = ["init", "norm1", "qkv", "rope", "qk", "softmax", "pv", "oquant", "oproj", "norm2", "gateup",
-       "silu", "down", "final", "lmhead", "gemm", "gelu", "attn", "rope_k", "rope_v"]
+       "silu", "down", "final", "lmhead", "gemm", "gelu", "attn", "rope_k", "rope_v", "softcap"]
 OP = {n: i for i, n in enumerate(OPS)}
 T_NONE, T_GEMM, T_PRENORM, T_ROPE, T_SOFTMAX, T_EWQ, T_FILL, T_SILU, T_ACT, T_FA = 0, 1, 2, 3, 4, 5, 6, 7, 8, 9
 FA_BK, FA_QT = 128, 64          # ATTN phase: key block, query tile (fa_phase.h)
@@ -133,6 +153,38 @@ def bf(x):
     return bf16_to_f32(bf16_bits(x))
 
 
+def bf_scalar(x):
+    return float(np.asarray(bf(np.float32(x))).reshape(-1)[0])
+
+
+# kernel.cpp's fp32 transcendental helpers, in its operation order (float32 throughout)
+_F = np.float32
+
+
+def exp2_poly(t):
+    """2^t: degree-5 minimax on the fraction (kernel.cpp exp2_poly)"""
+    t = np.clip(np.asarray(t, _F), _F(-126), _F(126))
+    n = np.floor(t).astype(np.int32)
+    f = (t - n.astype(_F)).astype(_F)
+    p = _F(1.8775767e-3)
+    for c in (8.9893397e-3, 5.5826318e-2, 2.4015361e-1, 6.9315308e-1, 9.9999994e-1):
+        p = (p * f + _F(c)).astype(_F)
+    return (p.view(np.uint32) + (n.astype(np.uint32) << 23)).view(_F)
+
+
+def tanh_dev(y):
+    """tanh(y) = 1 - 2 / (1 + 2^(2 log2(e) y)) (kernel.cpp tanh_f)"""
+    e = exp2_poly(_F(2.0) * _F(1.4426950409) * np.asarray(y, _F))
+    return (_F(1) - _F(2) / (_F(1) + e)).astype(_F)
+
+
+def gelu_dev(x):
+    """tanh GELU (kernel.cpp gelu_f): x / (1 + 2^(-2 log2(e) z)), z = 0.79788 (x + 0.044715 x^3)"""
+    x = np.asarray(x, _F)
+    z = (_F(0.7978845608) * (x + _F(0.044715) * x * x * x)).astype(_F)
+    return (x / (_F(1) + exp2_poly(_F(-2.0) * _F(1.4426950409) * z))).astype(_F)
+
+
 # ================================ device layouts ================================
 def pack_a(codes, scales, TM, TKa):
     """A [R][K] -> pretiled [MT][KS][TM][TKa], scales [R][K/32] -> [MT][KS][TKa/32][TM]"""
@@ -169,7 +221,7 @@ class Mem:
 
     def __init__(self, name):
         self.name = name
-        self.blobs = {1: bytearray(), 2: bytearray(), 3: bytearray()}
+        self.blobs = {r: bytearray() for r in REGION_BASE}
         self.arena = None
         self.defs = []
 
@@ -186,11 +238,20 @@ class Mem:
             self.defs.append((f"{sym}_ADDR", f"0x{addr:08x}u"))
         return addr
 
+    def add_any(self, array):
+        """a blob tensor in the first region of FILL_ORDER with room for it"""
+        nb = np.ascontiguousarray(array).nbytes
+        for r in FILL_ORDER:
+            used = (len(self.blobs[r]) + ALIGN - 1) // ALIGN * ALIGN
+            if REGION_BASE[r] + used + nb <= REGION_END[r]:
+                return self.add(r, array)
+        raise SystemExit(f"out of GPU memory placing a {nb}-byte tensor")
+
     def alloc(self, nbytes, sym=None):
         if self.arena is None:
             self.arena = {r: REGION_BASE[r] + len(b) for r, b in self.blobs.items()}
         nbytes = (nbytes + ALIGN - 1) // ALIGN * ALIGN
-        for r in (3, 2, 1):
+        for r in (3, 2, 1, 0, 4):
             a = (self.arena[r] + ALIGN - 1) // ALIGN * ALIGN
             if a + nbytes <= REGION_END[r]:
                 self.arena[r] = a + nbytes
@@ -234,12 +295,15 @@ def load_hf(cfg, M, P0, layers):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     torch.set_grad_enabled(False)
     tok = AutoTokenizer.from_pretrained(cfg["hf"])
-    model = AutoModelForCausalLM.from_pretrained(cfg["hf"], torch_dtype=torch.float32)
+    model = AutoModelForCausalLM.from_pretrained(cfg["hf"], dtype=torch.float32)
     model.eval()
     import glob
     import pyarrow.parquet as pq
-    files = sorted(glob.glob(os.path.expanduser(
-        "~/.cache/huggingface/hub/datasets--Salesforce--wikitext/snapshots/*/wikitext-2-raw-v1/test-*.parquet")))
+    hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
+        os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
+    files = sorted(glob.glob(os.path.join(
+        hub, "datasets--Salesforce--wikitext/snapshots/*/wikitext-2-raw-v1/test-*.parquet")))
+    assert files, f"wikitext-2 test split not in {hub} (huggingface_hub snapshot_download Salesforce/wikitext)"
     text = "".join(pq.read_table(files[0]).column("text").to_pylist())
     ids = tok(text, return_tensors="pt").input_ids[:, : P0 + M + 1]
     full = model(ids[:, : P0 + M], output_hidden_states=True)
@@ -266,10 +330,14 @@ def load_hf(cfg, M, P0, layers):
             wd=g("mlp.down_proj.weight"),
             g_in=g("input_layernorm.weight"), g_post=g("post_attention_layernorm.weight"),
             kc=k[0].float().numpy(), vc=v[0].float().numpy()))          # [Hkv][P0][hd]
+        if cfg.get("bias"):                                              # Qwen2: q, k, v projections have biases
+            W[-1]["bqkv"] = np.concatenate([g("self_attn.q_proj.bias"), g("self_attn.k_proj.bias"),
+                                            g("self_attn.v_proj.bias")], 0)
     hs = [full.hidden_states[i][0, P0:].float().numpy() for i in range(len(full.hidden_states))]
     x0 = sd["model.embed_tokens.weight"][ids[0, P0:P0 + M]].float().numpy()
+    wlm = sd["lm_head.weight"] if "lm_head.weight" in sd else sd["model.embed_tokens.weight"]   # tied embeddings
     return dict(layers=W, g_final=sd["model.norm.weight"].float().numpy(),
-                wlm=sd["lm_head.weight"].float().numpy(), x0=x0, hidden=hs,
+                wlm=wlm.float().numpy(), x0=x0, hidden=hs,
                 logits=full.logits[0, P0:].float().numpy(), labels=ids[0, P0 + 1:P0 + M + 1].numpy())
 
 
@@ -283,8 +351,15 @@ def random_model(cfg, M, P0, layers, rng):
             wgu=rng.normal(0, D ** -0.5, (2 * F, D)), wd=rng.normal(0, F ** -0.5, (D, F)),
             g_in=rng.uniform(0.5, 1.5, D), g_post=rng.uniform(0.5, 1.5, D),
             kc=rng.normal(0, 1, (Hkv, P0, hd)), vc=rng.normal(0, 1, (Hkv, P0, hd))))
+        if cfg.get("bias"):
+            W[-1]["bqkv"] = rng.normal(0, 0.5, Dq + 2 * Dkv)
+        if cfg.get("gemma"):   # post-attention / post-feedforward norm gains (effective, i.e. 1 + w)
+            W[-1]["g_pa"], W[-1]["g_pf"] = rng.uniform(0.5, 1.5, D), rng.uniform(0.5, 1.5, D)
+    x0 = rng.normal(0, 1, (M, D))
+    if cfg.get("gemma"):
+        x0 = x0 * bf_scalar(np.sqrt(D))                     # Gemma's sqrt(D) embedding normalizer
     return dict(layers=W, g_final=rng.uniform(0.5, 1.5, D), wlm=rng.normal(0, D ** -0.5, (V, D)),
-                x0=rng.normal(0, 1, (M, D)), hidden=None, logits=None, labels=None)
+                x0=x0, hidden=None, logits=None, labels=None)
 
 
 def gu_interleave(F):
@@ -299,21 +374,32 @@ def emulate(cfg, M, P0, mdl, qw, cos, sin, keep_layer0=True, fa=False, ilv=False
     Dq, Dkv, Gq, SK = Hq * hd, Hkv * hd, Hq // Hkv, P0 + M
     out = dict(h=[], layer0={})
 
-    def norm_q(h, gamma):
+    gemma = cfg.get("gemma", False)
+    acap, fcap = cfg.get("attn_cap"), cfg.get("final_cap")
+
+    def norm_f(h, gamma):
         ss = np.sum(h.astype(np.float32) ** 2, axis=1, dtype=np.float32)
         inv = (np.float32(1) / np.sqrt(ss / np.float32(D) + np.float32(eps))).astype(np.float32)
-        y = (h * inv[:, None]).astype(np.float32) * bf(gamma)[None, :]
-        return mx_dequant(*mx_quant(y))
+        return (h * inv[:, None]).astype(np.float32) * bf(gamma)[None, :]
+
+    def norm_q(h, gamma):
+        return mx_dequant(*mx_quant(norm_f(h, gamma)))
+
+    def resid(x, y, g2):
+        """h = x + y, Gemma-2: x + bf16(rmsnorm(y) * g2) (the PRENORM post-norm, d[14])"""
+        return bf(x + (bf(norm_f(y, g2)) if g2 is not None else y))
 
     h = bf(mdl["x0"])
     hmid = ymlp = None
     for l, w in enumerate(mdl["layers"]):
         q = qw[l]
         if l > 0:
-            h = bf(hmid + ymlp)
+            h = resid(hmid, ymlp, mdl["layers"][l - 1].get("g_pf") if gemma else None)
             out["h"].append(h)
         xn = norm_q(h, w["g_in"])
         qkv = bf(xn @ deq_weight(q["wqkv"]))
+        if "bqkv" in w:                                                  # bias added to the bf16 GEMM output
+            qkv = bf(qkv + bf(w["bqkv"])[None, :])
         Q = rope(qkv[:, :Dq].reshape(M, Hq, hd), cos, sin)
         Kn = rope(qkv[:, Dq:Dq + Dkv].reshape(M, Hkv, hd), cos, sin)
         Vn = qkv[:, Dq + Dkv:].reshape(M, Hkv, hd)
@@ -322,7 +408,7 @@ def emulate(cfg, M, P0, mdl, qw, cos, sin, keep_layer0=True, fa=False, ilv=False
                              mx_dequant(*mx_quant(Kn.transpose(1, 0, 2)))], axis=1)   # [Hkv][SK][hd]
         Vall = np.concatenate([np.asarray(w["vc"], np.float32), Vn.transpose(1, 0, 2)], axis=1)
         Vd = mx_dequant(*mx_quant(Vall.transpose(0, 2, 1))).transpose(0, 2, 1)       # groups along keys
-        scale = np.float32(1.0 / np.sqrt(hd))
+        scale = np.float32(1.0 / np.sqrt(cfg.get("qpre", hd)))
         mask = np.arange(SK)[None, :] <= (P0 + np.arange(M))[:, None]
         O = np.zeros((M, Hq, hd), np.float32)
         S0 = None
@@ -331,34 +417,44 @@ def emulate(cfg, M, P0, mdl, qw, cos, sin, keep_layer0=True, fa=False, ilv=False
             S = bf(Qd[:, h_, :] @ Kd[g].T)
             if h_ == 0:
                 S0 = S
-            if fa:   # ATTN phase: max of key block 0 only, unnormalized bf16 P, O = (P V) / l
+            if fa:   # ATTN phase: exact masked row max (pre-pass), unnormalized bf16 P, O = (P V) / l
                 s = bf(S * bf(scale))
-                m = s[:, :FA_BK].max(axis=1, keepdims=True)
+                m = np.where(mask, s, -np.inf).max(axis=1, keepdims=True)
                 e = np.where(mask, bf(np.exp(bf(s - m))), 0).astype(np.float32)
                 lsum = np.sum(e, axis=1, dtype=np.float32)
                 O[:, h_, :] = bf(bf(mx_dequant(*mx_quant(e)) @ Vd[g]) * (np.float32(1) / lsum)[:, None])
                 continue
-            z = np.where(mask, S * scale, -np.inf).astype(np.float32)
+            if acap:   # Gemma-2 soft-capping: cap tanh(S scale / cap) (SOFTMAX d[16], d[17])
+                zc = (np.float32(acap) * tanh_dev(S * np.float32(scale / acap))).astype(np.float32)
+                z = np.where(mask, zc, -np.inf).astype(np.float32)
+            else:
+                z = np.where(mask, S * scale, -np.inf).astype(np.float32)
             m = np.max(z, axis=1, keepdims=True)
             e = np.where(mask, bf(np.exp(bf(z - m))), 0).astype(np.float32)
             p = e * (np.float32(1) / np.sum(e, axis=1, keepdims=True, dtype=np.float32))
             O[:, h_, :] = bf(mx_dequant(*mx_quant(p)) @ Vd[g])
         O = O.reshape(M, Dq)
         yattn = bf(mx_dequant(*mx_quant(O)) @ deq_weight(q["wo"]))
-        hmid = bf(h + yattn)
+        hmid = resid(h, yattn, w.get("g_pa") if gemma else None)
         xn2 = norm_q(hmid, w["g_post"])
         gu = bf(xn2 @ deq_weight(q["wgu"]))
         guo = gu[:, np.argsort(gu_interleave(F))] if ilv else gu         # back to [G | U]
         G, U = guo[:, :F], guo[:, F:]
-        en = bf(np.exp(bf(-G)))
-        Hh = (G / (np.float32(1) + en)).astype(np.float32) * U
+        if gemma:                                                        # GeGLU: tanh GELU(G) * U
+            Hh = (gelu_dev(G) * U).astype(np.float32)
+        else:
+            en = bf(np.exp(bf(-G)))
+            Hh = (G / (np.float32(1) + en)).astype(np.float32) * U
         ymlp = bf(mx_dequant(*mx_quant(Hh)) @ deq_weight(q["wd"]))
         if l == 0 and keep_layer0:
             out["layer0"] = dict(qkv=qkv, s0=S0, o=O, yattn=yattn, hmid=hmid, gu=gu, ymlp=ymlp)
-    h = bf(hmid + ymlp)
+    h = resid(hmid, ymlp, mdl["layers"][-1].get("g_pf") if gemma else None)
     out["h"].append(h)
     xf = norm_q(h, mdl["g_final"])
-    out["logits"] = bf(xf @ deq_weight(qw["wlm"]))
+    lg = bf(xf @ deq_weight(qw["wlm"]))
+    if fcap:   # final logit soft-capping (ACT kind 1 after the LM head)
+        lg = bf(np.float32(fcap) * tanh_dev(lg * np.float32(1.0 / fcap)))
+    out["logits"] = lg
     return out
 
 
@@ -492,27 +588,38 @@ def main():
     a = ap.parse_args()
 
     cfg = dict(MODELS[a.model])
-    M = a.M or (64 if a.model == "smoke" else 128)
-    SK = a.ctx or (256 if a.model == "smoke" else 1024)
+    M = a.M or cfg.get("M") or (64 if a.model == "smoke" else 128)
+    SK = a.ctx or cfg.get("ctx") or (256 if a.model == "smoke" else 1024)
     L = a.layers or cfg["L"]
     P0 = SK - M
     D, F, Hq, Hkv, hd, V = cfg["D"], cfg["F"], cfg["Hq"], cfg["Hkv"], cfg["hd"], cfg["V"]
     Dq, Dkv, Gq, NQKV = Hq * hd, Hkv * hd, Hq // Hkv, Hq * hd + 2 * Hkv * hd
+    gemma, bias = cfg.get("gemma", False), cfg.get("bias", False)
+    acap, fcap = cfg.get("attn_cap"), cfg.get("final_cap")
     TM = M
     assert M in (64, 128) and SK % 256 == 0 and P0 % 32 == 0 and P0 >= 0
-    assert D % TK == 0 and F % TK == 0 and Dq % TK == 0 and hd in (64, 128)
+    assert D % TK == 0 and F % TK == 0 and Dq % TK == 0 and hd in (64, 128, 256)
+    assert D <= 4096, "PRENORM stages a row (and its gammas) in 8 KiB of SMEM"
     for n in (NQKV, D, 2 * F, V, SK):
         assert n % TN == 0, n
     synthetic = cfg["kind"] == "synthetic"
     rng = np.random.default_rng(a.seed)
-    fa_ok = (hd == 128 and SK % FA_BK == 0 and SK // FA_BK >= 6 and P0 >= FA_BK and (Hq * M // FA_QT) % 4 == 0
-             and P0 % 64 == 0 and M % 64 == 0)
+    # ATTN: hd 64 / 128, >= 6 key blocks (even: the max pre-pass leaves the accumulator halves at 0), <= 64 query tiles
+    # per cluster (fa_phase.h QT_MAX, checked for one cluster: the most tiles)
+    fa_ok = (hd in (64, 128) and SK % FA_BK == 0 and SK // FA_BK >= 6 and (SK // FA_BK) % 2 == 0 and P0 >= FA_BK
+             and (Hq * M // FA_QT) % 4 == 0 and Hq * M // FA_QT <= 64 and P0 % 64 == 0 and M % 64 == 0 and not acap)
     fa = a.attn == "fa" or (a.attn == "auto" and fa_ok)
-    assert fa_ok or not fa, "ATTN phase needs hd 128, >= 6 key blocks of 128, P0 >= 128, Hq M / 64 % 4 == 0"
+    assert fa_ok or not fa, "ATTN phase needs hd 64/128, an even number (>= 6) of 128-key blocks, P0 >= 128, " \
+                            "Hq M / 64 % 4 == 0 and <= 64, no cap"
     assert not (fa and a.debug_l0), "--debug-l0 checks the qk / softmax / pv phases"
     NBk = SK // FA_BK
     fuse = fa                                            # SILU fused into the gateup GEMM (with the ATTN path)
+    fuse_rope = fuse and hd == 128                       # ROPE fused into the qkv GEMM (its units are hd 128)
     assert not fuse or (F % TK == 0 and (2 * F // TN) % 8 == 0 and M % 32 == 0 and M <= 256)
+    # the q/k/v bias is added by the fused ROPE units (ATTN path); Gemma-2's post-norms need the unfused PRENORM
+    assert not bias or fuse_rope, "q/k/v biases need the fused ROPE (ATTN path, hd 128, --ctx >= 768)"
+    assert not (gemma and fuse), "Gemma-2 post-norms: unfused PRENORM only"
+    assert not a.debug_l0 or not (bias or gemma), "--debug-l0 covers the Llama path only"
 
     cos, sin = rope_tables(M, P0, hd, cfg["theta"])
     if cfg["kind"] == "real":
@@ -528,27 +635,35 @@ def main():
     KSv = SK // TK
 
     # ---------------- blob: weights, caches, inputs ----------------
-    def put_weight(q, region):
+    def put_weight(q):
         (bt, bs), _ = q
-        return mem.add(region, bt), mem.add(region, bs)
+        return mem.add_any(bt), mem.add_any(bs)
 
     lw = []              # per layer: dict of device addresses
     qw = {}              # quantized weights, for the emulation
     # one shared layer and one shared KV cache for the synthetic model (device-filled, see the arena)
     sizes = dict(wqkv=(D * NQKV, NQKV * D // 32), wo=(Dq * D, D * Dq // 32),
                  wgu=(D * 2 * F, 2 * F * D // 32), wd=(F * D, D * F // 32))
+    # LM head in column chunks of <= 192 MiB of codes (one allocation fits a region): (first, end) vocab columns
+    nlm = -(-D * V // (192 << 20))
+    vc_ = -(-V // nlm // TN) * TN
+    lm_chunks = [(c0, min(c0 + vc_, V)) for c0 in range(0, V, vc_)]
     prog_addr = mem.add(3, np.zeros(PW * 1024, np.uint32))   # patched once the arena is laid out
     if not synthetic:
         for l, w in enumerate(mdl["layers"]):
-            region = 1 if l < (L + 1) // 2 else 2
             q = {k: quant_weight(w[k][gu_interleave(F)] if k == "wgu" and fuse else w[k])
                  for k in ("wqkv", "wo", "wgu", "wd")}
             qw[l] = {k: v[1] for k, v in q.items()}
             d = {}
             for k in ("wqkv", "wo", "wgu", "wd"):
-                d[k], d[k + "_sc"] = put_weight(q[k], region)
+                d[k], d[k + "_sc"] = put_weight(q[k])
             d["g_in"] = mem.add(3, bf16_bits(w["g_in"]))
             d["g_post"] = mem.add(3, bf16_bits(w["g_post"]))
+            for k in ("g_pa", "g_pf"):
+                if k in w:
+                    d[k] = mem.add(3, bf16_bits(w[k]))
+            if "bqkv" in w:
+                d["bqkv"] = mem.add(3, bf16_bits(w["bqkv"]))
             # KV cache: K^T [hd][SK] as B (KS=1, TK=hd), V [SK][hd] as B (TK=256), cached keys 0..P0-1
             kc = np.zeros((Hkv, SK, hd), np.float32)
             vc = np.zeros((Hkv, SK, hd), np.float32)
@@ -564,21 +679,27 @@ def main():
             else:
                 kb, kbs = zip(*[pack_b(kcodes[g].T, ksc[g].T, hd) for g in range(Hkv)])
                 vb, vbs = zip(*[pack_b(vcodes[g].T, vsc[g].T, TK) for g in range(Hkv)])
-            d["kc"] = mem.add(3, np.stack(kb))
-            d["kc_sc"] = mem.add(3, np.stack(kbs))
-            d["vc"] = mem.add(3, np.stack(vb))
-            d["vc_sc"] = mem.add(3, np.stack(vbs))
+            d["kc"] = mem.add_any(np.stack(kb))
+            d["kc_sc"] = mem.add_any(np.stack(kbs))
+            d["vc"] = mem.add_any(np.stack(vb))
+            d["vc_sc"] = mem.add_any(np.stack(vbs))
             if l == 0:
                 kv0 = dict(kcodes=kcodes, ksc=ksc, vcodes=vcodes, vsc=vsc)
             lw.append(d)
-        ql = quant_weight(mdl["wlm"])
-        qw["wlm"] = ql[1]
-        wlm, wlm_sc = put_weight(ql, 3)
+        lcodes, lsc = mx_quant(np.asarray(mdl["wlm"], np.float32))     # groups along D per vocab row
+        qw["wlm"] = (lcodes, lsc)
+        wlm = []
+        for c0, c1 in lm_chunks:
+            bt, bs = pack_b(np.ascontiguousarray(lcodes[c0:c1].T), np.ascontiguousarray(lsc[c0:c1].T), TK)
+            wlm.append((mem.add_any(bt), mem.add_any(bs)))
+        del lcodes, lsc
         g_final = mem.add(3, bf16_bits(mdl["g_final"]))
         x0 = mem.add(3, bf16_bits(mdl["x0"]))
     if synthetic:
-        x0 = mem.add(3, bf16_bits(rng.normal(0, 1, (M, D))))
-        gam = mem.add(3, bf16_bits(rng.uniform(0.5, 1.5, (2 * L + 1, D))))
+        xs = rng.normal(0, 1, (M, D)) * (bf_scalar(np.sqrt(D)) if gemma else 1.0)
+        x0 = mem.add(3, bf16_bits(xs))
+        ngam = 4 * L + 1 if gemma else 2 * L + 1                       # Gemma-2: + post-attn / post-ffn per layer
+        gam = mem.add(3, bf16_bits(rng.uniform(0.5, 1.5, (ngam, D))))
     zeros = mem.add(3, np.zeros(M * D, np.uint16))          # layer 0's norm adds zero
     cos_a = mem.add(3, cos)
     sin_a = mem.add(3, sin)
@@ -616,18 +737,22 @@ def main():
             sw[k], sw[k + "_sc"] = al(nb), al(ns)
         kvb = Hkv * SK * hd
         sw["kc"], sw["kc_sc"], sw["vc"], sw["vc_sc"] = al(kvb), al(kvb // 32), al(kvb), al(kvb // 32)
-        wlm, wlm_sc = al(D * V), al(V * D // 32)
+        wlm = [(al(D * (c1 - c0)), al((c1 - c0) * D // 32)) for c0, c1 in lm_chunks]
         lw = []
+        npl = 4 if gemma else 2                                          # gammas per layer in `gam`
         for l in range(L):
             d = dict(sw)
-            d["g_in"], d["g_post"] = gam + (2 * l) * D * 2, gam + (2 * l + 1) * D * 2
+            d["g_in"], d["g_post"] = gam + (npl * l) * D * 2, gam + (npl * l + 1) * D * 2
+            if gemma:
+                d["g_pa"], d["g_pf"] = gam + (npl * l + 2) * D * 2, gam + (npl * l + 3) * D * 2
             lw.append(d)
-        g_final = gam + 2 * L * D * 2
+        g_final = gam + npl * L * D * 2
         fills = [(sw[k], sizes[k][0], 0, 0x9E3779B9 + i) for i, k in enumerate(sizes)]
         fills += [(sw[k + "_sc"], sizes[k][1], 1, 0x7A7A7A7A) for k in sizes]          # weights ~ +-2 * 2^-5
         fills += [(sw["kc"], kvb, 0, 0x1234567), (sw["vc"], kvb, 0, 0x7654321),
-                  (sw["kc_sc"], kvb // 32, 1, 0x7F7F7F7F), (sw["vc_sc"], kvb // 32, 1, 0x7F7F7F7F),
-                  (wlm, D * V, 0, 0xABCDEF1), (wlm_sc, V * D // 32, 1, 0x7A7A7A7A)]
+                  (sw["kc_sc"], kvb // 32, 1, 0x7F7F7F7F), (sw["vc_sc"], kvb // 32, 1, 0x7F7F7F7F)]
+        for i, ((c0, c1), (wb, ws)) in enumerate(zip(lm_chunks, wlm)):
+            fills += [(wb, D * (c1 - c0), 0, 0xABCDEF1 + i), (ws, (c1 - c0) * D // 32, 1, 0x7A7A7A7A)]
         for base, nb, mode, val in fills:
             assert nb % 4 == 0
             prog.add(T_FILL, 255, "init", base, nb, mode, val)
@@ -653,6 +778,10 @@ def main():
 
     # ---------------- phases ----------------
     eps = f32_bits(cfg["eps"])
+    ascale = 1.0 / np.sqrt(cfg.get("qpre", hd))          # attention logit scale (Gemma-2: query_pre_attn_scalar)
+    cap_args = (f32_bits(ascale / acap), f32_bits(acap)) if acap else (0, 0)
+    act_kind = 1 if gemma else 0                          # SILU phases: 0 silu(G) * U, 1 tanh GELU(G) * U (GeGLU)
+    pf = lambda l: lw[l].get("g_pf", 0) if gemma else 0   # PRENORM d[14]: post-norm gain of the added branch
     xn_all, qmx_all, pmx_all, omx_all, hmx_all = xn, qmx, pmx, omx, hmx
     for l in range(L):
         w, ac = lw[l], act[l]
@@ -664,31 +793,31 @@ def main():
             xn, qmx, pmx, omx, hmx = xn_all, qmx_all, pmx_all, omx_all, hmx_all
             xn2 = xn
         if l == 0:
-            prog.add(T_PRENORM, l, "norm1", x0, zeros, hbuf[0], w["g_in"], xn[0], xn[1], D, M, TM, TK, eps)
+            prog.add(T_PRENORM, l, "norm1", x0, zeros, hbuf[0], w["g_in"], xn[0], xn[1], D, M, TM, TK, eps, 0, 0)
         else:
             pa = act[l - 1]
             prog.add(T_PRENORM, l, "norm1", pa["hmid"], pa["ymlp"], hbuf[l], w["g_in"], xn[0], xn[1],
-                     D, M, TM, TK, eps, int(fuse))
+                     D, M, TM, TK, eps, int(fuse), pf(l - 1))
         rope_args = (ac["qkv"], NQKV, Hq, Hkv, hd, cos_a, sin_a, qmx[0], qmx[1], Gq * M * hd, Gq * M * hd // 32,
                      w["kc"], w["kc_sc"], SK * hd, SK * hd // 32, w["vc"], w["vc_sc"], SK * hd, SK * hd // 32,
-                     P0, M, SK, FA_QT if fa else TM, int(fa), 0)
+                     P0, M, SK, FA_QT if fa else TM, int(fa), 0, w.get("bqkv", 0))   # d[27]: q/k/v bias (bf16)
         # fused: ROPE runs on warps 1.. under the qkv GEMM; its descriptor rides in the no-op phase right after it
         rope_desc = prog_addr + (len(prog.ph) + 1) * PW * 4
         prog.gemm(l, "qkv", xn[0], xn[1], 0, 0, w["wqkv"], w["wqkv_sc"], 0, 0, ac["qkv"], 0, NQKV * 2,
-                  TM * NQKV * 2, 1, 1, NQKV // TN, D // TK, TM, TK, fuse=(2, rope_desc) if fuse else ())
-        prog.add(T_NONE if fuse else T_ROPE, l, "rope", *rope_args)
+                  TM * NQKV * 2, 1, 1, NQKV // TN, D // TK, TM, TK, fuse=(2, rope_desc) if fuse_rope else ())
+        prog.add(T_NONE if fuse_rope else T_ROPE, l, "rope", *rope_args)
         if fa:
             # O goes straight into oproj's MX A operand (no oquant phase)
             prog.add(T_FA, l, "attn", qmx[0], qmx[1], w["kc"], w["kc_sc"], w["vc"], w["vc_sc"], omx[0], Hq, Gq, M,
                      SK, P0, 0, f32_bits(1.0 / np.sqrt(hd)), SK * hd, SK * hd // 32, SK * hd, SK * hd // 32,
-                     omx[1], TM, TK, Dq // TK)
+                     omx[1], TM, TK, Dq // TK, hd)                 # d[24]: head dim (fa_phase.h Fa<D>)
         else:
             s = s_ring[l & 1]
             prog.gemm(l, "qk", qmx[0], qmx[1], Gq * M * hd, Gq * M * hd // 32, w["kc"], w["kc_sc"],
                       SK * hd, SK * hd // 32, s, Gq * M * SK * 2, SK * 2, TM * SK * 2,
                       Hkv, Gq * M // TM, SK // TN, 1, TM, hd)
             prog.add(T_SOFTMAX, l, "softmax", s, Gq * M * SK * 2, SK, Gq * M, Hkv, pmx[0], pmx[1],
-                     Gq * M * SK, Gq * M * SK // 32, f32_bits(1.0 / np.sqrt(hd)), P0, M, TM, TK)
+                     Gq * M * SK, Gq * M * SK // 32, f32_bits(ascale), P0, M, TM, TK, *cap_args)
             prog.gemm(l, "pv", pmx[0], pmx[1], Gq * M * SK, Gq * M * SK // 32, w["vc"], w["vc_sc"],
                       SK * hd, SK * hd // 32, ac["o"], Gq * hd * 2, Dq * 2, hd * 2,
                       Hkv, Gq * M // TM, hd // TN, KSv, TM, TK)
@@ -697,12 +826,12 @@ def main():
         prog.gemm(l, "oproj", omx[0], omx[1], 0, 0, w["wo"], w["wo_sc"], 0, 0, ac["yattn"], 0, D * 2,
                   TM * D * 2, 1, 1, D // TN, Dq // TK, TM, TK, fuse=(3, hbuf[l], ac["hmid"]) if fuse else ())
         prog.add(T_PRENORM, l, "norm2", hbuf[l], ac["yattn"], ac["hmid"], w["g_post"], xn2[0], xn2[1],
-                 D, M, TM, TK, eps, int(fuse))
+                 D, M, TM, TK, eps, int(fuse), w.get("g_pa", 0) if gemma else 0)
         prog.gemm(l, "gateup", xn2[0], xn2[1], 0, 0, w["wgu"], w["wgu_sc"], 0, 0, ac["gu"], 0, 2 * F * 2,
                   TM * 2 * F * 2, 1, 1, 2 * F // TN, D // TK, TM, TK,
-                  fuse=(1, hmx[0], hmx[1], F, M, TM, TK) if fuse else ())
+                  fuse=(1, hmx[0], hmx[1], F, M, TM, TK, act_kind) if fuse else ())
         if not fuse:
-            prog.add(T_SILU, l, "silu", ac["gu"], 2 * F, 1, F, M, hmx[0], hmx[1], TM, TK)
+            prog.add(T_SILU, l, "silu", ac["gu"], 2 * F, 1, F, M, hmx[0], hmx[1], TM, TK, act_kind)
         # fused: the next norm1 (or final)'s h = h_mid + y_mlp and row sums under the down GEMM
         prog.gemm(l, "down", hmx[0], hmx[1], 0, 0, w["wd"], w["wd_sc"], 0, 0, ac["ymlp"], 0, D * 2,
                   TM * D * 2, 1, 1, D // TN, F // TK, TM, TK, fuse=(3, ac["hmid"], hbuf[l + 1]) if fuse else ())
@@ -710,9 +839,12 @@ def main():
         xn, qmx, pmx, omx, hmx = xn_all, qmx_all, pmx_all, omx_all, hmx_all
     pa = act[L - 1]
     prog.add(T_PRENORM, 255, "final", pa["hmid"], pa["ymlp"], hbuf[L], g_final, xf[0], xf[1],
-             D, M, TM, TK, eps, int(fuse))
-    prog.gemm(255, "lmhead", xf[0], xf[1], 0, 0, wlm, wlm_sc, 0, 0, logits, 0, V * 2, TM * V * 2,
-              1, 1, V // TN, D // TK, TM, TK)
+             D, M, TM, TK, eps, int(fuse), pf(L - 1))
+    for (c0, c1), (wb, ws) in zip(lm_chunks, wlm):       # column chunks of the logits (row stride V)
+        prog.gemm(255, "lmhead", xf[0], xf[1], 0, 0, wb, ws, 0, 0, logits + c0 * 2, 0, V * 2, TM * V * 2,
+                  1, 1, (c1 - c0) // TN, D // TK, TM, TK)
+    if fcap:   # final logit soft-capping in place: ACT kind 1, d[6] cap, d[7] 1 / cap
+        prog.add(T_ACT, 255, "softcap", logits, logits, M * V // 2, 1, f32_bits(fcap), f32_bits(1.0 / fcap))
     NP = len(prog.ph)
     assert NP <= 1024
 
@@ -753,13 +885,18 @@ def main():
                               ("yattn", l0["yattn"], M * D), ("hmid", l0["hmid"], M * D),
                               ("gu", l0["gu"], M * 2 * F), ("ymlp", l0["ymlp"], M * D)):
                 checks.append((f"L0 {k} vs emulation", dev, gold[f"emu_l0_{k}"], n, 12))
+        # random models: bit-exact with the emulation.  Real weights: the device's fexp / reduction order differ from the
+        # emulation's, so the hidden states only gate gross failures (Frobenius error in 0.01 % units); the host also
+        # requires >= 90 % top-1 agreement with the HF model.
+        real = mdl["hidden"] is not None
+        htol, ltol = (3000, 2000) if real else (0, 0)
         for l in range(1, L + 1):
-            checks.append((f"h{l} vs emulation", hbuf[l], gold[f"emu_h{l}"], M * D, 8))
+            checks.append((f"h{l} vs emulation", hbuf[l], gold[f"emu_h{l}"], M * D, 8, 0, htol))
             if f"hf_h{l}" in gold:
-                checks.append((f"h{l} vs HF fp32", hbuf[l], gold[f"hf_h{l}"], M * D, 8))
-        checks.append(("logits vs emulation", logits, gold["emu_logits"], M * V, 10))
+                checks.append((f"h{l} vs HF fp32", hbuf[l], gold[f"hf_h{l}"], M * D, 8, 0, htol))
+        checks.append(("logits vs emulation", logits, gold["emu_logits"], M * V, 10, 0, ltol))
     if "hf_logits" in gold and L == cfg["L"]:
-        checks.append(("logits vs HF fp32", logits, gold["hf_logits"], M * V, 10))
+        checks.append(("logits vs HF fp32", logits, gold["hf_logits"], M * V, 10, 0, 2000))
 
     # patch the program into its reserved blob slot
     pa_ = prog.array().tobytes()

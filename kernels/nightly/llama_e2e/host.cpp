@@ -16,7 +16,8 @@ static inline uint32_t desc(uint32_t p, uint32_t w) { return rd32(LL_PROG_ADDR +
 static inline uint32_t stamp(uint32_t p, uint32_t c, uint32_t e) { return rd32(LL_PERF_ADDR + ((p * NC + c) * 16 + e) * 4); }
 
 static uint64_t gemm_macs(uint32_t p) {
-  if (desc(p, 0) == LL_T_FA) return 2ull * desc(p, 9) * desc(p, 11) * desc(p, 12) * 128;   // QK + PV: H SQ SK d
+  if (desc(p, 0) == LL_T_FA)   // QK + PV: H SQ SK d (useful MACs; the max pre-pass's QK is not counted)
+    return 2ull * desc(p, 9) * desc(p, 11) * desc(p, 12) * (desc(p, 24) ? desc(p, 24) : 128);
   if (desc(p, 0) != LL_T_GEMM) return 0;
   // batch * MT * NT * KS * TM * TN * TK
   return (uint64_t)desc(p, 14) * desc(p, 15) * desc(p, 16) * desc(p, 17) * desc(p, 18) * LL_TN * desc(p, 19);
@@ -57,6 +58,11 @@ int main() {
   if (NC > 1) {
     for (uint32_t p = 0; p < LL_NP; p++) {
       for (uint32_t cl = 0; cl < NC; cl++) nightly_pb_write(cl, PB_GO, p + 1);
+#if defined(LL_PROGRESS) && LL_PROGRESS
+      // progress print (-DLL_PROGRESS=1), after releasing phase p.  Off by default: one HTIF round trip on FireSim is
+      // longer than most phases, so the clusters finish and wait for the host (TinyLlama 4 SMs: 344 M idle cycles).
+      if (p > 0 && (p & 15) == 0) { nh_puts("phase "); nh_putu(p); nh_puts("/"); nh_putu(LL_NP); nh_puts("\n"); nh_flush(); }
+#endif
       for (uint32_t cl = 0; cl < NC; cl++) {
         uint64_t polls = 0;
         while (nightly_pb_read(cl, PB_DONE) < p + 1) {
@@ -66,7 +72,6 @@ int main() {
           }
         }
       }
-      if ((p & 15) == 15) { nh_puts("phase "); nh_putu(p + 1); nh_puts("/"); nh_putu(LL_NP); nh_puts("\n"); nh_flush(); }
     }
   }
   if (!nightly_host_wait(NC, 2000000000ull)) { nh_puts("timeout waiting for the kernel end\n"); nh_flush(); exit(2); }
@@ -115,7 +120,8 @@ int main() {
   nh_puts("== model (first phase after init to the end of the LM head)\n");
   nh_puts("model_cycles="); nh_putu(total); nh_puts(" phase_cycles="); nh_putu(busy);
   nh_puts(" handshake_cycles="); nh_putu(total - busy); nh_puts("\n");
-  nh_puts("cycles_per_layer="); nh_putu((total - op_cyc[13] - op_cyc[14]) / LL_L);
+  // per layer: without final, lmhead and softcap (ops 13, 14, 20)
+  nh_puts("cycles_per_layer="); nh_putu((total - op_cyc[13] - op_cyc[14] - (LL_NOPS > 20 ? op_cyc[20] : 0)) / LL_L);
   nh_puts(" cycles_per_token="); nh_putu(total / LL_M); nh_puts("\n");
   nh_puts("gemm_macs="); nh_putu(macs); nh_puts(" mesh_util_model="); put_pct(nightly_util_bp(macs, 256ull * NC, total));
   nh_puts("\n"); nh_flush();
@@ -179,6 +185,8 @@ int main() {
     }
     nh_puts("\n");
     if (nonfin) pass = 0;
+    // real weights: the model's predictions must agree with the fp32 HF model (>= 90 % top-1)
+    if (LL_HF_LOGITS_ADDR && agree_hf * 10 < LL_M * 9) pass = 0;
   }
   nh_puts(pass ? "PASS\n" : "FAIL\n");
   nh_flush();

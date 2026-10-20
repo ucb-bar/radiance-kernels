@@ -19,6 +19,13 @@
 #define STACK_BASE_ADDR 0x7F000000
 #define STACK_LOG2_SIZE 13
 #define CSR_WMASK 0xCC3
+#define CSR_CLUSTER_ID 0xCD0
+// nightly/pb.h: printBuf slot NIGHTLY_PB_CLUSTER (7) holds NIGHTLY_CLUSTER_TAG | cluster index
+#define PB_CLUSTER_SLOT_ADDR (0x80000 + 7 * 8)
+#define PB_CLUSTER_TAG 0xC1D00000
+// stack shift per cluster-index step past the CSR: 8 MiB, above one cluster's stacks (16 warps x
+// 16 lanes x 8 KiB = 2 MiB), so clusters 2 and 3 sit 16 MiB below clusters 0 and 1
+#define CLUSTER_STACK_LOG2_SHIFT 23
 
 // Stack layout.
 //
@@ -109,6 +116,27 @@ init_regs:
   
   # set stack pointer register
   li    sp, STACK_BASE_ADDR # load stack base address
+  # mhartid's cluster field is the 1-bit cluster-ID CSR (the RTL builds every core with
+  # numClusters = 2), so on 4 clusters clusters 2 and 3 get the stacks of clusters 0 and 1.
+  # With __mu_cluster_from_pb set (nightly/device.h), wait for the host's tagged cluster index in
+  # printBuf slot 7 (nightly_host_launch writes it before LAUNCH; the wait also covers configs that
+  # boot the GPU before the host runs) and move the stack down (index - CSR) * CLUSTER_STACK_SHIFT.
+  la    t1, __mu_cluster_from_pb
+  lw    t1, 0(t1)
+  beqz  t1, 2f
+1:
+  li    t1, PB_CLUSTER_SLOT_ADDR
+  lw.shared t2, 0(t1)
+  srli  t1, t2, 16
+  li    t0, (PB_CLUSTER_TAG >> 16)
+  bne   t1, t0, 1b
+  slli  t2, t2, 16
+  srli  t2, t2, 16            # cluster index
+  csrr  t0, CSR_CLUSTER_ID
+  sub   t2, t2, t0
+  slli  t2, t2, CLUSTER_STACK_LOG2_SHIFT
+  sub   sp, sp, t2
+2:
   csrr  t0, mhartid
 #if MU_STACK_WORD_STRIDE > 1
   # warp region = (1 << MU_LOG2_LANES) * STACK_SIZE, one per warp
@@ -165,5 +193,10 @@ __dso_handle:
 	.global __mu_num_warps
 	.weak __mu_num_warps
 __mu_num_warps:
+	.long	0
+
+	.global __mu_cluster_from_pb
+	.weak __mu_cluster_from_pb
+__mu_cluster_from_pb:
 	.long	0
 

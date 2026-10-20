@@ -33,6 +33,8 @@
 #define NIGHTLY_OCC 8
 #endif
 extern "C" uint32_t __mu_num_warps = NIGHTLY_OCC;
+/* mu_start.S: take the cluster index for the warp stacks from printBuf (see mu_cluster_id) */
+extern "C" uint32_t __mu_cluster_from_pb = 1;
 
 /* Barrier ids: mu_schedule uses 0.  nightly_kernel_end uses 15.  Kernels use 1..14. */
 #define NIGHTLY_BAR_END 15u
@@ -40,12 +42,6 @@ extern "C" uint32_t __mu_num_warps = NIGHTLY_OCC;
 static inline uint32_t nightly_mcycle(void) {
   uint32_t c;
   asm volatile("csrr %0, mcycle" : "=r"(c) :: "memory");
-  return c;
-}
-
-static inline uint32_t nightly_cluster_id(void) {
-  uint32_t c;
-  asm volatile("csrr %0, %1" : "=r"(c) : "i"(MU_CSR_CLUSTER_ID));
   return c;
 }
 
@@ -61,6 +57,22 @@ static inline uint32_t nightly_pb_get(uint32_t slot) {
   asm volatile("lw.shared %0, 0(%1)" : "=r"(v) : "r"(a) : "memory");
   return v;
 }
+
+/* Cluster index.  The cluster-ID CSR is only 1 bit wide in the RTL (radiance subsystem/Configs.scala
+ * builds every core with numClusters = 2), so clusters 2 and 3 read 0 and 1 and redo clusters 0 and
+ * 1's work.  nightly_host_launch writes each cluster's index to its own printBuf slot
+ * NIGHTLY_PB_CLUSTER before LAUNCH; without the tag (another host) fall back to the CSR.
+ * This strong definition overrides mu_schedule.cpp's weak one, so threadblock_id is right too
+ * (every nightly kernel is one device translation unit, so the definition is emitted once). */
+extern "C" __attribute__((noinline)) uint32_t mu_cluster_id(void) {
+  const uint32_t v = nightly_pb_get(NIGHTLY_PB_CLUSTER);
+  if ((v & 0xFFFF0000u) == NIGHTLY_CLUSTER_TAG) return v & 0xFFFFu;
+  uint32_t c;
+  asm volatile("csrr %0, %1" : "=r"(c) : "i"(MU_CSR_CLUSTER_ID));
+  return c;
+}
+
+static inline uint32_t nightly_cluster_id(void) { return mu_cluster_id(); }
 
 /* Called by the boot warp (one thread) of every core, before mu_schedule(). */
 static inline void nightly_wait_launch(void) {
