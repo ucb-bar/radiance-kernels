@@ -50,7 +50,10 @@ static inline uint32_t bf16(float f) {                   // round to nearest eve
 }
 static inline float bfr(float f) { return f_bits(bf16(f) << 16); }
 static inline float fabs_(float f) { return f_bits(bits_f(f) & 0x7FFFFFFFu); }
-static inline float fexp_bf(float x) {                    // Muon fexp.h on bf16(x), result widened to fp32
+// Muon fexp.h on bf16(x), result widened to fp32.  x is clamped at -64: fpEX converts x / ln 2 to Q10.24 with no
+// underflow check, so x below ~-355 wraps and returns garbage (e^-64 ~ 1.6e-28 stands in for 0)
+static inline float fexp_bf(float x) {
+  x = __builtin_fmaxf(x, -64.0f);
   const _Float16 r = mu_fexp(__builtin_bit_cast(_Float16, (uint16_t)bf16(x)));
   return f_bits((uint32_t)__builtin_bit_cast(uint16_t, r) << 16);
 }
@@ -99,7 +102,11 @@ static inline volatile uint8_t *gw8(uint32_t a) { return (volatile uint8_t *)a; 
 
 // =================================== GEMM (thread 0 of the cluster) ===================================
 static uint32_t scale_sink[64] __attribute__((aligned(64)));   // dummy requantizer flush address
-static uint32_t acc_parity = 0;                                // accumulator half of the next tile
+// accumulator half of the next tile, per cluster (one 64 B line each): a single global was shared by every cluster's
+// GEMM thread, so when the clusters' tile counts differed in parity (an LM-head chunk split 593 / 594) a cluster read
+// another's flips and stored some tiles from the wrong half (DeepSeek's logits at 2 / 4 SMs)
+static uint32_t acc_parity_cl[NC * 16] __attribute__((aligned(64)));
+static inline uint32_t &acc_par(uint32_t tb) { return acc_parity_cl[tb * 16]; }
 
 struct GemmDesc {
   uint32_t a, asc, a_bs, asc_bs, b, bsc, b_bs, bsc_bs, c, c_bs, c_rs, c_ms, batch, MT, NT, KS, TM, TK;
@@ -148,6 +155,7 @@ __attribute__((noinline)) static void gemm(const volatile uint32_t *d, uint32_t 
   q.a = d[2]; q.asc = d[3]; q.a_bs = d[4]; q.asc_bs = d[5]; q.b = d[6]; q.bsc = d[7]; q.b_bs = d[8];
   q.bsc_bs = d[9]; q.c = d[10]; q.c_bs = d[11]; q.c_rs = d[12]; q.c_ms = d[13]; q.batch = d[14];
   q.MT = d[15]; q.NT = d[16]; q.KS = d[17]; q.TM = d[18]; q.TK = d[19];
+  uint32_t &acc_parity = acc_par(tb);
   const uint32_t total = q.batch * q.MT * q.NT;
   const bool fused = d[20] != 0 && (d[20] != FUSE_NORM || NC == 1);   // fused: tile pairs stay on one cluster
   const uint32_t t0 = fused ? 2 * (total / 2 * tb / NC) : total * tb / NC;
@@ -350,8 +358,7 @@ static void prenorm(const volatile uint32_t *d, uint32_t tid, uint32_t tpb, uint
 // warp's code buffer and stores its scale byte directly; the warp then stores the buffer with coalesced stores.
 // SMEM indices are rotated by lane so the 16 lanes hit different banks.
 constexpr uint32_t CB_GROUPS = SB_BYTES / 32;             // groups per code-buffer flush
-static inline float silu_mul(float g, float u) { return g / (1.0f + fexp_bf(-g)) * u; }
-// fp32 transcendentals (gen_data.py exp2_poly / tanh_dev / gelu_dev reproduce them in this operation order)
+// fp32 transcendentals (gen_data.py exp2_poly / tanh_dev / gelu_dev / silu_dev reproduce them in this operation order)
 static inline float exp2_poly(float t) {                  // 2^t, degree-5 minimax on the fraction
   t = __builtin_fminf(__builtin_fmaxf(t, -126.0f), 126.0f);
   int32_t n;
@@ -370,6 +377,9 @@ static inline float gelu_f(float x) {                     // tanh GELU: x / (1 +
   return x / (1.0f + exp2_poly(-2.0f * 1.4426950409f * z));
 }
 static inline float tanh_f(float y) { return 1.0f - 2.0f / (1.0f + exp2_poly(2.0f * 1.4426950409f * y)); }
+// silu(g) u = g / (1 + e^-g) u.  exp through exp2_poly, not Muon's bf16 fexp: fexp is accurate on the softmax's
+// arguments (<= 0) but not on e^-g for g < 0 (TinyLlama --debug-l0: 31 % of the H codes one step off, 2.9 % down error)
+static inline float silu_mul(float g, float u) { return g / (1.0f + exp2_poly(-1.4426950409f * g)) * u; }
 // gated MLP activation: GELU = false silu(G) * U (Llama, Qwen2), true tanh GELU(G) * U (Gemma-2 GeGLU)
 template <bool GELU>
 static inline float act_mul(float g, float u) { return GELU ? gelu_f(g) * u : silu_mul(g, u); }
@@ -959,10 +969,20 @@ static __attribute__((noinline)) void rope_k_unit(const volatile uint32_t *rd, u
   ROPE_FIELDS(rd);
   volatile __shared uint32_t *xs = sm32(base), *cs = sm32(base + 512), *sn = sm32(base + 1024), *R = sm32(base + 1536);
   const uint32_t Dq = Hq * hd, bias = rd[27];
+  // BIAS models also center their keys (gen_data.py key_center): the head's fp32 center, staged past the row tile
+  volatile __shared uint32_t *cen = sm32(base + 3584);
+  static_assert(3584 + 128 * 4 <= FUSE_STAGE_BYTES, "rope K SMEM");
   uint32_t bv[BIAS ? 8 : 1];
   if (BIAS) {                                            // the head's bias words, the same for every key
+    uint32_t cv[8];
 #pragma unroll
-    for (uint32_t i = 0; i < 8; i++) bv[i] = g32(bias + (Dq + h * hd) * 2)[(lane + 16 * i) % 64];
+    for (uint32_t i = 0; i < 8; i++) {
+      bv[i] = g32(bias + (Dq + h * hd) * 2)[(lane + 16 * i) % 64];
+      cv[i] = g32(rd[28] + h * hd * 4)[lane + 16 * i];
+    }
+#pragma unroll
+    for (uint32_t i = 0; i < 8; i++) cen[lane + 16 * i] = cv[i];
+    mu_fence_smem();
   }
   for (uint32_t s = 0; s < 8; s++) {                     // 2 keys per step
     const uint32_t tk = k0 + 2 * s;
@@ -983,7 +1003,12 @@ static __attribute__((noinline)) void rope_k_unit(const volatile uint32_t *rd, u
     mu_fence_smem();
     if (lane < 8) {
       const uint32_t kk = lane / 4, k = lane % 4, key = P0 + tk + kk;
-      quant_group([&](uint32_t jj) __attribute__((always_inline)) { return rope_pair(xs + 64 * kk, cs + 64 * kk, sn + 64 * kk, k, jj); },
+      quant_group([&](uint32_t jj) __attribute__((always_inline)) {
+                    const F2 r = rope_pair(xs + 64 * kk, cs + 64 * kk, sn + 64 * kk, k, jj);
+                    if (!BIAS) return r;
+                    const uint32_t e = 32 * k + 2 * jj;  // elements e, e + 1 of the head row
+                    return F2{r.a - f_bits(cen[e]), r.b - f_bits(cen[e + 1])};
+                  },
                   lane, R + (2 * s + kk) * 32 + 8 * k, ksc + h * ksc_bs + (key / 128) * (hd / 32) * 128 + k * 128 + key % 128);
     } else asm volatile("nop");
     mu_fence_smem();
@@ -1322,9 +1347,9 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
     else asm volatile("nop");
     if (opaque(ty == LL_T_SOFTMAX) & scap) softmax_phase<true>(dsc, own, nown, wi, nwo, lane, red, cw, stage, sb);
     else asm volatile("nop");
-    if (opaque(ty == LL_T_FA) & opaque(dsc[24] == 64)) fa::Fa<64>::phase(dsc, tid, tpb, tb, acc_parity);
+    if (opaque(ty == LL_T_FA) & opaque(dsc[24] == 64)) fa::Fa<64>::phase(dsc, tid, tpb, tb, acc_par(tb));
     else asm volatile("nop");
-    if (opaque(ty == LL_T_FA) & opaque(dsc[24] != 64)) fa::Fa<128>::phase(dsc, tid, tpb, tb, acc_parity);
+    if (opaque(ty == LL_T_FA) & opaque(dsc[24] != 64)) fa::Fa<128>::phase(dsc, tid, tpb, tb, acc_par(tb));
     else asm volatile("nop");
     if (opaque(ty == LL_T_FILL)) fill_phase(dsc, gw, ngw, lane);
     else asm volatile("nop");
@@ -1337,10 +1362,21 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
     bar(BAR_PH, warps);
     if (lead) {
       perf[(p * NC + tb) * 16 + 1] = nightly_mcycle();
+#if defined(LL_FA_PROF) && LL_FA_PROF
+      if (ty == LL_T_FA)
+        for (uint32_t k = 0; k < fa::PROF_N; k++) perf[(p * NC + tb) * 16 + 2 + k] = sm32(fa::PROF_SM)[k];
+#endif
       mu_fence();
       nightly_pb_put(PB_DONE, p + 1);
+#if defined(LL_FA_DUMP) && LL_FA_DUMP
+      if (tb == 0) nightly_heartbeat(0x100u | p);       // phase p finished (debug builds: where a hang sits)
+#endif
     } else asm volatile("nop");
   }
+#if defined(LL_FA_DUMP) && LL_FA_DUMP
+  if (lead && tb == 0) nightly_heartbeat(0xE0Du);       // every phase done, entering nightly_kernel_end
+  else asm volatile("nop");
+#endif
   nightly_kernel_end(tid, tpb);
 }
 

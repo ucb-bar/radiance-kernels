@@ -96,7 +96,7 @@ elif a.model == "silufuse":
     cg = mem.add(3, C)
     Cf = g.bf16_to_f32(C).reshape(M, F // 64, 2, 64)
     G_, U_ = Cf[:, :, 0].reshape(M, F), Cf[:, :, 1].reshape(M, F)
-    hh = (G_ / (np.float32(1) + g.bf(np.exp(g.bf(-G_))))).astype(np.float32) * U_
+    hh = (g.silu_dev(G_) * U_).astype(np.float32)
     hq, hs = g.pack_a(*g.mx_quant(hh), M, TKg)
     hqg, hsg = mem.add(3, hq), mem.add(3, hs)
     perf = mem.alloc(64 * 4 * 1024)
@@ -174,7 +174,7 @@ else:
     gold["xn"], gold["xn_sc"] = g.pack_a(*g.mx_quant(y), TM, TK)
     gold["oq"], gold["oq_sc"] = g.pack_a(*g.mx_quant(g.bf(o)), TM, TK)
     G_, U_ = g.bf(gu[:, :F]), g.bf(gu[:, F:])
-    hh = (G_ / (np.float32(1) + g.bf(np.exp(g.bf(-G_))))).astype(np.float32) * U_
+    hh = (g.silu_dev(G_) * U_).astype(np.float32)
     gold["hq"], gold["hq_sc"] = g.pack_a(*g.mx_quant(hh), TM, TK)
     qb = g.bf(qkv)
     Q = g.rope(qb[:, :Dq].reshape(M, Hq, hd), cos, sin)

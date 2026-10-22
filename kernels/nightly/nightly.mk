@@ -64,6 +64,14 @@ OCC ?= 8
 GPRS := $(if $(filter 1 2,$(OCC)),128,$(if $(filter 3 4,$(OCC)),64,32))
 MU_CFLAGS += -DNIGHTLY_OCC=$(OCC) -mllvm -riscv-max-allocatable-gprs=$(GPRS)
 
+# The Muon runtime, built here when missing or older than its sources (a fresh checkout has no lib/libmuonrt.a):
+# llvm-muon's llvm-ar (no riscv32 gcc-ar needed) and the freestanding libc / libstdc++ headers the nightly headers use.
+LIB_SRCS := $(wildcard $(LIB)/src/*) $(wildcard $(LIB)/include/*.h) $(wildcard $(LIB)/include/nightly/*.h)
+$(LIB)/libmuonrt.a: $(LIB_SRCS)
+	$(MAKE) -C $(LIB) libmuonrt.a LLVM_MUON=$(LLVM_MUON) AR=$(LLVM_MUON)/bin/llvm-ar \
+	  RISCV_TOOLCHAIN_PATH=$(RISCV_TOOLCHAIN_PATH) MU_STACK_WORD_STRIDE=$(MU_STACK_WORD_STRIDE) \
+	  MU_EXTRA_DEFS="$(if $(MU_LIBC_INCLUDE),-idirafter $(MU_LIBC_INCLUDE)) $(if $(MU_CXX_INCLUDE),-idirafter $(MU_CXX_INCLUDE) -idirafter $(MU_CXX_INCLUDE)/riscv64-unknown-elf)"
+
 MU_LINKER_SCRIPT ?= $(LIB)/linker/mu_link_nightly.ld
 MU_LDFLAGS := -nodefaultlibs -nostartfiles -Wl,-Bstatic,-T,$(MU_LINKER_SCRIPT),-z,norelro -fuse-ld=lld \
   $(LIB)/libmuonrt.a $(LIB)/tohost.S
@@ -98,13 +106,16 @@ STAMP_TEXT := $(DEFS) MU_ADDR_HASH=$(MU_ADDR_HASH)
 $(shell mkdir -p build; printf '%s\n' "$(STAMP_TEXT)" | cmp -s - $(DEFS_STAMP) || printf '%s\n' "$(STAMP_TEXT)" > $(DEFS_STAMP))
 
 MU_OBJCOPY := $(LLVM_MUON)/bin/llvm-objcopy
-# one object per blob: build/blobs/<name>.o holds <name>.bin in section .regionN
-blob_obj = build/blobs/$(basename $(notdir $(1))).o
+# one object per blob: $(BLOB_DIR)/<name>.o holds <name>.bin in section .regionN.  A project that builds several
+# data sets with the same blob names (llama_e2e: one per model) sets BLOB_DIR per data set, or a build whose data is
+# up to date links the objects of whichever data set was converted last.
+BLOB_DIR ?= build/blobs
+blob_obj = $(BLOB_DIR)/$(basename $(notdir $(1))).o
 blob_sec = $(patsubst .%,%,$(suffix $(basename $(notdir $(1)))))
 BLOB_OBJS := $(foreach b,$(BLOBS),$(call blob_obj,$(b)))
 define BLOB_RULE
 $(call blob_obj,$(1)): $(1)
-	mkdir -p build/blobs
+	mkdir -p $(BLOB_DIR)
 	$(MU_OBJCOPY) -I binary -O elf32-littleriscv \
 	  --rename-section .data=.$(call blob_sec,$(1)),alloc,load,contents,data $$< $$@
 endef
