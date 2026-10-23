@@ -602,7 +602,7 @@ def build(R, emu, ref, outdir, header):
             prog.add(T_ROPE, l, "vrope", qkv + i * 1024 * 2304 * 2, 2304, 12, 12, 64, vcos[0], vcos[1],
                      Q_v[0] + hb * 65536, Q_v[1] + hb * 2048, 65536, 2048, K_v[0] + hb * 65536, K_v[1] + hb * 2048,
                      65536, 2048, V_v[0] + hb * 65536, V_v[1] + hb * 2048, 65536, 2048, 0, 1024, 1024, 64, 1, 0,
-                     d["bqkv"], 0, 1, 0, 0)
+                     d["bqkv"], 1, 1, 0, 0)                     # d[28] = 1: no rotation (rope_qk_norot)
         # 9 ATTN phases of 4 heads (64 query tiles: the softmax lanes keep their row maxima on the stack, not in DRAM
         # as one 36-head phase did, whose output broke on FireSim); head hb writes O rows (hb / 12) 1024 + t, columns
         # (hb % 12) 64 + d (d[28], d[29]).  d[27] = 0: block-0 max.

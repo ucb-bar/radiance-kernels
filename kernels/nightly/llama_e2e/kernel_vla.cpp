@@ -575,19 +575,35 @@ static void ewq_rows(const volatile uint32_t *d, uint32_t tid, uint32_t tpb, uin
         }
       }
       mu_fence_smem();
-      for (uint32_t g = g0 + lane; g < g0 + ng; g += MU_NUM_THREADS)
+      for (uint32_t g = g0 + lane; g < g0 + ng; g += MU_NUM_THREADS) {
+        // the activation once per element (quant_group evaluates its pair twice: amax, then codes): the lane's 32
+        // results (fp32) in place, elements 2j in stage[w], 2j + 1 in stage[UOFF + w] (U's slots; unused by MODE 2)
+        if (MODE != 0) {
+#pragma unroll 4
+          for (uint32_t j = 0; j < 16; j++) {
+            const uint32_t w = 16 * (g - g0) + j, xv = stage[w];
+            float a, b;
+            if (MODE == 2) {
+              const uint32_t bv = bsm[16 * g + j];
+              const float xa = lo(xv) + lo(bv), xb = hi(xv) + hi(bv);
+              a = GELU ? gelu_f(xa) : silu_mul(xa, 1.0f);
+              b = GELU ? gelu_f(xb) : silu_mul(xb, 1.0f);
+            } else {
+              const uint32_t uv = stage[UOFF + w];
+              a = act_mul<GELU>(lo(xv), lo(uv));
+              b = act_mul<GELU>(hi(xv), hi(uv));
+            }
+            stage[w] = bits_f(a);
+            stage[UOFF + w] = bits_f(b);
+          }
+        }
         quant_group([&](uint32_t j) __attribute__((always_inline)) {
                       const uint32_t w = 16 * (g - g0) + j, xv = stage[w];
                       if (MODE == 0) return F2{lo(xv), hi(xv)};
-                      if (MODE == 2) {
-                        const uint32_t bv = bsm[16 * g + j];
-                        const float a = lo(xv) + lo(bv), b = hi(xv) + hi(bv);
-                        return GELU ? F2{gelu_f(a), gelu_f(b)} : F2{silu_mul(a, 1.0f), silu_mul(b, 1.0f)};
-                      }
-                      const uint32_t uv = stage[UOFF + w];
-                      return F2{act_mul<GELU>(lo(xv), lo(uv)), act_mul<GELU>(hi(xv), hi(uv))};
+                      return F2{f_bits(xv), f_bits(stage[UOFF + w])};
                     },
                     lane, cb + 8 * (g - g0), a_scale(ASC, TM, TK, KS, t, 32 * g));
+      }
       cb_flush(cb, lane, ng, g0, A, TM, TK, KS, t);     // its trailing fence also orders the stage reuse
     }
   }
@@ -636,10 +652,15 @@ static void silu_fused(const volatile uint32_t *d, uint32_t tb, uint32_t warp, u
     for (uint32_t i = 0; i < 16; i++) { gs[lane + 16 * i] = gv[i]; us[lane + 16 * i] = uv[i]; }
     mu_fence_smem();
     const uint32_t r = lane / 2, k = lane % 2;
-    quant_group([&](uint32_t jj) __attribute__((always_inline)) {
-                  const uint32_t x = gs[32 * r + 16 * k + jj], y = us[32 * r + 16 * k + jj];
-                  return F2{act_mul<GELU>(lo(x), lo(y)), act_mul<GELU>(hi(x), hi(y))};
-                },
+    // the activation once per element (quant_group evaluates its pair twice), fp32 over the lane's own G / U words
+    volatile __shared uint32_t *gl = gs + 32 * r + 16 * k, *ul = us + 32 * r + 16 * k;
+#pragma unroll 4
+    for (uint32_t jj = 0; jj < 16; jj++) {
+      const uint32_t x = gl[jj], y = ul[jj];
+      gl[jj] = bits_f(act_mul<GELU>(lo(x), lo(y)));
+      ul[jj] = bits_f(act_mul<GELU>(hi(x), hi(y)));
+    }
+    quant_group([&](uint32_t jj) __attribute__((always_inline)) { return F2{f_bits(gl[jj]), f_bits(ul[jj])}; },
                 lane, cb + 8 * lane, a_scale(ASC, TM, TK, KS, r0 + r, 64 * j + 32 * k));
     mu_fence_smem();
 #pragma unroll
@@ -785,6 +806,7 @@ static void rope_qk(const volatile uint32_t *d, uint32_t own, uint32_t nown, uin
     }
   }
 }
+#include "rope_fast.h"
 // V: warp per (KV head, 32 keys); lane per column dd = 16 i + lane, amax over the 32 keys is lane-local.  The 32 x 16
 // code bytes of a column chunk go through the warp's stage (one word per byte), then lanes store whole words.
 template <bool BIAS = false>
@@ -1533,9 +1555,16 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
 #endif
     // hd 64: d[27] bias (SigLIP), d[30] the K A operand (SmolVLA cross-attention sources)
     const uint32_t r64 = opaque(ty == LL_T_ROPE) & opaque(dsc[6] == 64), rb = opaque(dsc[27] != 0), rka = opaque(dsc[30] != 0);
-    if (r64 & (rb ^ 1u) & (rka ^ 1u)) rope_qk<2>(dsc, own, nown, wi, nwo, lane, red, cw);
+    // ROPE: rope_fast.h when the token range is 64-aligned (every model's prefill), else the old rope_qk
+    const uint32_t rfast = opaque(ty == LL_T_ROPE) & opaque(dsc[21] % 64 == 0) & opaque(dsc[22] % 64 == 0);
+    if (r64 & (rb ^ 1u) & (rka ^ 1u) & (rfast ^ 1u)) rope_qk<2>(dsc, own, nown, wi, nwo, lane, red, cw);
     else asm volatile("nop");
-    if (r64 & rb) rope_qk<2, true>(dsc, own, nown, wi, nwo, lane, red, cw);
+    if (r64 & (rb ^ 1u) & (rka ^ 1u) & rfast) rope_qk_fast<2, false, true>(dsc, gw, ngw, lane, stage);
+    else asm volatile("nop");
+    const uint32_t nrot = opaque(dsc[28] != 0);           // hd 64, no rotation (SigLIP): rope_qk_norot
+    if (r64 & rb & (nrot ^ 1u)) rope_qk<2, true>(dsc, own, nown, wi, nwo, lane, red, cw);
+    else asm volatile("nop");
+    if (r64 & rb & nrot) rope_qk_fast<2, true, false>(dsc, gw, ngw, lane, stage);   // SigLIP (64-aligned)
     else asm volatile("nop");
     if (r64 & (rb ^ 1u) & rka) rope_qk<2, false, true>(dsc, own, nown, wi, nwo, lane, red, cw);
     else asm volatile("nop");
