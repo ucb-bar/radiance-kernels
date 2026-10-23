@@ -1129,58 +1129,65 @@ static void rope_fused(const volatile uint32_t *d, uint32_t tb, uint32_t warp, u
 
 // ---- SOFTMAX: warp per row, causal, normalized, MX --------------------------------------------------
 static inline float masked(float v, uint32_t valid) { return f_bits(bits_f(v) & mask_if(valid)); }
-// unit = (head group, m-tile, k-step): the k-step's P codes and scale lines.  Each unit computes its rows' full max
-// and sum itself (KS-fold extra reads).  CAP (Gemma-2): logits soft-capped, cap tanh(S scale / cap), d[16] scale / cap,
+// unit = (head group, m-tile): its rows' P codes (every k-step) and scale lines, so each row's max and sum are computed
+// once.  A row (SK <= 1024) is staged once: S words, then the logit z (fp32, after the CAP soft-cap) with the max,
+// then e = exp(z - m) over z with the sum, then a lane per 32-group quantizes p = e / sum (quant_group).  The old
+// unit (head group, m-tile, k-step) recomputed every row's max and sum per k-step, with the soft-cap's tanh and the
+// exp re-evaluated in each pass (~9 tanh + 5 exp per score on Gemma-2 instead of 1 + 1).  Same operations and lane
+// order as before: bit-identical P.  CAP (Gemma-2): logits soft-capped, cap tanh(S scale / cap), d[16] scale / cap,
 // d[17] cap.
 template <bool CAP>
 static inline float sm_logit(float s, float scale, float k1, float cap) { return CAP ? cap * tanh_f(s * k1) : s * scale; }
 template <bool CAP>
 static void softmax_phase(const volatile uint32_t *d, uint32_t own, uint32_t nown, uint32_t wi, uint32_t nwo,
-                          uint32_t lane, volatile __shared float *red, volatile __shared uint32_t *cw,
-                          volatile __shared uint32_t *stage, volatile __shared uint32_t *sb) {
+                          uint32_t lane, volatile __shared float *red, volatile __shared uint32_t *stage) {
   const uint32_t s = d[2], s_bs = d[3], SK = d[4], R = d[5], batch = d[6];
   const uint32_t pa = d[7], pasc = d[8], pa_bs = d[9], pasc_bs = d[10];
   const float scale = f_bits(d[11]), k1 = f_bits(d[16]), cap = f_bits(d[17]);
-  const uint32_t P0 = d[12], M = d[13], TM = d[14], TK = d[15], KSp = SK / TK, W = SK / 2, GS = TK / 32;
+  const uint32_t P0 = d[12], M = d[13], TM = d[14], TK = d[15], KSp = SK / TK, W = SK / 2, NGT = SK / 32;
   const uint32_t MTb = R / TM;
   const float NEG = f_bits(0xFF800000u);
-  for (uint32_t u = own; u < batch * MTb * KSp; u += nown) {
-    const uint32_t bt = u / (MTb * KSp), mt = (u / KSp) % MTb, ks = u % KSp;
+  volatile __shared float *zf = (volatile __shared float *)(stage + W);   // [SK] fp32 after the S words
+  for (uint32_t u = own; u < batch * MTb; u += nown) {
+    const uint32_t bt = u / MTb, mt = u % MTb;
     const uint32_t A = pa + bt * pa_bs, ASC = pasc + bt * pasc_bs;
-    for (uint32_t rb = mt * TM + 4 * wi; rb < (mt + 1) * TM; rb += 4 * nwo) {
-      for (uint32_t rr = 0; rr < 4; rr++) {
-        const uint32_t r = rb + rr, qpos = P0 + r % M;
-        const uint32_t *S = g32(s + bt * s_bs + r * SK * 2);
-        float m = NEG;
-        for (uint32_t w0 = lane; w0 < W; w0 += 8 * MU_NUM_THREADS) {   // W is a multiple of 128
-          uint32_t sv[8];
+    for (uint32_t r = mt * TM + wi; r < (mt + 1) * TM; r += nwo) {
+      const uint32_t qpos = P0 + r % M;
+      const uint32_t *S = g32(s + bt * s_bs + r * SK * 2);
+      float m = NEG;
+      for (uint32_t w0 = lane; w0 < W; w0 += 8 * MU_NUM_THREADS) {   // W is a multiple of 128
+        uint32_t sv[8];
 #pragma unroll
-          for (uint32_t k = 0; k < 8; k++) sv[k] = S[w0 + k * MU_NUM_THREADS];
+        for (uint32_t k = 0; k < 8; k++) sv[k] = S[w0 + k * MU_NUM_THREADS];
 #pragma unroll
-          for (uint32_t k = 0; k < 8; k++) {
-            const uint32_t w = w0 + k * MU_NUM_THREADS;
-            stage[w] = sv[k];
-            m = __builtin_fmaxf(m, f_bits(sel((uint32_t)(2 * w <= qpos), bits_f(sm_logit<CAP>(lo(sv[k]), scale, k1, cap)), bits_f(NEG))));
-            m = __builtin_fmaxf(m, f_bits(sel((uint32_t)(2 * w + 1 <= qpos), bits_f(sm_logit<CAP>(hi(sv[k]), scale, k1, cap)), bits_f(NEG))));
-          }
-        }
-        m = warp_max(red, lane, m);
-        float sum = 0.f;
-        for (uint32_t w = lane; w < W; w += MU_NUM_THREADS) {
-          const uint32_t sv = stage[w];
-          sum += masked(fexp_bf(sm_logit<CAP>(lo(sv), scale, k1, cap) - m), (uint32_t)(2 * w <= qpos)) +
-                 masked(fexp_bf(sm_logit<CAP>(hi(sv), scale, k1, cap) - m), (uint32_t)(2 * w + 1 <= qpos));
-        }
-        sum = warp_sum(red, lane, sum);
-        const float inv = 1.0f / sum;
-        for (uint32_t gi = 0; gi < GS; gi++) {          // this k-step's groups: keys 32 g .., words 16 g + lane
-          const uint32_t g = ks * GS + gi, w = g * 16 + lane, sv = stage[w];
-          const float p0 = masked(fexp_bf(sm_logit<CAP>(lo(sv), scale, k1, cap) - m) * inv, (uint32_t)(2 * w <= qpos));
-          const float p1 = masked(fexp_bf(sm_logit<CAP>(hi(sv), scale, k1, cap) - m) * inv, (uint32_t)(2 * w + 1 <= qpos));
-          mx_group2(red, cw, lane, p0, p1, a_code(A, TM, TK, KSp, r, g * 32), sb + gi, rr);
+        for (uint32_t k = 0; k < 8; k++) {
+          const uint32_t w = w0 + k * MU_NUM_THREADS;
+          const float za = sm_logit<CAP>(lo(sv[k]), scale, k1, cap), zb = sm_logit<CAP>(hi(sv[k]), scale, k1, cap);
+          zf[2 * w] = za;
+          zf[2 * w + 1] = zb;
+          m = __builtin_fmaxf(m, f_bits(sel((uint32_t)(2 * w <= qpos), bits_f(za), bits_f(NEG))));
+          m = __builtin_fmaxf(m, f_bits(sel((uint32_t)(2 * w + 1 <= qpos), bits_f(zb), bits_f(NEG))));
         }
       }
-      sb_flush(sb, lane, GS, ks * GS, ASC, TM, TK, KSp, rb);
+      m = warp_max(red, lane, m);
+      float sum = 0.f;
+      for (uint32_t w = lane; w < W; w += MU_NUM_THREADS) {   // a lane rewrites only its own z words
+        const float ea = masked(fexp_bf(zf[2 * w] - m), (uint32_t)(2 * w <= qpos));
+        const float eb = masked(fexp_bf(zf[2 * w + 1] - m), (uint32_t)(2 * w + 1 <= qpos));
+        zf[2 * w] = ea;
+        zf[2 * w + 1] = eb;
+        sum += ea + eb;
+      }
+      sum = warp_sum(red, lane, sum);
+      const float inv = 1.0f / sum;
+      mu_fence_smem();                                   // e of every lane in the stage
+      for (uint32_t g = lane; g < NGT; g += MU_NUM_THREADS)
+        quant_group([&](uint32_t jj) __attribute__((always_inline)) {
+                      const uint32_t e = 32 * g + 2 * jj;
+                      return F2{zf[e] * inv, zf[e + 1] * inv};
+                    },
+                    lane, (uint32_t *)a_code(A, TM, TK, KSp, r, 32 * g), a_scale(ASC, TM, TK, KSp, r, 32 * g));
+      mu_fence_smem();                                   // the stage read before the next row rewrites it
     }
   }
 }
@@ -1367,9 +1374,9 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
     if (opaque(ty == LL_T_ROPE) & (opaque(dsc[25] == 0) | opaque(dsc[6] != 128))) rope_v(dsc, gw, ngw, lane, stage);
     else asm volatile("nop");
     const uint32_t scap = opaque(dsc[17] != 0);           // SOFTMAX d[17]: soft-cap (Gemma-2)
-    if (opaque(ty == LL_T_SOFTMAX) & (scap ^ 1u)) softmax_phase<false>(dsc, own, nown, wi, nwo, lane, red, cw, stage, sb);
+    if (opaque(ty == LL_T_SOFTMAX) & (scap ^ 1u)) softmax_phase<false>(dsc, own, nown, wi, nwo, lane, red, stage);
     else asm volatile("nop");
-    if (opaque(ty == LL_T_SOFTMAX) & scap) softmax_phase<true>(dsc, own, nown, wi, nwo, lane, red, cw, stage, sb);
+    if (opaque(ty == LL_T_SOFTMAX) & scap) softmax_phase<true>(dsc, own, nown, wi, nwo, lane, red, stage);
     else asm volatile("nop");
     if (opaque(ty == LL_T_FA) & opaque(dsc[24] == 64)) fa::Fa<64>::phase(dsc, tid, tpb, tb, acc_par(tb));
     else asm volatile("nop");

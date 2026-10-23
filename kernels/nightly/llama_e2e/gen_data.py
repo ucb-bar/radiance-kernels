@@ -917,6 +917,7 @@ def main():
             prog.gemm(l, "qk", qmx[0], qmx[1], Gq * M * hd, Gq * M * hd // 32, w["kc"], w["kc_sc"],
                       SK * hd, SK * hd // 32, s, Gq * M * SK * 2, SK * 2, TM * SK * 2,
                       Hkv, Gq * M // TM, SK // TN, 1, TM, hd)
+            assert SK <= 1024, "SOFTMAX stages a row's S words and fp32 logits in a warp's 8 KiB stage"
             prog.add(T_SOFTMAX, l, "softmax", s, Gq * M * SK * 2, SK, Gq * M, Hkv, pmx[0], pmx[1],
                      Gq * M * SK, Gq * M * SK // 32, f32_bits(ascale), P0, M, TM, TK, *cap_args)
             prog.gemm(l, "pv", pmx[0], pmx[1], Gq * M * SK, Gq * M * SK // 32, w["vc"], w["vc_sc"],
