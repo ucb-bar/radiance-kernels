@@ -19,6 +19,15 @@ constexpr uint32_t WORDS = LN_DIM / 2;                  // 32-bit words per row
 constexpr uint32_t PER_LANE = WORDS / MU_NUM_THREADS;   // words per lane per row
 static_assert(WORDS % (MU_NUM_THREADS * LN_UNROLL) == 0, "DIM must be a multiple of 32*UNROLL");
 constexpr uint32_t WARPS = MU_NUM_CORES * NIGHTLY_OCC;      // warps per cluster
+// Row skew: a row is 4 KiB, the size of the direct-mapped 4 KiB L0d, so the warps of a core working on
+// their rows at the same offset all hit one L0d set, and the L0d input adapter blocks a set while a nack
+// on it is pending.  Each warp of a core starts its row LN_UNROLL lines further on (8 warps x 8 lines cover
+// the 64 sets; mu_schedule numbers warps round-robin over cores, so warp / MU_NUM_CORES is the
+// warp within its core).  LN_SKEW=0 disables it.
+#ifndef LN_SKEW
+#define LN_SKEW 1
+#endif
+static_assert((PER_LANE & (PER_LANE - 1)) == 0, "the row skew wraps with a mask");
 // SMEM map: gamma words | beta words | per-warp row stages | per-warp 2 x 16-word reduce buffers
 constexpr uint32_t GAMMA_SM = 0;
 constexpr uint32_t BETA_SM = GAMMA_SM + WORDS * 4;
@@ -45,6 +54,7 @@ static inline float warp_sum(volatile __shared float *red, uint32_t lane, float 
 
 static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
   const uint32_t lane = tid % MU_NUM_THREADS, warp = tid / MU_NUM_THREADS;
+  const uint32_t skew = LN_SKEW ? (((warp / MU_NUM_CORES) % NIGHTLY_OCC) * LN_UNROLL) & (PER_LANE - 1) : 0;
   volatile __shared uint32_t *gamma_s = (volatile __shared uint32_t *)GAMMA_SM;
   volatile __shared uint32_t *beta_s = (volatile __shared uint32_t *)BETA_SM;
   volatile __shared uint32_t *stage = (volatile __shared uint32_t *)(STAGE_SM + warp * WORDS * 4);
@@ -63,7 +73,8 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
     uint32_t *Y = (uint32_t *)LN_Y_ADDR + r * WORDS;
     // pass 1: DRAM -> stage, sum(x)
     float acc0 = 0.f, acc1 = 0.f;
-    for (uint32_t k = 0; k < PER_LANE; k += LN_UNROLL) {
+    for (uint32_t kk = 0; kk < PER_LANE; kk += LN_UNROLL) {
+      const uint32_t k = (kk + skew) & (PER_LANE - 1);
       uint32_t w[LN_UNROLL];
 #pragma unroll
       for (int u = 0; u < LN_UNROLL; u++) w[u] = X[(k + u) * MU_NUM_THREADS + lane];
@@ -76,7 +87,8 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
     const float mean = warp_sum(red_mean, lane, acc0 + acc1) * (1.0f / LN_DIM);
     // pass 2: stage -> sum((x - mean)^2)
     float sq0 = 0.f, sq1 = 0.f;
-    for (uint32_t k = 0; k < PER_LANE; k += LN_UNROLL) {
+    for (uint32_t kk = 0; kk < PER_LANE; kk += LN_UNROLL) {
+      const uint32_t k = (kk + skew) & (PER_LANE - 1);
 #pragma unroll
       for (int u = 0; u < LN_UNROLL; u++) {
         const uint32_t w = stage[(k + u) * MU_NUM_THREADS + lane];
@@ -87,7 +99,8 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
     const float var = warp_sum(red_var, lane, sq0 + sq1) * (1.0f / LN_DIM);
     const float inv = 1.0f / __builtin_sqrtf(var + LN_EPS);
     // pass 3: stage, gamma, beta -> y
-    for (uint32_t k = 0; k < PER_LANE; k += LN_UNROLL) {
+    for (uint32_t kk = 0; kk < PER_LANE; kk += LN_UNROLL) {
+      const uint32_t k = (kk + skew) & (PER_LANE - 1);
 #pragma unroll
       for (int u = 0; u < LN_UNROLL; u++) {
         const uint32_t i = (k + u) * MU_NUM_THREADS + lane;

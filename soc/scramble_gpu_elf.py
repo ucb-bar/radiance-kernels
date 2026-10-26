@@ -4,11 +4,17 @@ memory system, so that a loader which writes DRAM directly (SimDRAM +loadmem, Fi
 every byte where the hashed hardware looks for it.
 
 usage: scramble_gpu_elf.py IN OUT [--base 0x0] [--size 0x80000000] [--unit 32] [--slices 4]
+                           [--channels-per-slice 1] [--chan-set-stride 0]
 
 The hash is the one in radiance's AddressHashParams (radiance/memory/AddressHash.scala) and must use
 the same parameters as the RTL. Inside [base, base + size) an offset splits into a unit index v and a
 byte within the unit; with s = log2(slices), o = v >> s and slice c = (v mod slices) XOR fold(o),
 where fold XORs the s-bit groups of o. The physical offset is c * size/slices + o * unit + byte.
+
+With --channels-per-slice k > 1 the `slices` parts are DRAM channels, k per L2 slice: part c is
+placed at (c mod S) * k + c div S (S = slices / k), so consecutive units still alternate L2
+slices and each slice's channels stay adjacent. --chan-set-stride t XORs o with j * t for channel
+j = c div S. RadianceHBMConfig (4 SMs): --slices 16 --channels-per-slice 2 --chan-set-stride 128.
 
 Run it on the rv32 kernel ELF before fusing (GPU-local addresses, base 0) or on any ELF whose
 GPU-memory addresses lie in [base, base + size). Only the program headers change: each PT_LOAD inside
@@ -36,6 +42,8 @@ class AddressHash:
     size: int
     unit: int
     slices: int
+    channels_per_slice: int = 1
+    chan_set_stride: int = 0
 
     def __post_init__(self) -> None:
         for name in ("size", "unit", "slices"):
@@ -46,6 +54,9 @@ class AddressHash:
             raise ValueError(f"base {self.base:#x} must be aligned to size {self.size:#x}")
         if self.slices < 2 or self.unit * self.slices > self.size:
             raise ValueError("need slices >= 2 and at least one unit per slice")
+        cps = self.channels_per_slice
+        if cps <= 0 or cps & (cps - 1) or cps > self.slices:
+            raise ValueError("channels_per_slice must be a power of two no larger than slices")
 
     @property
     def slice_bits(self) -> int:
@@ -58,6 +69,17 @@ class AddressHash:
     @property
     def range_bits(self) -> int:
         return self.size.bit_length() - 1
+
+    def _place(self, c: int) -> int:
+        l2 = self.slices // self.channels_per_slice
+        return (c % l2) * self.channels_per_slice + c // l2
+
+    def _unplace(self, p: int) -> int:
+        l2 = self.slices // self.channels_per_slice
+        return (p % self.channels_per_slice) * l2 + p // self.channels_per_slice
+
+    def _flip(self, c: int) -> int:
+        return (c // (self.slices // self.channels_per_slice)) * self.chan_set_stride
 
     def contains(self, addr: int) -> bool:
         return self.base <= addr < self.base + self.size
@@ -78,7 +100,7 @@ class AddressHash:
         v = off >> self.unit_bits
         o = v >> self.slice_bits
         c = (v & (self.slices - 1)) ^ self._fold(o)
-        return self.base + (c << (self.range_bits - self.slice_bits)) + (o << self.unit_bits) + byte
+        return self.base + (self._place(c) << (self.range_bits - self.slice_bits)) + ((o ^ self._flip(c)) << self.unit_bits) + byte
 
     def inverse(self, addr: int) -> int:
         """Physical address back to the client address."""
@@ -86,8 +108,8 @@ class AddressHash:
             return addr
         off = addr - self.base
         byte = off & (self.unit - 1)
-        c = off >> (self.range_bits - self.slice_bits)
-        o = (off >> self.unit_bits) & ((1 << (self.range_bits - self.unit_bits - self.slice_bits)) - 1)
+        c = self._unplace(off >> (self.range_bits - self.slice_bits))
+        o = ((off >> self.unit_bits) & ((1 << (self.range_bits - self.unit_bits - self.slice_bits)) - 1)) ^ self._flip(c)
         v = (o << self.slice_bits) | (c ^ self._fold(o))
         return self.base + (v << self.unit_bits) + byte
 
@@ -223,12 +245,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--size", type=lambda s: int(s, 0), default=0x80000000)
     parser.add_argument("--unit", type=lambda s: int(s, 0), default=32)
     parser.add_argument("--slices", type=lambda s: int(s, 0), default=4)
+    parser.add_argument("--channels-per-slice", type=lambda s: int(s, 0), default=1)
+    parser.add_argument("--chan-set-stride", type=lambda s: int(s, 0), default=0,
+                        help="XOR channel j's in-part line index with j * stride (L2 sets / channels per slice)")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    hash_ = AddressHash(args.base, args.size, args.unit, args.slices)
+    hash_ = AddressHash(args.base, args.size, args.unit, args.slices, args.channels_per_slice, args.chan_set_stride)
     hash_.self_check()
     with open(args.input, "rb") as f:
         image = f.read()

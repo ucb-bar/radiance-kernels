@@ -213,7 +213,12 @@ static inline NhVerify nightly_host_read_verify(uint32_t cl) {
 }
 /* clear the verify slots (call before launch) and wait for cluster `cl` to post them */
 static inline void nightly_host_clear_verify(uint32_t n_clusters) {
-  for (uint32_t cl = 0; cl < n_clusters; cl++) { nightly_pb_write(cl, NV_SLOT, 0); nightly_pb_write(cl, NV_GO, 0); }
+  for (uint32_t cl = 0; cl < n_clusters; cl++) {
+    nightly_pb_write(cl, NV_SLOT, 0); nightly_pb_write(cl, NV_GO, 0);
+#ifdef NIGHTLY_VERIFY_LOCATE
+    nightly_pb_write(cl, NV_LOC_POISON, 0xFFFFFFFFu); nightly_pb_write(cl, NV_LOC_BAD, 0xFFFFFFFFu);
+#endif
+  }
 }
 static inline int nightly_host_wait_verify(uint32_t cl, uint64_t max_polls = 50000000ull) {
   for (uint64_t i = 0; i < max_polls; i++)
@@ -226,6 +231,10 @@ static inline void nightly_host_print_verify(const char *name, uint32_t cl, cons
   nh_puts(" bad="); nh_putu(v.bad); nh_puts(" poison="); nh_putu(v.poison);
   nh_puts(" nonfinite="); nh_putu(v.nonfin); nh_puts(" frob_rel_err="); nh_putfix(v.err_bp, 2);
   nh_puts("%\n");
+#ifdef NIGHTLY_VERIFY_LOCATE
+  nh_puts("  locate (cluster "); nh_putu(cl); nh_puts("): poison element "); nh_putx(nightly_pb_read(cl, NV_LOC_POISON), 8);
+  nh_puts(" bad element "); nh_putx(nightly_pb_read(cl, NV_LOC_BAD), 8); nh_puts("\n");
+#endif
 }
 /* Standard end-of-run check: GPU verify of every cluster (all must agree), plus a host spot
  * check of `samples` elements.  Returns 1 when the output passes: no poison, no non-finite,
@@ -251,6 +260,20 @@ static inline int nightly_host_check(const char *name, uint32_t n_clusters, uint
   const uint32_t same = nightly_host_spot_check(out_dev, gold_dev, n, samples);
   nh_puts(name); nh_puts(" (host spot check): exact "); nh_putu(same); nh_puts("/"); nh_putu(samples); nh_puts("\n");
   if (v0.n != n || v0.poison || v0.nonfin || v0.err_bp > max_err_bp || v0.bad > max_bad) pass = 0;
+#ifdef NIGHTLY_HOST_SCAN
+  /* Diagnosis, host side only (the GPU image is unchanged): list up to 16 poisoned (never written)
+   * output elements with their device byte addresses. */
+  if (v0.poison) {
+    const volatile uint16_t *o = nightly_gpu_ptr<uint16_t>(out_dev);
+    uint32_t found = 0;
+    for (uint32_t i = 0; i < n && found < 16; i++) {
+      if (o[i] == 0xEEEEu) {
+        nh_puts("  poisoned element "); nh_putu(i); nh_puts(" at device 0x"); nh_putx(out_dev + 2 * i, 8); nh_puts("\n");
+        found++;
+      }
+    }
+  }
+#endif
   nh_flush();
   return pass;
 }

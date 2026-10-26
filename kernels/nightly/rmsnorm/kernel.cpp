@@ -17,6 +17,15 @@ constexpr uint32_t WORDS = RMS_DIM / 2;                 // 32-bit words per row
 constexpr uint32_t PER_LANE = WORDS / MU_NUM_THREADS;   // words per lane per row
 static_assert(WORDS % (MU_NUM_THREADS * RMS_UNROLL) == 0, "DIM must be a multiple of 32*UNROLL");
 constexpr uint32_t WARPS = MU_NUM_CORES * NIGHTLY_OCC;      // warps per cluster
+// Row skew: a row is 4 KiB, the size of the direct-mapped 4 KiB L0d, so the warps of a core working on
+// their rows at the same offset all hit one L0d set, and the L0d input adapter blocks a set while a nack
+// on it is pending.  Each warp of a core starts its row RMS_UNROLL lines further on (8 warps x 8 lines cover
+// the 64 sets; mu_schedule numbers warps round-robin over cores, so warp / MU_NUM_CORES is the
+// warp within its core).  RMS_SKEW=0 disables it.
+#ifndef RMS_SKEW
+#define RMS_SKEW 1
+#endif
+static_assert((PER_LANE & (PER_LANE - 1)) == 0, "the row skew wraps with a mask");
 // SMEM map: [0, 4*DIM/2)  gamma words | per-warp row stages | per-warp 16-word reduce buffers
 constexpr uint32_t GAMMA_SM = 0;
 constexpr uint32_t STAGE_SM = GAMMA_SM + WORDS * 4;
@@ -32,6 +41,7 @@ static inline uint32_t bf(float f) {
 
 static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
   const uint32_t lane = tid % MU_NUM_THREADS, warp = tid / MU_NUM_THREADS;
+  const uint32_t skew = RMS_SKEW ? (((warp / MU_NUM_CORES) % NIGHTLY_OCC) * RMS_UNROLL) & (PER_LANE - 1) : 0;
   volatile __shared uint32_t *gamma_s = (volatile __shared uint32_t *)GAMMA_SM;
   volatile __shared uint32_t *stage = (volatile __shared uint32_t *)(STAGE_SM + warp * WORDS * 4);
   volatile __shared float *red = (volatile __shared float *)(RED_SM + warp * 64);
@@ -47,7 +57,8 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
     const uint32_t *X = (const uint32_t *)RMS_X_ADDR + r * WORDS;
     uint32_t *Y = (uint32_t *)RMS_Y_ADDR + r * WORDS;
     float acc0 = 0.f, acc1 = 0.f;
-    for (uint32_t k = 0; k < PER_LANE; k += RMS_UNROLL) {
+    for (uint32_t kk = 0; kk < PER_LANE; kk += RMS_UNROLL) {
+      const uint32_t k = (kk + skew) & (PER_LANE - 1);
       uint32_t w[RMS_UNROLL];
 #pragma unroll
       for (int u = 0; u < RMS_UNROLL; u++) w[u] = X[(k + u) * MU_NUM_THREADS + lane];
@@ -64,7 +75,8 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
 #pragma unroll
     for (int j = 0; j < MU_NUM_THREADS; j++) s += red[j];
     const float inv = 1.0f / __builtin_sqrtf(s * (1.0f / RMS_DIM) + RMS_EPS);
-    for (uint32_t k = 0; k < PER_LANE; k += RMS_UNROLL) {
+    for (uint32_t kk = 0; kk < PER_LANE; kk += RMS_UNROLL) {
+      const uint32_t k = (kk + skew) & (PER_LANE - 1);
 #pragma unroll
       for (int u = 0; u < RMS_UNROLL; u++) {
         const uint32_t i = (k + u) * MU_NUM_THREADS + lane;

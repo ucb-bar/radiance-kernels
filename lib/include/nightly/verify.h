@@ -29,6 +29,11 @@
  * every core's END stamp, and the check waits for it. */
 #define NV_GO 24u
 #define NV_GO_MAGIC 0x60C0FFEEu
+/* NIGHTLY_VERIFY_LOCATE (diagnosis): the element index of one poisoned output goes to printBuf
+ * NV_LOC_POISON and of one bad, not poisoned output to NV_LOC_BAD (any one when there are several;
+ * 0xFFFFFFFF when none).  Define it for both the device and the host build. */
+#define NV_LOC_POISON 25u
+#define NV_LOC_BAD 26u
 
 #ifdef RADIANCE_DEVICE
 #include <nightly/device.h>
@@ -59,7 +64,12 @@ static __attribute__((noinline)) void nightly_verify_bf16(uint32_t out, uint32_t
     const uint32_t ow = o32[i], gw = g32[i];
     for (uint32_t h = 0; h < 2; h++) {
       const uint32_t o = (ow >> (16 * h)) & 0xFFFFu, g = (gw >> (16 * h)) & 0xFFFFu;
-      if (o == NV_POISON16) poison++;
+      if (o == NV_POISON16) {
+        poison++;
+#ifdef NIGHTLY_VERIFY_LOCATE
+        nightly_pb_put(NV_LOC_POISON, 2 * i + h);
+#endif
+      }
       if (((o >> 7) & 0xFF) == 0xFF) nonfin++;
       if (o == g) exact++;
       else {
@@ -68,6 +78,9 @@ static __attribute__((noinline)) void nightly_verify_bf16(uint32_t out, uint32_t
         if ((same && (d == 1 || d == -1)) || (((o | g) & 0x7FFF) <= 0x0080)) ulp1++;
         else {
           bad++;
+#ifdef NIGHTLY_VERIFY_LOCATE
+          if (o != NV_POISON16) nightly_pb_put(NV_LOC_BAD, 2 * i + h);
+#endif
           if (cols) {
             const uint32_t e = 2 * i + h, r = e / cols, c = e % cols, t = (r / tr) * (cols / tc) + c / tc;
             if (t < 16) {

@@ -5,18 +5,25 @@
 # DEPS (generated headers), then includes this file.  Every kernel is built once per cluster
 # count, into its own directory so the objects never mix:
 #
-#   build/1sm/$(PROJECT).soc.elf   NIGHTLY_CLUSTERS=1  (RadianceHBMConfig, cluster 0 only)
-#   build/2sm/$(PROJECT).soc.elf   NIGHTLY_CLUSTERS=2  (RadianceHBMConfig, both clusters)
+#   build/1sm/$(PROJECT).soc.elf   NIGHTLY_CLUSTERS=1  (cluster 0 only)
+#   build/2sm/$(PROJECT).soc.elf   NIGHTLY_CLUSTERS=2  (clusters 0 and 1)
+#   build/4sm/$(PROJECT).soc.elf   NIGHTLY_CLUSTERS=4  (4-cluster configs, e.g. RadianceHBMConfig)
 #
-# `make` builds both.  `make SMS=1` builds one.  Extra defines: DEFS="-DFOO=1 -DBAR".
-# With NIGHTLY_CLUSTERS=1 the host launches cluster 0 only; cluster 1 waits for LAUNCH forever.
+# `make` builds 1sm and 2sm.  `make SMS="1 2 4"` adds 4sm.  Extra defines: DEFS="-DFOO=1 -DBAR".
+# The host launches clusters 0 .. NIGHTLY_CLUSTERS-1; the other clusters wait for LAUNCH forever.
 #
-# MU_ADDR_HASH (default 1): RadianceHBMConfig hashes GPU memory over the 4 L2 slices / DRAM
-# channels (radiance WithGPUAddressHash).  SimDRAM +loadmem and FireSim LoadMem write DRAM
-# directly, so the GPU load segments are scrambled into the hashed layout before the fuse step
-# (soc/scramble_gpu_elf.py).  Use MU_ADDR_HASH=0 only for a loader that goes through the hash
-# (TSI, RadianceHBMTSIConfig) or for an unhashed config.  The flag is part of the DEFS stamp, so
-# switching it rebuilds.
+# MU_ADDR_HASH (default 1): the hashed HBM configs hash GPU memory over the GPU DRAM channels
+# (radiance WithGPUAddressHash).  The defaults below match radiance WithRadianceHBM's defaults (4 GPU
+# L2 slices, one channel each): Radiance2SMHBMConfig, RadianceE4M3MxGemmini*HBMConfig,
+# RadianceFP4HBMConfig and the FireSim *HBMRadianceConfig targets.  RadianceHBMConfig (4 SMs, 8 slices
+# x 2 channels) needs MU_ADDR_HASH_SLICES=16 MU_ADDR_HASH_CPS=2 MU_ADDR_HASH_CSS=128.
+# SimDRAM +loadmem and FireSim LoadMem write DRAM directly, so the GPU load segments are scrambled
+# into the hashed layout before the fuse step (soc/scramble_gpu_elf.py).  Use MU_ADDR_HASH=0 only for a loader that goes through the hash
+# (TSI, RadianceHBMTSIConfig) or for an unhashed config.  MU_ADDR_HASH_SLICES (default 4) is the
+# number of parts the hash spreads GPU memory over and MU_ADDR_HASH_CPS (default 1) the DRAM channels
+# per GPU L2 slice, MU_ADDR_HASH_CSS (default 0) the per-channel set stride (--chan-set-stride);
+# all must match the RTL.  MU_ADDR_HASH_SCRAMBLER overrides the scrambler script.
+# All are part of the DEFS stamp, so switching any rebuilds.
 #
 # BLOBS: raw binary files named <anything>.regionN.bin (N = 0..3) are linked into section
 # .regionN of the device image (see lib/linker/mu_link_nightly.ld for the addresses).  Use them
@@ -100,9 +107,16 @@ $(shell mkdir -p build; printf '%s\n' "$(GEN_ARGS)" | cmp -s - $(GEN_STAMP) || p
 # DEFS stamp: the objects depend on $(DEFS_STAMP), rewritten whenever DEFS changes, so
 # `make DEFS=...` recompiles even when no source changed.
 MU_ADDR_HASH ?= 1
-MU_ADDR_HASH_ARGS := --base 0x0 --size 0x80000000 --unit 32 --slices 4
+MU_ADDR_HASH_SLICES ?= 4
+MU_ADDR_HASH_CPS ?= 1
+MU_ADDR_HASH_CSS ?= 0
+MU_ADDR_HASH_SCRAMBLER ?= $(SOC)/scramble_gpu_elf.py
+MU_ADDR_HASH_ARGS := --base 0x0 --size 0x80000000 --unit 32 --slices $(MU_ADDR_HASH_SLICES) \
+  $(if $(filter-out 1,$(MU_ADDR_HASH_CPS)),--channels-per-slice $(MU_ADDR_HASH_CPS)) \
+  $(if $(filter-out 0,$(MU_ADDR_HASH_CSS)),--chan-set-stride $(MU_ADDR_HASH_CSS))
+MU_ADDR_HASH_TEXT := unit=32 slices=$(MU_ADDR_HASH_SLICES)$(if $(filter-out 1,$(MU_ADDR_HASH_CPS)), cps=$(MU_ADDR_HASH_CPS))$(if $(filter-out 0,$(MU_ADDR_HASH_CSS)), css=$(MU_ADDR_HASH_CSS))
 DEFS_STAMP := build/defs.stamp
-STAMP_TEXT := $(DEFS) MU_ADDR_HASH=$(MU_ADDR_HASH)
+STAMP_TEXT := $(DEFS) MU_ADDR_HASH=$(MU_ADDR_HASH) MU_ADDR_HASH_SLICES=$(MU_ADDR_HASH_SLICES) MU_ADDR_HASH_CPS=$(MU_ADDR_HASH_CPS) MU_ADDR_HASH_CSS=$(MU_ADDR_HASH_CSS)
 $(shell mkdir -p build; printf '%s\n' "$(STAMP_TEXT)" | cmp -s - $(DEFS_STAMP) || printf '%s\n' "$(STAMP_TEXT)" > $(DEFS_STAMP))
 
 MU_OBJCOPY := $(LLVM_MUON)/bin/llvm-objcopy
@@ -132,9 +146,9 @@ build/$(1)sm/$(PROJECT).radiance.elf: build/$(1)sm/$(PROJECT).mu.o $(BLOB_OBJS) 
 	$(MU_OBJDUMP) -d $$@ > build/$(1)sm/$(PROJECT).radiance.dump
 build/$(1)sm/$(PROJECT).host.o: $(HOST_SRCS) $(DEPS) $(DEFS_STAMP) $(NIGHTLY_DIR)/nightly.mk $(wildcard $(LIB)/include/nightly/*.h) | build/$(1)sm
 	$(HOST_CXX) $(HOST_CFLAGS) -DNIGHTLY_CLUSTERS=$(1) $(DEFS) -c $(firstword $(HOST_SRCS)) -o $$@
-build/$(1)sm/$(PROJECT).fuse.elf: build/$(1)sm/$(PROJECT).radiance.elf $(DEFS_STAMP) $(SOC)/scramble_gpu_elf.py
+build/$(1)sm/$(PROJECT).fuse.elf: build/$(1)sm/$(PROJECT).radiance.elf $(DEFS_STAMP) $(MU_ADDR_HASH_SCRAMBLER)
 ifeq ($(MU_ADDR_HASH),1)
-	python3 $(SOC)/scramble_gpu_elf.py $$< $$@ $(MU_ADDR_HASH_ARGS) > /dev/null
+	python3 $(MU_ADDR_HASH_SCRAMBLER) $$< $$@ $(MU_ADDR_HASH_ARGS) > /dev/null
 else
 	cp $$< $$@
 endif
@@ -145,7 +159,7 @@ build/$(1)sm/$(PROJECT).soc.elf: build/$(1)sm/$(PROJECT).fuse.elf build/$(1)sm/$
 	  CC=$(HOST_CC) LD=$(HOST_LD) RV64_LINK=$(HOST_CC) OBJCOPY=$(HOST_OBJCOPY) READELF=readelf \
 	  $(SOC)/fuse_rv32_into_rv64.sh > /dev/null
 ifeq ($(MU_ADDR_HASH),1)
-	echo "unit=32 slices=4 size=0x80000000 gpu_base=0x100000000" > $$@.addrhash
+	echo "$(MU_ADDR_HASH_TEXT) size=0x80000000 gpu_base=0x100000000" > $$@.addrhash
 	$(HOST_OBJCOPY) --add-section .radiance_addr_hash=$$@.addrhash $$@
 	rm -f $$@.addrhash
 endif
