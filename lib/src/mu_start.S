@@ -53,6 +53,20 @@
 #define MU_LOG2_LANES 4
 #endif
 
+// Stack skew (lane-interleaved layout only).  The warp regions are 128 KiB apart (16 lanes x
+// 8 KiB), a multiple of the L0d (4 KiB) and cluster L1 (16 KiB) set spans, so the same stack slot
+// of every warp falls in one L0d set and one L1 set.  These caches allow one outstanding miss per
+// set index, so warps that touch their stacks together (a prologue that saves registers) miss one
+// at a time.  With MU_STACK_SKEW, the stack of global warp g = mhartid / 16 starts
+// 256 * (g mod 16) + 64 * ((g / 16) mod 4) bytes lower: 256 B (8 L1 sets) per warp of a cluster
+// (2 cores x 8 warps) and 64 B per cluster (the clusters share the L2).  Both steps are multiples
+// of 64 B, so lane L stays 4*L bytes into each line.  The largest skew is 4032 B of the warp
+// region, 252 B of stack depth per lane.  The thread-major layout needs no skew: its 16 B per
+// thread already moves each warp 256 B.
+#ifndef MU_STACK_SKEW
+#define MU_STACK_SKEW 1
+#endif
+
 .section .init, "ax"
 .global _start
 .type   _start, @function
@@ -151,6 +165,17 @@ init_regs:
 #else
   sll   t1, t0, STACK_LOG2_SIZE
   sll   t2, t0, 4
+  add   t1, t1, t2
+  sub   sp, sp, t1
+#endif
+#if MU_STACK_WORD_STRIDE > 1 && MU_STACK_SKEW
+  # stack skew (see MU_STACK_SKEW); t0 still holds mhartid for the thread pointer below
+  srl   t1, t0, MU_LOG2_LANES
+  andi  t2, t1, 15
+  sll   t2, t2, 8
+  srl   t1, t1, 4
+  andi  t1, t1, 3
+  sll   t1, t1, 6
   add   t1, t1, t2
   sub   sp, sp, t1
 #endif
