@@ -33,13 +33,15 @@ F32 = np.float32
 
 
 # ================================ inputs and weights (lerobot) ================================
-def load_reference(seed=0, text="pick up the red cube and place it in the bowl\n"):
-    """lerobot SmolVLAPolicy (fp32), fixed synthetic inputs, its action chunk; returns numpy weights + inputs."""
+def load_reference(seed=0, text="pick up the red cube and place it in the bowl\n", policy=None):
+    """lerobot SmolVLAPolicy (fp32), fixed synthetic inputs, its action chunk; returns numpy weights + inputs.
+    policy: an already loaded policy (gen_vla_dec.py runs one reference per sample)."""
     import torch
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
     from lerobot.policies.common.vla_utils import create_sinusoidal_pos_embedding
     torch.manual_seed(seed)
-    policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base").float().eval()
+    if policy is None:
+        policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base").float().eval()
     cfg, m = policy.config, policy.model
     rng = np.random.default_rng(seed)
     batch = {}
@@ -71,7 +73,7 @@ def load_reference(seed=0, text="pick up the red cube and place it in the bowl\n
     tab = shuf.reshape(64, 16, 768)[:, :, 0].astype(np.int64)
     assert (shuf.reshape(64, 16, 768) == tab[:, :, None]).all(), "pixel shuffle keeps 768-chunks"
     return dict(
-        sd=sd, P=P, images=np.stack([i[0].numpy() for i in images]), state=state[0].numpy(), noise=noise[0].numpy(),
+        policy=policy, sd=sd, P=P, images=np.stack([i[0].numpy() for i in images]), state=state[0].numpy(), noise=noise[0].numpy(),
         lang_ids=lang[0, :nvalid].numpy(), actions=actions[0].numpy(), temb=temb, dt=-1.0 / steps, shuffle=tab,
         eps_v=vlm.vision_model.config.layer_norm_eps, eps_t=vlm.text_model.config.rms_norm_eps,
         eps_e=ex.config.rms_norm_eps, n_vision=len(vlm.vision_model.encoder.layers),
@@ -187,6 +189,8 @@ def attention(o, Q, K, V, mask, scale, fa=False):
 
 
 FA_DUMP = False
+VFA_HPP = 4    # vision ATTN heads per phase (9 phases of 4: 64 query tiles per phase; must divide 12)
+VFA_SA = True  # vision ATTN: fa_sa_vla.h (the standalone FA kernel, compile-time shapes; d[31] = 1), else fa_phase_vla.h
 FATRACE = {}  # quantized pass: the first ATTN head's S / P / m / l / unnormalized O (gen_vla.py --fa-dump)
 VTRACE = {}   # quantized pass: vision layer 0's device buffers per image (the host's per-stage checks)
 
@@ -331,6 +335,7 @@ def forward(R, q):
         x[:NA] = (x[:NA] + F32(R["dt"]) * (v[:NA] + sd["model.action_out_proj.bias"][None, :])).astype(F32)
         out["x"].append(x.copy())
     out["actions"] = x[:NA]
+    out["caches"], out["cross"], out["Lv"] = caches, cross, Lv   # the expert's inputs (gen_vla_dec.py)
     return out
 
 
@@ -605,12 +610,14 @@ def build(R, emu, ref, outdir, header):
                      d["bqkv"], 1, 1, 0, 0)                     # d[28] = 1: no rotation (rope_qk_norot)
         # 9 ATTN phases of 4 heads (64 query tiles: the softmax lanes keep their row maxima on the stack, not in DRAM
         # as one 36-head phase did, whose output broke on FireSim); head hb writes O rows (hb / 12) 1024 + t, columns
-        # (hb % 12) 64 + d (d[28], d[29]).  d[27] = 0: block-0 max.
-        for hb in range(0, 36, 4):
+        # (hb % 12) 64 + d (d[28], d[29]).  d[27] = 0: block-0 max.  d[31] = 1: fa_sa_vla.h (--vfa-impl standalone,
+        # its shapes the LL_VFA_* macros below), else fa_phase_vla.h
+        for hb in range(0, 36, VFA_HPP):
             prog.add(T_FA, l, "vattn", Q_v[0] + hb * 65536, Q_v[1] + hb * 2048, K_v[0] + hb * 65536,
-                     K_v[1] + hb * 2048, V_v[0] + hb * 65536, V_v[1] + hb * 2048, O_v[0], 4, 1, 1024, 1024, 1024, 0,
-                     s18, 65536, 2048, 65536, 2048, O_v[1], 128, TK, 3, 64, 0, 4, 0, (hb // 12) * 1024, (hb % 12) * 64,
-                     fa_dump if (l == 0 and hb == 0) else 0)    # d[30]: --fa-dump
+                     K_v[1] + hb * 2048, V_v[0] + hb * 65536, V_v[1] + hb * 2048, O_v[0], VFA_HPP, 1, 1024, 1024, 1024, 0,
+                     s18, 65536, 2048, 65536, 2048, O_v[1], 128, TK, 3, 64, 0, VFA_HPP, 0, (hb // 12) * 1024,
+                     (hb % 12) * 64, fa_dump if (l == 0 and hb == 0) else 0,   # d[30]: --fa-dump
+                     int(VFA_SA))
         y = vbuf()
         prog.dense(l, "vo", O_v, d["o"], y, 1536, Mv, 768, 768, 128)
         hm = vbuf()
@@ -790,6 +797,9 @@ def build(R, emu, ref, outdir, header):
                           LL_HD=64, LL_V=0, LL_NP=NP, LL_NFILL=nfill, LL_PW=PW, LL_TN=TN, LL_SYNTHETIC=0).items():
             f.write(f"#define {k} {v_}u\n")
         f.write('#define LL_MODEL "smolvla"\n')
+        if VFA_SA:   # fa_sa_vla.h: the vision ATTN phase's compile-time shapes and logit scale (1 / 8)
+            f.write(f"#define LL_VFA_SA 1\n#define LL_VFA_HD 64u\n#define LL_VFA_SQ 1024u\n#define LL_VFA_SK 1024u\n"
+                    f"#define LL_VFA_H {VFA_HPP}u\n#define LL_VFA_SCALE_BITS 0x{s18:08x}u\n")
         f.write(f"#define LL_PROG_ADDR 0x{prog_addr:08x}u\n#define LL_PERF_ADDR 0x{perf:08x}u\n")
         f.write("#define LL_LOGITS_ADDR 0x00000000u\n#define LL_LABELS_ADDR 0x00000000u\n")
         f.write("#define LL_HF_LOGITS_ADDR 0x00000000u\n#define LL_EMU_LOGITS_ADDR 0x00000000u\n")
@@ -845,9 +855,14 @@ def main():
                     help="truncate the vision, prefix and expert stacks to N layers each (the expert's layer l reads the "
                          "prefix layer l cache; N = 1: only self-attention, N >= 2 also cross-attention); the fp32 "
                          "reference is then the numpy pipeline (it matches lerobot exactly for the full model)")
+    ap.add_argument("--vfa-impl", choices=("standalone", "port"), default="standalone",
+                    help="vision ATTN phase: standalone = fa_sa_vla.h (nightly/fa_mxfp8_sr as fa_sa.h, compile-time "
+                         "shapes), port = fa_phase_vla.h (runtime shapes)")
     a = ap.parse_args()
-    global FA_DUMP
+    global FA_DUMP, VFA_SA
     FA_DUMP = a.fa_dump
+    VFA_SA = a.vfa_impl == "standalone"
+    assert not (VFA_SA and a.fa_dump), "fa_sa_vla.h: no --fa-dump (use --vfa-impl port)"
     print("lerobot reference ...", flush=True)
     R = load_reference()
     if a.layers:

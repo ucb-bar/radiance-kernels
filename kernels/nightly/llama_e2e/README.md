@@ -43,13 +43,33 @@ make MODEL=deepseek TAG=l1 ARGS="--layers 1" SMS=1 PY=...    # variant: llama_e2
 ```
 
 Useful generator options (`ARGS=`): `--layers N`, `--check-l0` (report-only layer-0 stage checks),
-`--fa-exact {0,1}`, `--lm-chunks N`, `--spread S` (random models: MX scales that vary like real data),
+`--fa-exact {0,1}`, `--fa-impl {standalone,port}` (attention: `fa_sa.h` / `fa_sa256.h`, the standalone flash-attention
+kernel with O fused into oproj's operand, the default; DeepSeek's exact-max attention stays on `fa_phase.h`),
+`--lm-chunks N`, `--spread S` (random models: MX scales that vary like real data),
 `--fa-dump` with `DEFS=-DLL_FA_DUMP=1` (dump and check one attention tile stage by stage).
 `DEFS=-DLL_FA_PROF=1` adds per-role cycle totals of the attention phase (`fa_prof` lines).
 
 The host prints `PASS` / `FAIL`; tolerances are relative Frobenius errors from FireSim runs plus margin (the fp8
 format alone puts the emulation 5 - 10 % from fp32 on the LLM hidden states and 38 / 23 / 7.7 % on SmolVLA's vision /
 prefix / actions; the MX Gemmini's reduced-precision accumulation adds a few percent).
+
+## Decode (`DECODE=1`)
+
+Batch-16 decode after the prefill's context: `make DECODE=1 MODEL=<model> SMS="1 2 4" PY=...` builds
+`llama_e2e_dec_<model>.soc.elf`.
+
+- LLMs (`gen_decode.py`, `tinyllama`, `deepseek`, `llama7b`, `gemma2`, `smoke`): 16 sequences (16 text windows; window 0
+  is the prefill test's text), each with its own KV cache of the first 1024 tokens (from the HF model), decode
+  `--steps` (4) tokens: per step every layer runs on the 16 rows, the new key / value is appended to each sequence's
+  cache (DROPE phase: V's 32-key group is requantized from this layer's earlier steps), attention runs as batched GEMMs
+  over (sequence, KV head) with the query heads of a KV head as rows.  Checks: next-token logits of every step vs the HF
+  model (top-1 >= 85 %, teacher-forced with the text) and vs a numpy emulation of the pipeline.
+- SmolVLA (`gen_vla_dec.py`, `MODEL=smolvla`): the action expert alone for 16 observations (seeds 0..15: own images,
+  state, noise), over each sample's prefix caches and cross-attention K' / V' (the prefill's outputs, from the
+  quantized emulation): the 10 flow-matching steps with every dense GEMM over all 1024 action rows.  Checks: actions vs
+  the emulation and vs lerobot (fp32).
+
+The host prints `decode: batch= steps= cycles_per_step=` next to the usual per-phase table.
 
 ## Device pitfalls found while bringing these up
 
@@ -58,6 +78,8 @@ prefix / actions; the MX Gemmini's reduced-precision accumulation adds a few per
   state in registers or explicit per-lane DRAM addresses.
 - **At most 8 integer arguments for non-inlined functions.**  Outgoing stack arguments are stored at unscaled offsets
   while the callee reads them at scaled ones: the 10th argument and later arrive stale.  Use `always_inline`.
+- **Sub-word stores to DRAM are unreliable.**  A lane's byte store into a shared word lost bytes (the K^T cache append),
+  and the Q scale bytes of Gemma-2's 4-cluster decode hung the DROPE phase.  Stage bytes in SMEM and store whole words.
 - **`fexp.h` wraps for x below about -355** (no underflow check in the fixed-point path): clamp its argument.
 - **Per-cluster state must not be a shared global** (each cluster's GEMM thread kept its own accumulator half).
 - **The Rocket host has no FPU enabled** (`soc/start.S`): host code must stay integer-only.

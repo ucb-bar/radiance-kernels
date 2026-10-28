@@ -7,6 +7,11 @@
 #define LL_HOST 1
 #include <nightly/host.h>
 #include "llama_data.h"
+// per-phase host watchdog (multi-cluster): polls of a cluster's DONE word before "timeout: phase p cluster c" (~20 target
+// cycles a poll); debug builds lower it in the data header so a hang is located in about a minute
+#ifndef LL_WATCHDOG_POLLS
+#define LL_WATCHDOG_POLLS 400000000ull
+#endif
 
 static constexpr uint32_t NC = NIGHTLY_CLUSTERS;
 static constexpr uint32_t PB_GO = 20, PB_DONE = 21;
@@ -24,6 +29,30 @@ static uint64_t gemm_macs(uint32_t p) {
 }
 
 // bf16 bits -> order-preserving integer
+#if defined(LL_DROPE_DBG) && LL_DROPE_DBG
+// debug: every warp's progress word (kernel.cpp dbg_put: printBuf slot 24 + 2 w, its update count in 25 + 2 w)
+#ifndef LL_DBG_WARPS
+#define LL_DBG_WARPS 8u                                  // warps per cluster (MU_NUM_CORES x OCC)
+#endif
+static void dbg_dump(const char *tag) {
+#if defined(LL_VLA_DBG) && LL_VLA_DBG                    // kernel_vla.cpp's VLA_DBG sections; "count" is its mcycle
+  static const char *const SEC[16] = {"phase_start", "sm_unit", "sm_row", "sm_max", "sm_sum", "sm_group", "sm_flush",
+                                      "sm_done", "?", "?", "?", "?", "?", "before_fence", "after_fence", "?"};
+#else
+  static const char *const SEC[16] = {"phase_start", "unit", "Q_row", "Q_group", "K_word", "K_group", "K_empty",
+                                      "K_stored", "V_chunk", "V_amax", "V_staged", "V_stored", "drope_done",
+                                      "before_fence", "after_fence", "?"};
+#endif
+  for (uint32_t c = 0; c < NC; c++)
+    for (uint32_t w = 0; w < LL_DBG_WARPS; w++) {
+      const uint32_t v = nightly_pb_read(c, 24 + 2 * w), n = nightly_pb_read(c, 25 + 2 * w);
+      nh_puts(tag); nh_puts(" cluster "); nh_putu(c); nh_puts(" warp "); nh_putu(w); nh_puts(": "); nh_putx(v, 8);
+      nh_putc(' '); nh_puts(SEC[v >> 28]); nh_puts(" x="); nh_putu((v >> 16) & 0xFFF); nh_puts(" a=");
+      nh_putu((v >> 8) & 0xFF); nh_puts(" b="); nh_putu(v & 0xFF); nh_puts(" count="); nh_putu(n); nh_putc('\n');
+    }
+  nh_flush();
+}
+#endif
 static inline int32_t bf_key(uint16_t b) { return (b & 0x8000) ? -(int32_t)(b & 0x7FFF) : (int32_t)b; }
 
 static void put_pct(uint64_t bp) { nh_putfix(bp, 2); nh_putc('%'); }
@@ -54,9 +83,21 @@ int main() {
   }
 #endif
   for (uint32_t cl = 0; cl < NC; cl++) { nightly_pb_write(cl, PB_GO, NC == 1 ? LL_NP : 0); nightly_pb_write(cl, PB_DONE, 0); }
+#if defined(LL_DROPE_DBG) && LL_DROPE_DBG
+  for (uint32_t cl = 0; cl < NC; cl++)                   // the warps' progress slots (kernel.cpp dbg_put)
+    for (uint32_t w = 0; w < 2 * LL_DBG_WARPS; w++) nightly_pb_write(cl, 24 + w, 0);
+#endif
   nightly_host_launch(NC);
+#if defined(LL_DROPE_DBG) && LL_DROPE_DBG
+  // debug: the per-phase watchdog at one cluster too (GO = NP is already written: the cluster runs straight through)
+  if (true) {
+#else
   if (NC > 1) {
+#endif
     for (uint32_t p = 0; p < LL_NP; p++) {
+#if defined(LL_DROPE_DBG) && LL_DROPE_DBG
+      if (NC > 1)
+#endif
       for (uint32_t cl = 0; cl < NC; cl++) nightly_pb_write(cl, PB_GO, p + 1);
 #if defined(LL_PROGRESS) && LL_PROGRESS
       // progress print (-DLL_PROGRESS=1), after releasing phase p.  Off by default: one HTIF round trip on FireSim is
@@ -66,8 +107,18 @@ int main() {
       for (uint32_t cl = 0; cl < NC; cl++) {
         uint64_t polls = 0;
         while (nightly_pb_read(cl, PB_DONE) < p + 1) {
-          if (++polls == 400000000ull) {
-            nh_puts("timeout: phase "); nh_putu(p); nh_puts(" cluster "); nh_putu(cl); nh_puts("\n"); nh_flush();
+          if (++polls == LL_WATCHDOG_POLLS) {
+            nh_puts("timeout: phase "); nh_putu(p); nh_puts(" cluster "); nh_putu(cl); nh_puts("\n");
+            for (uint32_t c2 = 0; c2 < NC; c2++) {   // every cluster's progress: phases done (= index of the one it is in)
+              nh_puts("  cluster "); nh_putu(c2); nh_puts(" done="); nh_putu(nightly_pb_read(c2, PB_DONE)); nh_puts("\n");
+            }
+            nh_flush();
+#if defined(LL_DROPE_DBG) && LL_DROPE_DBG
+            nh_puts("heartbeat (cluster 0) "); nh_putx(nightly_pb_read(0, 48), 8); nh_putc('\n');
+            dbg_dump("dbg1");
+            for (uint32_t i = 0; i < 1000000u; i++) (void)nightly_pb_read(0, PB_DONE);   // a while, then again
+            dbg_dump("dbg2");
+#endif
             exit(2);
           }
         }
@@ -145,7 +196,17 @@ int main() {
   nh_puts("model_cycles="); nh_putu(total); nh_puts(" phase_cycles="); nh_putu(busy);
   nh_puts(" handshake_cycles="); nh_putu(total - busy); nh_puts("\n");
   // per layer: without final, lmhead and softcap (ops 13, 14, 20)
+#ifdef LL_STEPS
+  // decode (gen_decode.py): LL_M = steps x sequences; a layer is counted once per step
+  nh_puts("decode: batch="); nh_putu(LL_BATCH); nh_puts(" steps="); nh_putu(LL_STEPS);
+#if defined(LL_VERIFY_T) && LL_VERIFY_T > 1
+  nh_puts(" verify_tokens_per_step="); nh_putu(LL_VERIFY_T);   // speculative verify: T rows per sequence and step
+#endif
+  nh_puts(" cycles_per_step="); nh_putu(total / LL_STEPS);
+  nh_puts(" cycles_per_layer="); nh_putu((total - op_cyc[13] - op_cyc[14] - (LL_NOPS > 20 ? op_cyc[20] : 0)) / (LL_L * LL_STEPS));
+#else
   nh_puts("cycles_per_layer="); nh_putu((total - op_cyc[13] - op_cyc[14] - (LL_NOPS > 20 ? op_cyc[20] : 0)) / LL_L);
+#endif
   nh_puts(" cycles_per_token="); nh_putu(total / LL_M); nh_puts("\n");
   nh_puts("gemm_macs="); nh_putu(macs); nh_puts(" mesh_util_model="); put_pct(nightly_util_bp(macs, 256ull * NC, total));
   nh_puts("\n"); nh_flush();

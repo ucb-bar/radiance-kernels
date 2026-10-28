@@ -11,6 +11,9 @@
 // ROT: x1 c - x2 s for d < hd/2, x2 c + x1 s above (rope_row's operations, so the codes are bit-identical); ROT = false:
 // no rotation (SigLIP: bias + layout only).  BIAS: x = bf16(x + b) first, b = d[27] (bf16 [NQKV]).  d[29]: Gq when
 // Hkv = 0.  Needs P0 and M multiples of 64 (the dispatcher falls back to rope_qk otherwise).
+// d[31] = SB (batched SmolVLA expert, 0 = off): the M token rows are M / SB samples of SB rows (SB a multiple of 64);
+// sample s's Q goes to batches s (Hq / Gq) + h / Gq (rows (h % Gq) SB + t % SB), its keys to positions P0 + t % SB of
+// cache batch s Hkv + h.
 #ifndef LL_ROPE_FAST_H
 #define LL_ROPE_FAST_H
 
@@ -55,6 +58,7 @@ static void rope_qk_fast(const volatile uint32_t *d, uint32_t gw, uint32_t ngw, 
   const uint32_t kb = d[13], ksc = d[14], kb_bs = d[15], ksc_bs = d[16];
   const uint32_t P0 = d[21], M = d[22], SK = d[23], TM = d[24], fal = d[25], bias = d[27];
   const uint32_t Gq = d[29] ? d[29] : Hq / Hkv, Dq = Hq * hd, NBLK = M / 64;
+  const uint32_t SB = d[31] ? d[31] : M, HG = Hq / Gq;   // rows per sample, query batches per sample
   const uint32_t tt = lane / NG, g = lane % NG;          // this lane's (token of the batch, group)
   auto rows = [&](uint32_t t0, uint32_t col0) __attribute__((always_inline)) {   // TB tokens' rows into res
     for (uint32_t b = 0; b < TB; b++) {
@@ -70,25 +74,25 @@ static void rope_qk_fast(const volatile uint32_t *d, uint32_t gw, uint32_t ngw, 
   };
   // ---- Q ----
   for (uint32_t u = gw; u < Hq * NBLK; u += ngw) {
-    const uint32_t h = u / NBLK, ub = (u % NBLK) * 64;
-    const uint32_t aq = qa + (h / Gq) * qa_bs, asq = qasc + (h / Gq) * qasc_bs;
+    const uint32_t h = u / NBLK, ub = (u % NBLK) * 64, qb = (ub / SB) * HG + h / Gq;
+    const uint32_t aq = qa + qb * qa_bs, asq = qasc + qb * qasc_bs;
     for (uint32_t t0 = ub; t0 < ub + 64; t0 += TB) {
       rows(t0, h * hd);
-      const uint32_t row = (h % Gq) * M + t0 + tt;
+      const uint32_t row = (h % Gq) * SB + (t0 + tt) % SB;
       quant_group(pair, lane, (uint32_t *)a_code(aq, TM, hd, 1, row, 32 * g), a_scale(asq, TM, hd, 1, row, 32 * g));
       mu_fence_smem();                                   // res read before the next batch rewrites it
     }
   }
   // ---- K ----
   for (uint32_t u = gw; u < Hkv * NBLK; u += ngw) {
-    const uint32_t h = u / NBLK, key0 = P0 + (u % NBLK) * 64, nt = key0 / 64;
+    const uint32_t tok0 = (u % NBLK) * 64, hb = (tok0 / SB) * Hkv + u / NBLK, key0 = P0 + tok0 % SB, nt = key0 / 64;
     for (uint32_t p = 0; p < hd / 64; p++) {             // 64 d (2 groups) per pass
       for (uint32_t k0 = 0; k0 < 64; k0 += TB) {
-        rows(key0 - P0 + k0, Dq + h * hd);
+        rows(tok0 + k0, Dq + (u / NBLK) * hd);
         if (g / 2 == p) {
           const uint32_t kk = k0 + tt, key = key0 + kk;
-          const uint32_t sa = fal ? ksc + h * ksc_bs + (key / 128) * NG * 128 + g * 128 + key % 128
-                                  : ksc + h * ksc_bs + nt * NG * 64 + g * 64 + kk;
+          const uint32_t sa = fal ? ksc + hb * ksc_bs + (key / 128) * NG * 128 + g * 128 + key % 128
+                                  : ksc + hb * ksc_bs + nt * NG * 64 + g * 64 + kk;
           quant_group(pair, lane, cst + kk * PITCH + 8 * (g % 2), sa);
         } else asm volatile("nop");
         mu_fence_smem();
@@ -97,7 +101,7 @@ static void rope_qk_fast(const volatile uint32_t *d, uint32_t gw, uint32_t ngw, 
         const uint32_t dl = it / 16, w = it % 16, sh = 8 * (dl % 4), col = dl / 4, dd = 64 * p + dl;
         const uint32_t b0 = (cst[(4 * w) * PITCH + col] >> sh) & 0xFFu, b1 = (cst[(4 * w + 1) * PITCH + col] >> sh) & 0xFFu;
         const uint32_t b2 = (cst[(4 * w + 2) * PITCH + col] >> sh) & 0xFFu, b3 = (cst[(4 * w + 3) * PITCH + col] >> sh) & 0xFFu;
-        const uint32_t dst = fal ? kb + h * kb_bs + dd * SK + key0 + 4 * w : kb + h * kb_bs + nt * hd * 64 + dd * 64 + 4 * w;
+        const uint32_t dst = fal ? kb + hb * kb_bs + dd * SK + key0 + 4 * w : kb + hb * kb_bs + nt * hd * 64 + dd * 64 + 4 * w;
         *(uint32_t *)dst = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
       }
       mu_fence_smem();                                   // code stage read before the next pass / unit rewrites it

@@ -82,10 +82,11 @@ MODELS = {
 }
 
 OPS = ["init", "norm1", "qkv", "rope", "qk", "softmax", "pv", "oquant", "oproj", "norm2", "gateup",
-       "silu", "down", "final", "lmhead", "gemm", "gelu", "attn", "rope_k", "rope_v", "softcap"]
+       "silu", "down", "final", "lmhead", "gemm", "gelu", "attn", "rope_k", "rope_v", "softcap", "drope"]
 OP = {n: i for i, n in enumerate(OPS)}
 T_NONE, T_GEMM, T_PRENORM, T_ROPE, T_SOFTMAX, T_EWQ, T_FILL, T_SILU, T_ACT, T_FA = 0, 1, 2, 3, 4, 5, 6, 7, 8, 9
 FA_BK, FA_QT = 128, 64          # ATTN phase: key block, query tile (fa_phase.h)
+FA256_BK, FA256_QT = 64, 32     # hd 256 ATTN phase (fa_sa256.h): key block, query tile
 PW = 32                         # words per phase descriptor
 
 
@@ -440,11 +441,19 @@ def emulate(cfg, M, P0, mdl, qw, cos, sin, keep_layer0=True, fa=False, ilv=False
             S = bf(Qd[:, h_, :] @ Kd[g].T)
             if h_ == 0:
                 S0 = S
-            if fa:   # ATTN phase: max of key block 0 (fa_exact: the exact masked row max), unnormalized bf16 P, O = (P V) / l
+            if fa and acap:   # fa_sa256.h (hd 256, Gemma-2): z = cap tanh(S k1) fp32 (as the unfused SOFTMAX), m = the
+                # 64-key block 0's max taken on the raw S (tanh is increasing), floored at cap - 64; P = bf16 e^bf16(z - m)
+                k1 = np.float32(1.0 / np.sqrt(cfg.get("qpre", hd)) / acap)   # LL_FA_K1_BITS
+                z = (np.float32(acap) * tanh_dev(S * k1)).astype(np.float32)
+                m = np.maximum((np.float32(acap) * tanh_dev(S[:, :FA256_BK].max(axis=1, keepdims=True) * k1)),
+                               np.float32(acap - 64.0)).astype(np.float32)
+                e = np.where(mask, bf(np.exp(bf(z - m))), 0).astype(np.float32)
+            elif fa:   # ATTN phase: max of key block 0 (fa_exact: the exact masked row max), unnormalized bf16 P, O = (P V) / l
                 s = bf(S * bf(scale))
                 m = (np.where(mask, s, -np.inf).max(axis=1, keepdims=True) if cfg.get("fa_exact")
                      else s[:, :FA_BK].max(axis=1, keepdims=True))
                 e = np.where(mask, bf(np.exp(bf(s - m))), 0).astype(np.float32)
+            if fa:
                 lsum = np.sum(e, axis=1, dtype=np.float32)
                 PV = bf(mx_dequant(*mx_quant(e)) @ Vd[g])
                 O[:, h_, :] = bf(PV * (np.float32(1) / lsum)[:, None])
@@ -618,6 +627,10 @@ def main():
                     help="at least this many LM-head column chunks (each its own GEMM phase; default: by size)")
     ap.add_argument("--fa-exact", choices=["auto", "0", "1"], default="auto",
                     help="ATTN max: 1 = the exact-max pre-pass, 0 = key block 0's max, auto = the model's setting")
+    ap.add_argument("--fa-impl", choices=["auto", "standalone", "port"], default="auto",
+                    help="ATTN phase: standalone = fa_sa.h (nightly/fa_mxfp8_sr: compile-time shapes, block-0 max or "
+                         "the exact-max pre-pass, O fused into oproj's operand), port = fa_phase.h (runtime shapes, "
+                         "same options); auto = standalone, port for exact-max models (DeepSeek)")
     ap.add_argument("--fa-dump", action="store_true",
                     help="build with -DLL_FA_DUMP=1: cluster 0 dumps layer 0's ATTN tile 0 (head 0, rows 0..63): S, P "
                          "per key block, m, l, unnormalized O; the host compares them with the emulation's (report only)")
@@ -651,12 +664,24 @@ def main():
     # per cluster (fa_phase.h QT_MAX, checked for one cluster: the most tiles)
     fa_ok = (hd in (64, 128) and SK % FA_BK == 0 and SK // FA_BK >= 6 and (SK // FA_BK) % 2 == 0 and P0 >= FA_BK
              and (Hq * M // FA_QT) % 4 == 0 and Hq * M // FA_QT <= 64 and P0 % 64 == 0 and M % 64 == 0 and not acap)
-    fa = a.attn == "fa" or (a.attn == "auto" and fa_ok)
-    assert fa_ok or not fa, "ATTN phase needs hd 64/128, an even number (>= 6) of 128-key blocks, P0 >= 128, " \
-                            "Hq M / 64 % 4 == 0 and <= 64, no cap"
+    # hd 256 with the attention soft-cap (Gemma-2): fa_sa256.h, 64-key blocks (an even number >= 6), 32-query tiles
+    # (Hq M / 32 % 4 == 0); the K cache keeps the 128-key scale layout (SK % 128 == 0)
+    fa256_ok = (hd == 256 and bool(acap) and SK % FA_BK == 0 and SK // FA256_BK >= 6 and (SK // FA256_BK) % 2 == 0
+                and P0 >= FA256_BK and M % FA256_QT == 0 and (Hq * M // FA256_QT) % 4 == 0)
+    fa = a.attn == "fa" or (a.attn == "auto" and (fa_ok or fa256_ok))
+    assert fa_ok or fa256_ok or not fa, "ATTN phase needs hd 64/128, an even number (>= 6) of 128-key blocks, " \
+        "P0 >= 128, Hq M / 64 % 4 == 0 and <= 64, no cap (or hd 256 + cap: >= 6 64-key blocks, Hq M / 32 % 4 == 0)"
     assert not (fa and a.debug_l0), "--debug-l0 checks the qk / softmax / pv phases"
+    fa256 = fa and hd == 256                             # fa_sa256.h
+    # auto: fa_sa.h, except exact-max models (DeepSeek), which keep fa_phase.h: fa_sa.h's exact-max pre-pass gives wrong
+    # attention outputs on FireSim (2-layer DeepSeek runs 664 / 668: yattn 100 % off; fa_phase.h passes, run 663)
+    sa = fa and not fa256 and (a.fa_impl == "standalone" or (a.fa_impl == "auto" and not cfg.get("fa_exact")))
+    assert not (sa and a.fa_dump), "fa_sa.h: no --fa-dump"
+    assert not (fa256 and a.fa_dump), "fa_sa256.h: no --fa-dump"
+    fa_qt = FA256_QT if fa256 else FA_QT                 # ATTN query tile: Q scale layout (ROPE TM, d[24])
     NBk = SK // FA_BK
-    fuse = fa                                            # SILU fused into the gateup GEMM (with the ATTN path)
+    # SILU fused into the gateup GEMM (with the ATTN path; not Gemma-2: its post-norms need the unfused PRENORM)
+    fuse = fa and not gemma
     fuse_rope = fuse and hd == 128                       # ROPE fused into the qkv GEMM (its units are hd 128)
     assert not fuse or (F % TK == 0 and (2 * F // TN) % 8 == 0 and M % 32 == 0 and M <= 256)
     # the q/k/v bias is added by the fused ROPE units (ATTN path); Gemma-2's post-norms need the unfused PRENORM
@@ -794,9 +819,9 @@ def main():
             return np.stack(kb), np.stack(kbs), np.stack(vb), np.stack(vbs)
         k_, ks_, v_, vs_ = kv_dev(r0["Kc"], r0["Vall"])
         qc_, qs_ = mx_quant(r0["Q"])                                     # [M][Hq][hd], [M][Hq][hd/32]
-        if fa:   # Q codes [Hq][M][hd], scales [Hq M / 64][hd/32][64]
+        if fa:   # Q codes [Hq][M][hd], scales [Hq M / QT][hd/32][QT] (QT = 64, fa_sa256.h 32)
             qd = np.ascontiguousarray(qc_.transpose(1, 0, 2))
-            qsd = np.ascontiguousarray(qs_.transpose(1, 0, 2).reshape(Hq * M // 64, 64, hd // 32).transpose(0, 2, 1))
+            qsd = np.ascontiguousarray(qs_.transpose(1, 0, 2).reshape(Hq * M // fa_qt, fa_qt, hd // 32).transpose(0, 2, 1))
             for k, v in (("q", qd), ("q_sc", qsd)):
                 l0g[k] = (mem.add_any(v), v.size)
         for k, v in (("kc", k_), ("kc_sc", ks_), ("vc", v_), ("vc_sc", vs_)):
@@ -898,7 +923,7 @@ def main():
                      D, M, TM, TK, eps, int(fuse), pf(l - 1))
         rope_args = (ac["qkv"], NQKV, Hq, Hkv, hd, cos_a, sin_a, qmx[0], qmx[1], Gq * M * hd, Gq * M * hd // 32,
                      w["kc"], w["kc_sc"], SK * hd, SK * hd // 32, w["vc"], w["vc_sc"], SK * hd, SK * hd // 32,
-                     P0, M, SK, FA_QT if fa else TM, int(fa), 0, w.get("bqkv", 0),   # d[27]: q/k/v bias (bf16)
+                     P0, M, SK, fa_qt if fa else TM, int(fa), 0, w.get("bqkv", 0),   # d[27]: q/k/v bias (bf16)
                      w.get("kcen", 0))                                               # d[28]: key center (fp32)
         # fused: ROPE runs on warps 1.. under the qkv GEMM; its descriptor rides in the no-op phase right after it
         rope_desc = prog_addr + (len(prog.ph) + 1) * PW * 4
@@ -906,12 +931,13 @@ def main():
                   TM * NQKV * 2, 1, 1, NQKV // TN, D // TK, TM, TK, fuse=(2, rope_desc) if fuse_rope else ())
         prog.add(T_NONE if fuse_rope else T_ROPE, l, "rope", *rope_args)
         if fa:
-            # O goes straight into oproj's MX A operand (no oquant phase)
-            prog.add(T_FA, l, "attn", qmx[0], qmx[1], w["kc"], w["kc_sc"], w["vc"], w["vc_sc"], omx[0], Hq, Gq, M,
+            # O goes straight into oproj's MX A operand (no oquant phase), fa_phase.h and fa_sa.h alike
+            prog.add(T_FA, l, "attn", qmx[0], qmx[1], w["kc"], w["kc_sc"], w["vc"], w["vc_sc"],
+                     omx[0], Hq, Gq, M,
                      SK, P0, 0, f32_bits(1.0 / np.sqrt(hd)), SK * hd, SK * hd // 32, SK * hd, SK * hd // 32,
                      omx[1], TM, TK, Dq // TK, hd, fa_mrow, 0,      # d[24]: head dim (Fa<D>), d[25]: exact-max rows
                      int(cfg.get("fa_exact", False)),               # d[27]: exact-max pre-pass (DeepSeek)
-                     0, 0, fa_dump if l == 0 else 0)                # d[30]: tile-0 dump (--fa-dump)
+                     0, int(sa or fa256), fa_dump if l == 0 else 0)   # d[29]: fa_sa.h / fa_sa256.h, d[30]: tile-0 dump
         else:
             s = s_ring[l & 1]
             prog.gemm(l, "qk", qmx[0], qmx[1], Gq * M * hd, Gq * M * hd // 32, w["kc"], w["kc_sc"],
@@ -1010,11 +1036,10 @@ def main():
                               ("yattn", l0["yattn"], M * D), ("hmid", l0["hmid"], M * D),
                               ("gu", l0["gu"], M * 2 * F), ("ymlp", l0["ymlp"], M * D)):
                 checks.append((f"L0 {k} vs emulation", dev, gold[f"emu_l0_{k}"], n, 12))
-        # random models: bit-exact with the emulation.  Real weights: the device's fexp / reduction order differ from the
-        # emulation's, so the hidden states only gate gross failures (Frobenius error in 0.01 % units); the host also
-        # requires >= 85 % top-1 agreement with the HF model.
-        real = mdl["hidden"] is not None
-        htol, ltol = (3000, 2000) if real else (0, 0)
+        # the device's fexp / reduction order differ from the emulation's (random models too: smoke 6 %, gemmasmoke 1 %
+        # hidden-state error on FireSim), so the hidden states only gate gross failures (Frobenius error in 0.01 %
+        # units); with real weights the host also requires >= 85 % top-1 agreement with the HF model.
+        htol, ltol = 3000, 2000
         for l in range(1, L + 1):
             checks.append((f"h{l} vs emulation", hbuf[l], gold[f"emu_h{l}"], M * D, 8, 0, htol))
             if f"hf_h{l}" in gold:
@@ -1038,6 +1063,12 @@ def main():
                          LL_SYNTHETIC=int(synthetic)).items():
             f.write(f"#define {k} {v}u\n")
         f.write(f'#define LL_MODEL "{a.model}"\n')
+        if sa:   # fa_sa.h: compiled in, its logit scale a compile-time constant (the standalone's FA_SCALE_BITS)
+            f.write(f"#define LL_FA_SA 1\n#define LL_FA_SCALE_BITS 0x{f32_bits(1.0 / np.sqrt(hd)):08x}u\n"
+                    f"#define LL_FA_EXACT {int(bool(cfg.get('fa_exact')))}\n")
+        if fa256:   # fa_sa256.h: the soft-cap (cap, scale / cap as the unfused SOFTMAX's d[16], d[17]), f32 bits
+            f.write(f"#define LL_FA_SA256 1\n#define LL_FA_CAP_BITS 0x{f32_bits(acap):08x}u\n"
+                    f"#define LL_FA_K1_BITS 0x{f32_bits(ascale / acap):08x}u\n")
         f.write(f"#define LL_PROG_ADDR 0x{prog_addr:08x}u\n#define LL_PERF_ADDR 0x{perf:08x}u\n")
         f.write(f"#define LL_LOGITS_ADDR 0x{logits:08x}u\n")
         full = L == cfg["L"]                             # HF logits only mean something for the whole model
@@ -1063,7 +1094,8 @@ def main():
         f.write("  {0, 0, 0, 0, 0, 0, 0}\n};\n#endif\n#endif\n")
     used = {r: (mem.arena[r] - REGION_BASE[r]) >> 20 for r in (1, 2, 3)}
     blob = {r: len(b) >> 20 for r, b in mem.blobs.items()}
-    print(f"{a.model}: M={M} SK={SK} (cache {P0}) L={L} phases={NP} (fill {nfill}); "
+    print(f"{a.model}: M={M} SK={SK} (cache {P0}) L={L} attn={'fa_sa256' if fa256 else 'fa_sa' if sa else 'fa_phase' if fa else 'gemm'} "
+          f"phases={NP} (fill {nfill}); "
           f"blob MiB {blob}, used MiB {used}")
     if emu is not None and mdl.get("labels") is not None:
         top = np.argmax(emu["logits"], axis=1)

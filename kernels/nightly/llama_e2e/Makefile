@@ -28,7 +28,9 @@ MODEL ?= smoke
 TAG   ?=
 PY    ?= python3
 ARGS  ?=
-NAME      = $(MODEL)$(if $(TAG),_$(TAG))
+# DECODE=1: batch-16 decode steps after the KV cache (gen_decode.py) -> llama_e2e_dec_<MODEL>[_<TAG>]
+DECODE ?=
+NAME      = $(if $(DECODE),dec_)$(MODEL)$(if $(TAG),_$(TAG))
 DATA      = data_$(NAME)
 # blob objects per model / variant (nightly.mk BLOB_DIR): one data set's objects never link into another's ELF
 BLOB_DIR  = build/blobs/$(NAME)
@@ -55,8 +57,8 @@ include ../nightly.mk
 # per-variant generator stamp (nightly.mk's GEN_STAMP is shared by every variant of this directory)
 VAR_STAMP := $(DATA)/gen_args.stamp
 $(shell mkdir -p $(DATA); printf '%s\n' "$(GEN_ARGS)" | cmp -s - $(VAR_STAMP) || printf '%s\n' "$(GEN_ARGS)" > $(VAR_STAMP))
-$(DATA)/llama_data.h $(BLOBS) &: gen_data.py gen_unit.py $(if $(filter smolvla,$(MODEL)),gen_vla.py) $(VAR_STAMP)
-	$(PY) $(if $(filter smolvla,$(MODEL)),gen_vla.py,$(if $(filter cputest muontest gemmact m2g silufuse,$(MODEL)),gen_unit.py,gen_data.py)) $(GEN_ARGS) --out $(DATA) --header $(DATA)/llama_data.h
+$(DATA)/llama_data.h $(BLOBS) &: gen_data.py gen_unit.py gen_decode.py $(if $(filter smolvla,$(MODEL)),gen_vla.py gen_vla_dec.py) $(VAR_STAMP)
+	$(PY) $(if $(filter smolvla,$(MODEL)),$(if $(DECODE),gen_vla_dec.py,gen_vla.py),$(if $(DECODE),gen_decode.py,$(if $(filter cputest muontest gemmact m2g silufuse,$(MODEL)),gen_unit.py,gen_data.py))) $(GEN_ARGS) --out $(DATA) --header $(DATA)/llama_data.h
 
 # FireSim test ladder, cheapest first: smoke (random, every stage checked), TinyLlama 1 and 4 layers (real
 # weights), Llama-7B 2 layers (synthetic), then the full models
