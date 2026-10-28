@@ -35,14 +35,9 @@ static uint64_t gemm_macs(uint32_t p) {
 #define LL_DBG_WARPS 8u                                  // warps per cluster (MU_NUM_CORES x OCC)
 #endif
 static void dbg_dump(const char *tag) {
-#if defined(LL_VLA_DBG) && LL_VLA_DBG                    // kernel_vla.cpp's VLA_DBG sections; "count" is its mcycle
-  static const char *const SEC[16] = {"phase_start", "sm_unit", "sm_row", "sm_max", "sm_sum", "sm_group", "sm_flush",
-                                      "sm_done", "?", "?", "?", "?", "?", "before_fence", "after_fence", "?"};
-#else
   static const char *const SEC[16] = {"phase_start", "unit", "Q_row", "Q_group", "K_word", "K_group", "K_empty",
                                       "K_stored", "V_chunk", "V_amax", "V_staged", "V_stored", "drope_done",
                                       "before_fence", "after_fence", "?"};
-#endif
   for (uint32_t c = 0; c < NC; c++)
     for (uint32_t w = 0; w < LL_DBG_WARPS; w++) {
       const uint32_t v = nightly_pb_read(c, 24 + 2 * w), n = nightly_pb_read(c, 25 + 2 * w);

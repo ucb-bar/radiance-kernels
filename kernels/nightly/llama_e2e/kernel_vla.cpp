@@ -1220,21 +1220,6 @@ static inline float masked(float v, uint32_t valid) { return f_bits(bits_f(v) & 
 // unit = (head group, m-tile, k-step): the k-step's P codes and scale lines.  Each unit computes its rows' full max
 // and sum itself (KS-fold extra reads).  CAP (Gemma-2): logits soft-capped, cap tanh(S scale / cap), d[16] scale / cap,
 // d[17] cap.
-#if defined(LL_VLA_DBG) && LL_VLA_DBG
-// Debug (-DLL_VLA_DBG=1, with LL_DROPE_DBG for the host's watchdog dump): every warp posts its progress to printBuf
-// slot 24 + 2 w ((sec << 28) | (x << 16) | (a << 8) | b) and the cycle of that post to 25 + 2 w (two snapshots: moving
-// = still running, frozen = stuck there).  sec 0 phase start (x = p) |
-// 1 SOFTMAX unit (x = u) | 2 row (x = u, a = r, b = rr) | 3 max done | 4 sum done | 5 group stored (b = gi) |
-// 6 scales flushed (a = rb) | 7 SOFTMAX done | 13 before the phase's closing mu_fence (x = p) | 14 after it
-static_assert(MU_NUM_CORES * NIGHTLY_OCC <= 12, "printBuf slots 24..47");
-__attribute__((always_inline)) static inline void vdbg(uint32_t warp, uint32_t sec, uint32_t x, uint32_t a, uint32_t b) {
-  nightly_pb_put(24 + 2 * warp, (sec << 28) | ((x & 0xFFFu) << 16) | ((a & 0xFFu) << 8) | (b & 0xFFu));
-  nightly_pb_put(25 + 2 * warp, (uint32_t)nightly_mcycle());
-}
-#define VLA_DBG(w, sec, x, a, b) vdbg((w), (sec), (x), (a), (b))
-#else
-#define VLA_DBG(w, sec, x, a, b) ((void)0)
-#endif
 template <bool CAP>
 static inline float sm_logit(float s, float scale, float k1, float cap) { return CAP ? cap * tanh_f(s * k1) : s * scale; }
 template <bool CAP>
@@ -1247,16 +1232,12 @@ static void softmax_phase(const volatile uint32_t *d, uint32_t own, uint32_t now
   const uint32_t P0 = d[12], M = d[13], TM = d[14], TK = d[15], KSp = SK / TK, W = SK / 2, GS = TK / 32;
   const uint32_t MTb = R / TM;
   const float NEG = f_bits(0xFF800000u);
-  const uint32_t dw = wi * MU_NUM_CORES + own % MU_NUM_CORES;   // the block warp (VLA_DBG slot)
-  (void)dw;
   for (uint32_t u = own; u < batch * MTb * KSp; u += nown) {
     const uint32_t bt = u / (MTb * KSp), mt = (u / KSp) % MTb, ks = u % KSp;
-    VLA_DBG(dw, 1, u, 0, 0);
     const uint32_t A = pa + bt * pa_bs, ASC = pasc + bt * pasc_bs;
     for (uint32_t rb = mt * TM + 4 * wi; rb < (mt + 1) * TM; rb += 4 * nwo) {
       for (uint32_t rr = 0; rr < 4; rr++) {
         const uint32_t r = rb + rr, t = r % M;
-        VLA_DBG(dw, 2, u, r, rr);
         // key k allowed: k <= lim1, or b2 <= k <= lim2.  Table d[18] (u32 [M][2] = lim1, lim2; b2 = d[19]): SmolVLA's
         // prefix / suffix masks; no table: causal, lim1 = P0 + t, no second range.
         const uint32_t tab = d[18], lim1 = tab ? g32(tab)[2 * t] : P0 + t, lim2 = tab ? g32(tab)[2 * t + 1] : 0u;
@@ -1279,7 +1260,6 @@ static void softmax_phase(const volatile uint32_t *d, uint32_t own, uint32_t now
           }
         }
         m = warp_max(red, lane, m);
-        VLA_DBG(dw, 3, u, r, rr);
         float sum = 0.f;
         for (uint32_t w = lane; w < W; w += MU_NUM_THREADS) {
           const uint32_t sv = stage[w];
@@ -1287,21 +1267,17 @@ static void softmax_phase(const volatile uint32_t *d, uint32_t own, uint32_t now
                  masked(fexp_bf(sm_logit<CAP>(hi(sv), scale, k1, cap) - m), ok(2 * w + 1));
         }
         sum = warp_sum(red, lane, sum);
-        VLA_DBG(dw, 4, u, r, rr);
         const float inv = 1.0f / sum;
         for (uint32_t gi = 0; gi < GS; gi++) {          // this k-step's groups: keys 32 g .., words 16 g + lane
           const uint32_t g = ks * GS + gi, w = g * 16 + lane, sv = stage[w];
           const float p0 = masked(fexp_bf(sm_logit<CAP>(lo(sv), scale, k1, cap) - m) * inv, ok(2 * w));
           const float p1 = masked(fexp_bf(sm_logit<CAP>(hi(sv), scale, k1, cap) - m) * inv, ok(2 * w + 1));
           mx_group2(red, cw, lane, p0, p1, a_code(A, TM, TK, KSp, r, g * 32), sb + gi, rr);
-          VLA_DBG(dw, 5, u, r, gi);
         }
       }
       sb_flush(sb, lane, GS, ks * GS, ASC, TM, TK, KSp, rb);
-      VLA_DBG(dw, 6, u, rb, 0);
     }
   }
-  VLA_DBG(dw, 7, 0, 0, 0);
 }
 
 // ---- EWQ / SILU: warp per row, a group per warp step ----------------------------------------------
@@ -1527,7 +1503,6 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
       if (tb == 0) nightly_heartbeat(p);
     } else asm volatile("nop");
     bar(BAR_PH, warps);
-    VLA_DBG(warp, 0, p, 0, 0);
     // flat, one-level dispatch: an else-if chain nests a split per type on the IPDOM stack
     const uint32_t ty = opaque(dsc[0]);
     // fused GEMM: workers on warps 1.. (PRENORM accumulation only on one cluster)
@@ -1649,9 +1624,7 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
     else asm volatile("nop");
     if (opaque(ty == LL_T_ACT) & opaque(akind == 1)) act_phase<1>(dsc, gw, ngw, lane);
     else asm volatile("nop");
-    VLA_DBG(warp, 13, p, 0, 0);
     mu_fence();                                          // this thread's stores have landed
-    VLA_DBG(warp, 14, p, 0, 0);
     bar(BAR_PH, warps);
     if (lead) {
       perf[(p * NC + tb) * 16 + 1] = nightly_mcycle();

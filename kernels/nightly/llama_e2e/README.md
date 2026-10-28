@@ -71,6 +71,14 @@ Batch-16 decode after the prefill's context: `make DECODE=1 MODEL=<model> SMS="1
 
 The host prints `decode: batch= steps= cycles_per_step=` next to the usual per-phase table.
 
+## Known issues
+
+- **SmolVLA prefill at 2 SM is unstable.**  The plain build (`TAG=vsa`, fa_sa_vla.h) hangs deterministically on FireSim
+  at cycle 10,308,501,632 (runs 649 / 676): phase 1025, the action expert's SOFTMAX in denoise step 2, layer 5, with
+  cluster 0 not finishing.  Builds with per-warp progress probes in that phase complete and pass (runs 679 / 684, 2.71 G
+  model cycles), so it looks like a timing race in that phase or its hand-off to the next, not a logic error.  1 and 4
+  SM pass.  Treat 2 SM SmolVLA numbers as coming from a probe build.
+
 ## Device pitfalls found while bringing these up
 
 - **Runtime-indexed local arrays alias across lanes.**  Muon's stack interleaves lanes word by word
