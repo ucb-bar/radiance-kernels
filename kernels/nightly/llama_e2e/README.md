@@ -112,6 +112,13 @@ the norm after oproj / down is fused into the GEMM and sums in another order), a
 match the device bit for bit: TinyLlama and DeepSeek at 1 layer, every `--check-l0` stage of layer 0, the hidden state and
 the logits, at 1 / 2 / 4 SM (runs 689 - 698).  The gates stay at their old values, so they pass either way.
 
+## Cyclotron bench (`smbench/`)
+
+`smbench/` runs the SOFTMAX phases (SmolVLA's in kernel_vla.cpp, the LLM one in kernel.cpp) on cyclotron, the
+Radiance performance model, without FireSim: it extracts the phases from the sources, compares their output bytes
+with the previous versions and times them (`smbench/README.md`).  Cyclotron ranked the variants of the 2026-10-29
+softmax rewrite and proved it bit-identical; its speed-ups ran high (SmolVLA 2.2 - 2.5x there, 1.4 - 1.65x on FireSim).
+
 ## Known issues
 
 - **SmolVLA prefill at 2 SM was unstable.**  The plain build (`TAG=vsa`, fa_sa_vla.h) hangs deterministically on

@@ -1453,6 +1453,135 @@ static void softmax_phase(const volatile uint32_t *d, uint32_t own, uint32_t now
   }
 }
 
+// quant_group with two lanes per group (rows of <= 8 groups, so every lane works): lane l takes half l % 2 of group
+// l / 2, pairs j = 8 (l % 2) .. + 7; the two halves' amax meet through `red`.  Same amax, codes and scale byte as
+// quant_group (the max is order-free).  Lanes >= 2 ng only take part in the exchange.
+template <typename P>
+__attribute__((always_inline)) static inline void quant_half(P pair, uint32_t lane, uint32_t ng,
+                                                             volatile __shared float *red,
+                                                             volatile __shared uint32_t *cb, uint32_t scale_addr) {
+  const uint32_t h = lane & 1u, g = lane >> 1, act = bit(g < ng);
+  float amax = 0.f;
+  if (act) {
+#pragma unroll 4
+    for (uint32_t jj = 0; jj < 8; jj++) {
+      const F2 p = pair(8 * h + ((jj + g) & 7u));
+      amax = __builtin_fmaxf(amax, __builtin_fmaxf(fabs_(p.a), fabs_(p.b)));
+    }
+  } else asm volatile("nop");
+  red[lane] = amax;
+  mu_fence_smem();
+  amax = __builtin_fmaxf(amax, red[lane ^ 1u]);
+  mu_fence_smem();                                       // read before red is reused
+  if (act) {
+    const int32_t e = block_exp(amax);
+    const float sc = pow2_neg(e);
+#pragma unroll 2
+    for (uint32_t jj = 0; jj < 4; jj++) {
+      const uint32_t j = 4 * h + ((jj + g) & 3u);       // code word j of the group: pairs 2 j, 2 j + 1
+      const F2 p0 = pair(2 * j), p1 = pair(2 * j + 1);
+      cb[8 * g + j] = pack4(p0.a * sc, p0.b * sc, p1.a * sc, p1.b * sc);
+    }
+    if (h == 0) *(volatile uint8_t *)scale_addr = (uint8_t)(e + 127);
+    else asm volatile("nop");
+  } else asm volatile("nop");
+}
+
+// cb_flush for a whole row (groups 0 .. ng - 1), without its per-word a_code divisions: key k's code is at
+// rowb + (k >> tks) TM TK + (k & (TK - 1)), rowb = a_code(.., r, 0), tks = log2 TK (TK a power of two: 256 everywhere)
+static inline void cb_flush_row(volatile __shared uint32_t *cb, uint32_t lane, uint32_t ng, uint32_t rowb,
+                                uint32_t kstep, uint32_t tks, uint32_t TK) {
+  mu_fence_smem();
+  for (uint32_t w = lane; w < ng * 8; w += MU_NUM_THREADS) {
+    const uint32_t k = 4 * w;
+    *(uint32_t *)(rowb + (k >> tks) * kstep + (k & (TK - 1))) = cb[w];
+  }
+  mu_fence_smem();                                       // read before the buffer is rewritten
+}
+
+// SOFTMAX without the soft-cap (every model but Gemma-2): kernel_vla.cpp's layout.  The row stays in the stage as its
+// bf16 S words (the logit s * scale is recomputed in pass 2 instead of staged in fp32: half the SMEM traffic), pass 2
+// leaves e = fexp(z - m) (a bf16) in place, and the codes go through the code buffer cb (cb_flush: coalesced stores)
+// instead of a lane's scattered word stores.  Causal extents: keys of stripes q < nfull (32 q + 31 <= qpos) are all
+// allowed and skip the mask, stripes q >= nany (32 q > qpos) are skipped (e = 0).  Bit-identical P to softmax_phase:
+// the same z, m, e and sum order (a skipped key's e is +0), and quant_group / quant_half reproduce its amax and codes.
+// HALF: rows of <= 8 groups (SK <= 256), two lanes per group.  Cyclotron (smbench/, TinyLlama decode shapes): 1.08x.
+template <bool HALF>
+static void softmax_bf(const volatile uint32_t *d, uint32_t own, uint32_t nown, uint32_t wi, uint32_t nwo,
+                       uint32_t lane, volatile __shared float *red, volatile __shared uint32_t *stage,
+                       volatile __shared uint32_t *cb) {
+  const uint32_t s = d[2], s_bs = d[3], SK = d[4], R = d[5], batch = d[6];
+  const uint32_t pa = d[7], pasc = d[8], pa_bs = d[9], pasc_bs = d[10];
+  const float scale = f_bits(d[11]);
+  const uint32_t P0 = d[12], M = d[13], TM = d[14], TK = d[15], KSp = SK / TK, W = SK / 2, NGT = SK / 32;
+  const uint32_t MTb = R / TM, VR = d[18] ? d[18] : TM;   // d[18]: valid rows per m-tile (decode: Gq of TM)
+  const float NEG = f_bits(0xFF800000u);
+  uint32_t tks = 0;
+  while ((1u << tks) < TK) tks++;
+  for (uint32_t u = own; u < batch * MTb; u += nown) {
+    const uint32_t bt = u / MTb, mt = u % MTb;
+    const uint32_t A = pa + bt * pa_bs, ASC = pasc + bt * pasc_bs;
+    for (uint32_t r = mt * TM + wi; r < mt * TM + VR; r += nwo) {
+      const uint32_t qpos = P0 + r % M;
+      const uint32_t nany = qpos / 32 + 1 < NGT ? qpos / 32 + 1 : NGT;
+      const uint32_t nfull = (qpos + 1) / 32 < nany ? (qpos + 1) / 32 : nany;
+      const uint32_t WA = 16 * nfull, WV = 16 * nany;
+      const uint32_t *S = g32(s + bt * s_bs + r * SK * 2);
+      float m = NEG;
+      for (uint32_t w0 = lane; w0 < WV; w0 += 8 * MU_NUM_THREADS) {  // W is a multiple of 128: w0 + 112 < W
+        uint32_t sv[8];
+#pragma unroll
+        for (uint32_t k = 0; k < 8; k++) sv[k] = S[w0 + k * MU_NUM_THREADS];
+#pragma unroll
+        for (uint32_t k = 0; k < 8; k++) {
+          const uint32_t w = w0 + k * MU_NUM_THREADS;
+          stage[w] = sv[k];
+          if (w < WA) {                                  // warp-uniform: w / 16 is the same for every lane
+            m = __builtin_fmaxf(m, lo(sv[k]) * scale);
+            m = __builtin_fmaxf(m, hi(sv[k]) * scale);
+          } else if (w < WV) {
+            m = __builtin_fmaxf(m, f_bits(sel(bit(2 * w <= qpos), bits_f(lo(sv[k]) * scale), bits_f(NEG))));
+            m = __builtin_fmaxf(m, f_bits(sel(bit(2 * w + 1 <= qpos), bits_f(hi(sv[k]) * scale), bits_f(NEG))));
+          } else asm volatile("nop");
+        }
+      }
+      m = warp_max(red, lane, m);
+      float sum = 0.f;                                   // lane order of the sum as softmax_phase's
+      uint32_t w = lane;
+      for (; w < WA; w += MU_NUM_THREADS) {
+        const uint32_t sv = stage[w];
+        const float ea = fexp_bf(lo(sv) * scale - m), eb = fexp_bf(hi(sv) * scale - m);
+        sum += ea + eb;
+        stage[w] = (bits_f(ea) >> 16) | (bits_f(eb) & 0xFFFF0000u);   // e is a bf16: kept exactly
+      }
+      for (; w < WV; w += MU_NUM_THREADS) {
+        const uint32_t sv = stage[w];
+        const float ea = masked(fexp_bf(lo(sv) * scale - m), bit(2 * w <= qpos));
+        const float eb = masked(fexp_bf(hi(sv) * scale - m), bit(2 * w + 1 <= qpos));
+        sum += ea + eb;
+        stage[w] = (bits_f(ea) >> 16) | (bits_f(eb) & 0xFFFF0000u);
+      }
+      for (; w < W; w += MU_NUM_THREADS) stage[w] = 0u;
+      sum = warp_sum(red, lane, sum);
+      const float inv = 1.0f / sum;
+      mu_fence_smem();                                   // e of every lane in the stage (a lane reads a whole group)
+      auto pv = [&](uint32_t g, uint32_t j) __attribute__((always_inline)) {
+        const uint32_t ev = stage[16 * g + j];
+        return F2{lo(ev) * inv, hi(ev) * inv};
+      };
+      if (HALF) {
+        quant_half([&](uint32_t j) __attribute__((always_inline)) { return pv(lane / 2, j); }, lane, NGT, red, cb,
+                   a_scale(ASC, TM, TK, KSp, r, 32 * (lane / 2)));
+      } else {
+        for (uint32_t g = lane; g < NGT; g += MU_NUM_THREADS)
+          quant_group([&](uint32_t j) __attribute__((always_inline)) { return pv(g, j); }, lane, cb + 8 * g,
+                      a_scale(ASC, TM, TK, KSp, r, 32 * g));
+      }
+      cb_flush_row(cb, lane, NGT, a_code(A, TM, TK, KSp, r, 0), TM * TK, tks, TK);   // its last fence orders the stage reuse
+    }
+  }
+}
+
 // ---- EWQ / SILU: warp per row, a group per warp step ----------------------------------------------
 // EWQ: MX of a bf16 matrix [M][K] (row stride rs elements); SILU: MX(silu(G) * U), G = columns [0, K),
 // U = columns [K, 2K).  Four groups per step so 4 (8) loads per lane are in flight.
@@ -1653,7 +1782,10 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
     // SOFTMAX d[19] = 1 (decode): a unit (one batch's rows, own lines) per warp, its rows in that warp
     const uint32_t sdec = opaque(dsc[19] != 0);
     const uint32_t s_own = sel(sdec, gw, own), s_nown = sel(sdec, ngw, nown), s_wi = sel(sdec, 0u, wi), s_nwo = sel(sdec, 1u, nwo);
-    if (opaque(ty == LL_T_SOFTMAX) & (scap ^ 1u)) softmax_phase<false>(dsc, s_own, s_nown, s_wi, s_nwo, lane, red, stage);
+    const uint32_t tsm = opaque(ty == LL_T_SOFTMAX), shalf = opaque(dsc[4] <= 256);   // SK <= 256: two lanes per group
+    if (tsm & (scap ^ 1u) & (shalf ^ 1u)) softmax_bf<false>(dsc, s_own, s_nown, s_wi, s_nwo, lane, red, stage, sb);
+    else asm volatile("nop");
+    if (tsm & (scap ^ 1u) & shalf) softmax_bf<true>(dsc, s_own, s_nown, s_wi, s_nwo, lane, red, stage, sb);
     else asm volatile("nop");
     if (opaque(ty == LL_T_SOFTMAX) & scap) softmax_phase<true>(dsc, s_own, s_nown, s_wi, s_nwo, lane, red, stage);
     else asm volatile("nop");

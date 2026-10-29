@@ -1,0 +1,28 @@
+[muon]
+num_lanes = 16
+num_warps = 4
+num_cores = 2
+num_regs = 256
+start_pc = 0x10000000
+
+[mem]
+io_cout_addr = 0xFF080000
+io_cout_size = 64
+
+[sim]
+elf = "test/isa-tests/rv32ui-p-add"
+timeout = 400000000
+trace = false
+
+[timing]
+include = [
+  "/scratch/nicolas/chipyard/generators/radiance/cyclotron/config/timing/gmem.toml",
+  "/scratch/nicolas/chipyard/generators/radiance/cyclotron/config/timing/icache.toml",
+  "/scratch/nicolas/chipyard/generators/radiance/cyclotron/config/timing/lsu_scheduler.toml",
+  "/scratch/nicolas/chipyard/generators/radiance/cyclotron/config/timing/smem.toml",
+  "/scratch/nicolas/chipyard/generators/radiance/cyclotron/config/timing/writeback_operand_fetch.toml",
+  "/scratch/nicolas/chipyard/generators/radiance/cyclotron/config/timing/barrier.toml",
+  "/scratch/nicolas/chipyard/generators/radiance/cyclotron/config/timing/fence.toml",
+  "/scratch/nicolas/chipyard/generators/radiance/cyclotron/config/timing/dma_tensor.toml",
+  "/scratch/nicolas/chipyard/generators/radiance/cyclotron/config/timing/execute.toml",
+]
