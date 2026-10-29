@@ -265,7 +265,11 @@ static void phase(const volatile uint32_t *d, uint32_t tid, uint32_t tpb, uint32
     const _Float16 sc = bf((SCB + 0x7FFFu + ((SCB >> 16) & 1u)) >> 16);
     for (uint32_t i = 0; i < QT_C; i++) {
       const uint32_t q0 = (tile(i) % (SQ / QT)) * QT;
-      _Float16 m = bf(0xFF80u);
+      // bf16 -inf through opaque(): clang types _Float16 as IEEE half, where 0xFF80 is a NaN, so with NB a compile-time
+      // constant (loop fully unrolled) it folded every `bm > m` to false and stored the constant 0xFF800000 (-inf) as
+      // each row's max, discarding row_max (softmax with m = -inf: e^(s - m) = inf, l = inf, O * (1 / l) = 0).  fa_phase.h
+      // only escaped through its runtime NB (m a loop phi)
+      _Float16 m = bf(opaque(0xFF80u));
       for (uint32_t j = 0; j < NB; j++) {
         fa_bar(BAR_S, 5);
         const _Float16 bm = fa::row_max(row, lane, SP[j & 1], j * BK + BK - 1 > P0 + q0,

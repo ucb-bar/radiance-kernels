@@ -34,6 +34,17 @@ constexpr uint32_t WARPS = MU_NUM_CORES * NIGHTLY_OCC;   // warps per cluster
 constexpr uint32_t NC = NIGHTLY_CLUSTERS;
 constexpr uint32_t PB_GO = 20, PB_DONE = 21;            // printBuf slots of the phase handshake
 constexpr uint32_t BAR_PH = 1;
+// Phase epilogue (LL_PH_FENCE_PER_CORE, default 1): barrier, then ONE full fence per core (warps 0 .. cores-1; warp w
+// runs on core w % cores) while every sibling warp sits idle in the barrier, then a second barrier (BAR_FL) before the
+// lead posts DONE.  The old epilogue had all 8 warps issue `fence` while their siblings were still storing, i.e. the
+// "fence from every warp under store traffic" pattern behind the SFU / L0d flush fixes (radiance FIX 4 / 7 / 10); suspected:
+// a fence that never completes leaves its warp out of the barrier and the cluster never posts DONE (SmolVLA 2 SM 1025,
+// Gemma-2 4 SM decode phase 497).  A core's fence waits for that core's global + shared queues and in-flight lane
+// requests, so it covers every warp of the core (nightly_kernel_end relies on the same).  0 = the old epilogue (A/B).
+#ifndef LL_PH_FENCE_PER_CORE
+#define LL_PH_FENCE_PER_CORE 1
+#endif
+constexpr uint32_t BAR_FL = 13;                          // phase epilogue, after the per-core fences
 constexpr uint32_t RED_SM = 0x1C000;                     // per-warp 64 B reduction buffers (above the GEMM map)
 
 static_assert(WARPS * 64 + RED_SM <= 0x20000, "SMEM budget");
@@ -1679,11 +1690,21 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
 #if defined(LL_DROPE_DBG) && LL_DROPE_DBG
     dbg_put(warp, dbn_e, 13, p, 0, 0);
 #endif
+#if LL_PH_FENCE_PER_CORE
+    bar(BAR_PH, warps);                                  // every warp's stores are issued
+    if (opaque(warp < MU_NUM_CORES)) mu_fence();         // one write-back per core, its other warps idle
+    else asm volatile("nop");
+#if defined(LL_DROPE_DBG) && LL_DROPE_DBG
+    dbg_put(warp, dbn_e, 14, p, 0, 0);
+#endif
+    bar(BAR_FL, warps);                                  // both cores' fences done before DONE
+#else
     mu_fence();                                          // this thread's stores have landed
 #if defined(LL_DROPE_DBG) && LL_DROPE_DBG
     dbg_put(warp, dbn_e, 14, p, 0, 0);
 #endif
     bar(BAR_PH, warps);
+#endif
     if (lead) {
       perf[(p * NC + tb) * 16 + 1] = nightly_mcycle();
 #if defined(LL_FA_PROF) && LL_FA_PROF

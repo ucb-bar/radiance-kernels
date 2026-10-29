@@ -274,6 +274,9 @@ def main():
     ap.add_argument("--model", default="smolvla")
     ap.add_argument("--out", default="data")
     ap.add_argument("--header", default="llama_data.h")
+    ap.add_argument("--layers", type=int, default=None,
+                    help="truncate the stacks to N layers each, as gen_vla.py --layers (N >= 2 keeps a cross-attention "
+                         "layer); the fp32 reference is then the numpy pipeline instead of lerobot")
     a = ap.parse_args()
     samples = []
     R = None
@@ -282,6 +285,9 @@ def main():
         Rb = gv.load_reference(seed=b, policy=R["policy"] if R else None)
         if R is None:
             R = Rb
+            if a.layers:
+                for k in ("n_vision", "n_text", "n_expert"):
+                    R[k] = min(R[k], a.layers)
         else:   # same weights and instruction: keep sample 0's dict, this sample's inputs and reference
             R = dict(R)
             for k in ("images", "state", "noise", "actions"):
@@ -289,9 +295,11 @@ def main():
         del Rb
         emu = gv.forward(R, q=True)
         gv.VTRACE.clear()                                   # vision layer-0 traces (gen_vla.py's checks), not used here
-        gv.compare(f"sample {b} actions (emulation vs lerobot)", emu["actions"], R["actions"])
+        ref = gv.forward(R, q=False)["actions"] if a.layers else R["actions"]   # truncated: no lerobot model to match
+        gv.VTRACE.clear()
+        gv.compare(f"sample {b} actions (emulation vs {'fp32 numpy' if a.layers else 'lerobot'})", emu["actions"], ref)
         samples.append(dict(caches=emu["caches"], cross=emu["cross"], noise=R["noise"], x1=emu["x"][1],
-                            actions=emu["actions"], ref_actions=R["actions"]))
+                            actions=emu["actions"], ref_actions=ref))
         assert emu["Lv"] == 192 + len(R["lang_ids"]) + 1
     build(R, samples, a.out, a.header)
 

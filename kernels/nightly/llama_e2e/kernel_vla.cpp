@@ -35,6 +35,17 @@ constexpr uint32_t WARPS = MU_NUM_CORES * NIGHTLY_OCC;   // warps per cluster
 constexpr uint32_t NC = NIGHTLY_CLUSTERS;
 constexpr uint32_t PB_GO = 20, PB_DONE = 21;            // printBuf slots of the phase handshake
 constexpr uint32_t BAR_PH = 1;
+// Phase epilogue (LL_PH_FENCE_PER_CORE, default 1): barrier, then ONE full fence per core (warps 0 .. cores-1; warp w
+// runs on core w % cores) while every sibling warp sits idle in the barrier, then a second barrier (BAR_FL) before the
+// lead posts DONE.  The old epilogue had all 8 warps issue `fence` while their siblings were still storing, i.e. the
+// "fence from every warp under store traffic" pattern behind the SFU / L0d flush fixes (radiance FIX 4 / 7 / 10); suspected:
+// a fence that never completes leaves its warp out of the barrier and the cluster never posts DONE (SmolVLA 2 SM 1025,
+// Gemma-2 4 SM decode phase 497).  A core's fence waits for that core's global + shared queues and in-flight lane
+// requests, so it covers every warp of the core (nightly_kernel_end relies on the same).  0 = the old epilogue (A/B).
+#ifndef LL_PH_FENCE_PER_CORE
+#define LL_PH_FENCE_PER_CORE 1
+#endif
+constexpr uint32_t BAR_FL = 13;                          // phase epilogue, after the per-core fences
 constexpr uint32_t RED_SM = 0x1C000;                     // per-warp 64 B reduction buffers (above the GEMM map)
 
 static_assert(WARPS * 64 + RED_SM <= 0x20000, "SMEM budget");
@@ -1217,8 +1228,11 @@ static void rope_fused(const volatile uint32_t *d, uint32_t tb, uint32_t warp, u
 
 // ---- SOFTMAX: warp per row, causal, normalized, MX --------------------------------------------------
 static inline float masked(float v, uint32_t valid) { return f_bits(bits_f(v) & mask_if(valid)); }
-// unit = (head group, m-tile, k-step): the k-step's P codes and scale lines.  Each unit computes its rows' full max
-// and sum itself (KS-fold extra reads).  CAP (Gemma-2): logits soft-capped, cap tanh(S scale / cap), d[16] scale / cap,
+// unit = (head group, m-tile): every k-step of its rows (kernel.cpp's SOFTMAX: the old (head group, m-tile, k-step)
+// unit recomputed each row's max and sum per k-step).  The sum pass leaves each masked e = fexp(z - m) (a bf16) in the
+// row's stage word in place of S (a lane rewrites only its own words), so the output pass does not evaluate the logit
+// and fexp again: the same operations and order as before, bit-identical P (a masked e is +0, and 0 * inv = +0: key 0
+// is always allowed, so sum > 0).  CAP (Gemma-2): logits soft-capped, cap tanh(S scale / cap), d[16] scale / cap,
 // d[17] cap.
 template <bool CAP>
 static inline float sm_logit(float s, float scale, float k1, float cap) { return CAP ? cap * tanh_f(s * k1) : s * scale; }
@@ -1229,11 +1243,11 @@ static void softmax_phase(const volatile uint32_t *d, uint32_t own, uint32_t now
   const uint32_t s = d[2], s_bs = d[3], SK = d[4], R = d[5], batch = d[6];
   const uint32_t pa = d[7], pasc = d[8], pa_bs = d[9], pasc_bs = d[10];
   const float scale = f_bits(d[11]), k1 = f_bits(d[16]), cap = f_bits(d[17]);
-  const uint32_t P0 = d[12], M = d[13], TM = d[14], TK = d[15], KSp = SK / TK, W = SK / 2, GS = TK / 32;
+  const uint32_t P0 = d[12], M = d[13], TM = d[14], TK = d[15], KSp = SK / TK, W = SK / 2, NGT = SK / 32;
   const uint32_t MTb = R / TM;
   const float NEG = f_bits(0xFF800000u);
-  for (uint32_t u = own; u < batch * MTb * KSp; u += nown) {
-    const uint32_t bt = u / (MTb * KSp), mt = (u / KSp) % MTb, ks = u % KSp;
+  for (uint32_t u = own; u < batch * MTb; u += nown) {
+    const uint32_t bt = u / MTb, mt = u % MTb;
     const uint32_t A = pa + bt * pa_bs, ASC = pasc + bt * pasc_bs;
     for (uint32_t rb = mt * TM + 4 * wi; rb < (mt + 1) * TM; rb += 4 * nwo) {
       for (uint32_t rr = 0; rr < 4; rr++) {
@@ -1263,19 +1277,19 @@ static void softmax_phase(const volatile uint32_t *d, uint32_t own, uint32_t now
         float sum = 0.f;
         for (uint32_t w = lane; w < W; w += MU_NUM_THREADS) {
           const uint32_t sv = stage[w];
-          sum += masked(fexp_bf(sm_logit<CAP>(lo(sv), scale, k1, cap) - m), ok(2 * w)) +
-                 masked(fexp_bf(sm_logit<CAP>(hi(sv), scale, k1, cap) - m), ok(2 * w + 1));
+          const float ea = masked(fexp_bf(sm_logit<CAP>(lo(sv), scale, k1, cap) - m), ok(2 * w));
+          const float eb = masked(fexp_bf(sm_logit<CAP>(hi(sv), scale, k1, cap) - m), ok(2 * w + 1));
+          sum += ea + eb;
+          stage[w] = (bits_f(ea) >> 16) | (bits_f(eb) & 0xFFFF0000u);   // e is a bf16: kept exactly
         }
         sum = warp_sum(red, lane, sum);
         const float inv = 1.0f / sum;
-        for (uint32_t gi = 0; gi < GS; gi++) {          // this k-step's groups: keys 32 g .., words 16 g + lane
-          const uint32_t g = ks * GS + gi, w = g * 16 + lane, sv = stage[w];
-          const float p0 = masked(fexp_bf(sm_logit<CAP>(lo(sv), scale, k1, cap) - m) * inv, ok(2 * w));
-          const float p1 = masked(fexp_bf(sm_logit<CAP>(hi(sv), scale, k1, cap) - m) * inv, ok(2 * w + 1));
-          mx_group2(red, cw, lane, p0, p1, a_code(A, TM, TK, KSp, r, g * 32), sb + gi, rr);
+        for (uint32_t g = 0; g < NGT; g++) {            // every group of the row: keys 32 g .., words 16 g + lane
+          const uint32_t ev = stage[g * 16 + lane];
+          mx_group2(red, cw, lane, lo(ev) * inv, hi(ev) * inv, a_code(A, TM, TK, KSp, r, g * 32), sb + g, rr);
         }
       }
-      sb_flush(sb, lane, GS, ks * GS, ASC, TM, TK, KSp, rb);
+      sb_flush(sb, lane, NGT, 0, ASC, TM, TK, KSp, rb);
     }
   }
 }
@@ -1624,8 +1638,15 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
     else asm volatile("nop");
     if (opaque(ty == LL_T_ACT) & opaque(akind == 1)) act_phase<1>(dsc, gw, ngw, lane);
     else asm volatile("nop");
+#if LL_PH_FENCE_PER_CORE
+    bar(BAR_PH, warps);                                  // every warp's stores are issued
+    if (opaque(warp < MU_NUM_CORES)) mu_fence();         // one write-back per core, its other warps idle
+    else asm volatile("nop");
+    bar(BAR_FL, warps);                                  // both cores' fences done before DONE
+#else
     mu_fence();                                          // this thread's stores have landed
     bar(BAR_PH, warps);
+#endif
     if (lead) {
       perf[(p * NC + tb) * 16 + 1] = nightly_mcycle();
       mu_fence();

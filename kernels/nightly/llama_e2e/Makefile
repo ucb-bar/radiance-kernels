@@ -17,6 +17,7 @@
 #                                          (gen_vla.py; checked against lerobot in fp32 and a device emulation)
 #   TAG=l1 ARGS="--layers 1"               a variant (own data dir and ELF name: llama_e2e_<MODEL>_<TAG>)
 #   make ladder                            the FireSim test ladder (see the ladder target)
+#   make regress                           the 1-layer regression suite (regress.py)
 # e.g. Llama-7B, 1 layer + LM head on 2 or 4 clusters (FireSimE4M3MxGemmini{Two,Four}ClusterHBMRadianceConfig):
 #   make MODEL=llama7b TAG=l1 ARGS="--layers 1" SMS="2 4"  ->  build/{2,4}sm/llama_e2e_llama7b_l1.soc.elf
 # The host prints per-phase cycles, mesh_util_model and PASS/FAIL, then exits through HTIF.
@@ -69,4 +70,11 @@ ladder:
 	$(MAKE) MODEL=llama7b TAG=l2 ARGS="--layers 2"
 	$(MAKE) MODEL=tinyllama
 	$(MAKE) MODEL=llama7b
-.PHONY: ladder
+
+# Regression suite (regress.py): every model at 1 layer (SmolVLA 2) for prefill, decode and speculative verify, checked
+# offline; `regress.py jobs` writes the FireSim jobs file, `regress.py report` scales the results to the full models.
+#   make regress PY=<llm python> REGRESS_VLA_PY=<smolvla python> [SMS="1 2 4"]
+REGRESS_VLA_PY ?= $(PY)
+regress:
+	python3 regress.py build --sms "$(SMS)" --py $(PY) --vla-py $(REGRESS_VLA_PY)
+.PHONY: ladder regress

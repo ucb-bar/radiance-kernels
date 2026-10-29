@@ -44,14 +44,16 @@ make MODEL=deepseek TAG=l1 ARGS="--layers 1" SMS=1 PY=...    # variant: llama_e2
 
 Useful generator options (`ARGS=`): `--layers N`, `--check-l0` (report-only layer-0 stage checks),
 `--fa-exact {0,1}`, `--fa-impl {standalone,port}` (attention: `fa_sa.h` / `fa_sa256.h`, the standalone flash-attention
-kernel with O fused into oproj's operand, the default; DeepSeek's exact-max attention stays on `fa_phase.h`),
+kernel with O fused into oproj's operand, the default for every model),
 `--lm-chunks N`, `--spread S` (random models: MX scales that vary like real data),
 `--fa-dump` with `DEFS=-DLL_FA_DUMP=1` (dump and check one attention tile stage by stage).
 `DEFS=-DLL_FA_PROF=1` adds per-role cycle totals of the attention phase (`fa_prof` lines).
 
 The host prints `PASS` / `FAIL`; tolerances are relative Frobenius errors from FireSim runs plus margin (the fp8
 format alone puts the emulation 5 - 10 % from fp32 on the LLM hidden states and 38 / 23 / 7.7 % on SmolVLA's vision /
-prefix / actions; the MX Gemmini's reduced-precision accumulation adds a few percent).
+prefix / actions; the MX Gemmini's reduced-precision accumulation adds a few percent).  The gates are calibrated on
+the full models; a truncated SmolVLA (`--layers`) lands farther from the emulation on the actions (20 % at 2 layers), so
+its actions gates are 30 % instead of 18 %.
 
 ## Decode (`DECODE=1`)
 
@@ -71,13 +73,57 @@ Batch-16 decode after the prefill's context: `make DECODE=1 MODEL=<model> SMS="1
 
 The host prints `decode: batch= steps= cycles_per_step=` next to the usual per-phase table.
 
+## Offline checks (`LL_OFFLINE`, default off)
+
+The Rocket host has no FPU and reads GPU DRAM slowly: checking a 152k-word vocabulary on it took longer than the model.
+So after the per-phase report the host writes every checked device buffer to files on the simulation host
+(`lldump.txt` + `lldump_<i>.bin` in the FireSim sim slot, through fesvr's `openat` / `write` proxy) and prints
+`OFFLINE_DUMP ok`; `check_offline.py <dump dir> <soc.elf>` runs the same checks on x86 (bit-identical arithmetic to the
+host's `nh_compare_bf16`, golden data from the `.radiance.elf` next to the `.soc.elf`).  `run_all_profiling.py` moves
+the dump to `<log>.dump/`, runs the checker and records its PASS / FAIL.  If the host cannot create a file it checks on
+the host as before.
+
+Off by default (`DEFS=-DLL_OFFLINE=1` enables it): on FireSim fesvr reads target memory over serial TSI, 1 KiB per
+round trip and one round trip per tsibridge step (`+fesvr-step-size`, default 2,004,765 target cycles), so the dump runs
+at well under 2 KB/s; the first 1 MiB write of the l1 suite did not finish in 10 minutes.  It works under spike.
+
+## Regression suite (`make regress`, `regress.py`)
+
+Every model shortened to 1 layer (SmolVLA 2: one self- and one cross-attention expert layer) for prefill, decode and
+speculative verify (Llama-7B, T = 4), at 1 / 2 / 4 SM; minutes per run instead of hours.
+
+```
+make regress PY=<llm python> REGRESS_VLA_PY=<smolvla python>   # build every variant
+python3 regress.py jobs                                        # -> /scratch/nicolas/firesim-rundir/regress-jobs.yaml
+python3 regress.py report [--since RUN_ID]                     # latest result per variant, scaled to the full model
+```
+
+`scale_report.py` scales a short run's per-op cycles by layer count (per stack for SmolVLA) to the full model; against
+the full runs it is within ~1 % (TinyLlama, Llama-7B, Gemma-2 at 1 / 2 / 4 SM: `scale_report.py --validate SHORT:FULL`).
+The real-weight variants add `--check-l0` (report-only layer-0 stage checks) and `--exact-emu`.
+
+## Exact emulation (`--exact-emu`, `emu_exact.py`, `muon_fp.py`)
+
+`emulate()` approximates the device (float GEMMs, numpy reductions, an ideal exp, softmax normalized before PV), so the
+checks only gate gross failures.  `--exact-emu` (prefill, `fa_sa.h` models, not Gemma-2) follows the device instead:
+GEMMs through `mx_golden` (parallel over output columns), the PRENORM sums in the kernel's lane order (2 / 4 SM; at 1 SM
+the norm after oproj / down is fused into the GEMM and sums in another order), and `fa_sa.h`'s softmax with
+`muon_fp.fexp_bf16`, a bit-level model of the fpEX unit (it reproduces the wrap below x ~ -355).  The goldens it gives
+match the device bit for bit: TinyLlama and DeepSeek at 1 layer, every `--check-l0` stage of layer 0, the hidden state and
+the logits, at 1 / 2 / 4 SM (runs 689 - 698).  The gates stay at their old values, so they pass either way.
+
 ## Known issues
 
-- **SmolVLA prefill at 2 SM is unstable.**  The plain build (`TAG=vsa`, fa_sa_vla.h) hangs deterministically on FireSim
-  at cycle 10,308,501,632 (runs 649 / 676): phase 1025, the action expert's SOFTMAX in denoise step 2, layer 5, with
-  cluster 0 not finishing.  Builds with per-warp progress probes in that phase complete and pass (runs 679 / 684, 2.71 G
-  model cycles), so it looks like a timing race in that phase or its hand-off to the next, not a logic error.  1 and 4
-  SM pass.  Treat 2 SM SmolVLA numbers as coming from a probe build.
+- **SmolVLA prefill at 2 SM was unstable.**  The plain build (`TAG=vsa`, fa_sa_vla.h) hangs deterministically on
+  FireSim at cycle 10,308,501,632 (runs 649 / 676): phase 1025, the action expert's SOFTMAX in denoise step 2, layer 5,
+  with cluster 0 not finishing.  Builds with per-warp progress probes in that phase complete and pass (runs 679 / 684,
+  2.71 G model cycles), so it is a timing race, not a logic error.  1 and 4 SM pass.  The same signature (a cluster
+  never posts DONE, at one exact cycle; probe builds pass) hung Gemma-2 4 SM decode (570 / 595) and Llama-7B T = 4 at
+  1 SM (628).  Suspected: the phase epilogue, where all 8 warps issued `fence` while their siblings were still storing
+  (the pattern behind the RTL's SFU / L0d flush fixes).  Fix candidate, unconfirmed: `LL_PH_FENCE_PER_CORE` (default
+  1): barrier, one fence per core, barrier (as `nightly_kernel_end`); `=0` restores the old epilogue for an A/B.  The
+  A/B (2026-10-28) was inconclusive: both passed (old epilogue run 701, fix 703, with the new expert softmax), so the
+  race stayed hidden; the fix is kept as the default.
 
 ## Device pitfalls found while bringing these up
 
@@ -88,6 +134,10 @@ The host prints `decode: batch= steps= cycles_per_step=` next to the usual per-p
   while the callee reads them at scaled ones: the 10th argument and later arrive stale.  Use `always_inline`.
 - **Sub-word stores to DRAM are unreliable.**  A lane's byte store into a shared word lost bytes (the K^T cache append),
   and the Q scale bytes of Gemma-2's 4-cluster decode hung the DROPE phase.  Stage bytes in SMEM and store whole words.
+- **clang types `_Float16` as IEEE half; only the hardware runs it as bf16.**  A bf16 constant like `bf(0xFF80)` (-inf)
+  is a NaN to the optimizer, so with a fully unrolled loop it folded every `x > m` to false: fa_sa.h's exact-max
+  pre-pass stored -inf as each row's max (DeepSeek yattn 100 % off, runs 664 / 668).  Pass such constants through
+  `opaque()`.
 - **`fexp.h` wraps for x below about -355** (no underflow check in the fixed-point path): clamp its argument.
 - **Per-cluster state must not be a shared global** (each cluster's GEMM thread kept its own accumulator half).
 - **The Rocket host has no FPU enabled** (`soc/start.S`): host code must stay integer-only.

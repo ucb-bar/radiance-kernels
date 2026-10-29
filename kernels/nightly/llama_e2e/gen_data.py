@@ -627,10 +627,14 @@ def main():
                     help="at least this many LM-head column chunks (each its own GEMM phase; default: by size)")
     ap.add_argument("--fa-exact", choices=["auto", "0", "1"], default="auto",
                     help="ATTN max: 1 = the exact-max pre-pass, 0 = key block 0's max, auto = the model's setting")
+    ap.add_argument("--exact-emu", action="store_true",
+                    help="emulate in the device's own arithmetic (emu_exact.py: mx_golden GEMMs, fa_sa.h's softmax with "
+                         "the fpEX model, the kernels' reduction orders) for bit-exact goldens; slow (parallel "
+                         "mx_golden), for short models; 2 / 4-cluster norm order; not Gemma-2")
     ap.add_argument("--fa-impl", choices=["auto", "standalone", "port"], default="auto",
                     help="ATTN phase: standalone = fa_sa.h (nightly/fa_mxfp8_sr: compile-time shapes, block-0 max or "
                          "the exact-max pre-pass, O fused into oproj's operand), port = fa_phase.h (runtime shapes, "
-                         "same options); auto = standalone, port for exact-max models (DeepSeek)")
+                         "same options); auto = standalone")
     ap.add_argument("--fa-dump", action="store_true",
                     help="build with -DLL_FA_DUMP=1: cluster 0 dumps layer 0's ATTN tile 0 (head 0, rows 0..63): S, P "
                          "per key block, m, l, unnormalized O; the host compares them with the emulation's (report only)")
@@ -673,9 +677,9 @@ def main():
         "P0 >= 128, Hq M / 64 % 4 == 0 and <= 64, no cap (or hd 256 + cap: >= 6 64-key blocks, Hq M / 32 % 4 == 0)"
     assert not (fa and a.debug_l0), "--debug-l0 checks the qk / softmax / pv phases"
     fa256 = fa and hd == 256                             # fa_sa256.h
-    # auto: fa_sa.h, except exact-max models (DeepSeek), which keep fa_phase.h: fa_sa.h's exact-max pre-pass gives wrong
-    # attention outputs on FireSim (2-layer DeepSeek runs 664 / 668: yattn 100 % off; fa_phase.h passes, run 663)
-    sa = fa and not fa256 and (a.fa_impl == "standalone" or (a.fa_impl == "auto" and not cfg.get("fa_exact")))
+    # auto: fa_sa.h for every model (its exact-max pre-pass lost the row maxima to a constant fold before the
+    # opaque() fix in fa_sa.h: DeepSeek runs 664 / 668, yattn 100 % off); port = fa_phase.h
+    sa = fa and not fa256 and a.fa_impl != "port"
     assert not (sa and a.fa_dump), "fa_sa.h: no --fa-dump"
     assert not (fa256 and a.fa_dump), "fa_sa256.h: no --fa-dump"
     fa_qt = FA256_QT if fa256 else FA_QT                 # ATTN query tile: Q scale layout (ROPE TM, d[24])
@@ -789,7 +793,12 @@ def main():
     emu = None
     if mdl is not None and not a.no_emulate:
         print("emulating the quantized pipeline ...", flush=True)
-        emu = emulate(cfg, M, P0, mdl, qw, cos, sin, fa=fa, ilv=fuse)
+        if a.exact_emu:
+            assert sa, "--exact-emu models fa_sa.h (not fa_phase.h / fa_sa256.h)"
+            import emu_exact
+            emu = emu_exact.emulate_exact(sys.modules[__name__], cfg, M, P0, mdl, qw, cos, sin, ilv=fuse)
+        else:
+            emu = emulate(cfg, M, P0, mdl, qw, cos, sin, fa=fa, ilv=fuse)
     gold = {}
     fdg = {}
     if emu is not None and a.fa_dump and fa:            # --fa-dump goldens: head 0, rows 0..63
