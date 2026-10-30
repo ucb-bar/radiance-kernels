@@ -29,7 +29,7 @@ Models:
              this quantized pipeline; top-1 agreement.
   llama7b    Llama-2-7B shapes, SYNTHETIC: random weights filled on the device before timing (one layer's
              weights shared by all 32 layers, one KV cache shared by all layers).  Performance only.
-  deepseek   DeepSeek-R1-Distill-Qwen-1.5B (Qwen2: q/k/v biases, added as the fused ROPE stages Q, K, V), REAL
+  deepseek   DeepSeek-R1-Distill-Qwen-1.5B (Qwen2: q/k/v biases, added as the ROPE phase stages Q, K, V), REAL
              weights; checked like tinyllama.  Uses regions 0 and 4 (nearly all 2 GiB).
   gemma2     Gemma-2-2B shapes and math, SYNTHETIC like llama7b (2.6 GB of fp8 weights do not fit 2 GiB): head dim
              256, GeGLU (tanh GELU), a post-norm on each residual branch (norm1 / norm2 / final normalize the branch
@@ -71,7 +71,7 @@ MODELS = {
     "smoke": dict(D=256, F=512, Hq=4, Hkv=2, hd=64, L=2, V=512, eps=1e-5, theta=10000.0, kind="random"),
     # smallest model with the ATTN (flash attention) phase: hd 128, >= 6 key blocks (use --ctx 768)
     "fasmoke": dict(D=256, F=512, Hq=2, Hkv=2, hd=128, L=1, V=512, eps=1e-5, theta=10000.0, kind="random"),
-    # the deepseek path (ATTN + fused ROPE with q/k/v biases) and the gemma2 path (hd 256, post-norms, GeGLU, caps)
+    # the deepseek path (ATTN + ROPE with q/k/v biases) and the gemma2 path (hd 256, post-norms, GeGLU, caps)
     "qwensmoke": dict(D=256, F=512, Hq=2, Hkv=2, hd=128, L=2, V=512, eps=1e-6, theta=10000.0, kind="random",
                       bias=True, ctx=768, fa_exact=True),
     # DeepSeek's attention shape on random weights: 12 query heads over 2 KV heads, hd 128, biases, exact max
@@ -635,6 +635,11 @@ def main():
                     help="ATTN phase: standalone = fa_sa.h (nightly/fa_mxfp8_sr: compile-time shapes, block-0 max or "
                          "the exact-max pre-pass, O fused into oproj's operand), port = fa_phase.h (runtime shapes, "
                          "same options); auto = standalone")
+    ap.add_argument("--rope-fuse", choices=["auto", "on", "off"], default="auto",
+                    help="hd 128 prefill: run ROPE on the qkv GEMM's worker warps as its tiles land (on) or as its own "
+                         "phase after it (off: rope_fast.h, units owned by a core and split over its warps); auto = off, "
+                         "except q/k/v biases with a token range not 64-aligned (FireSim: off is 4-9 %% faster at 2 / 4 "
+                         "SM, the fused GEMM ran at 18-26 %% mesh; DeepSeek also wins at 1 SM, Llama-7B loses 1.8 %%)")
     ap.add_argument("--fa-dump", action="store_true",
                     help="build with -DLL_FA_DUMP=1: cluster 0 dumps layer 0's ATTN tile 0 (head 0, rows 0..63): S, P "
                          "per key block, m, l, unnormalized O; the host compares them with the emulation's (report only)")
@@ -686,10 +691,13 @@ def main():
     NBk = SK // FA_BK
     # SILU fused into the gateup GEMM (with the ATTN path; not Gemma-2: its post-norms need the unfused PRENORM)
     fuse = fa and not gemma
-    fuse_rope = fuse and hd == 128                       # ROPE fused into the qkv GEMM (its units are hd 128)
+    aligned = P0 % 64 == 0 and M % 64 == 0               # rope_fast.h's K units: 64-token blocks
+    # ROPE fused into the qkv GEMM (its units are hd 128); auto: only where the unfused phase cannot add the biases
+    fuse_rope = fuse and hd == 128 and (a.rope_fuse == "on" or (a.rope_fuse == "auto" and bias and not aligned))
     assert not fuse or (F % TK == 0 and (2 * F // TN) % 8 == 0 and M % 32 == 0 and M <= 256)
-    # the q/k/v bias is added by the fused ROPE units (ATTN path); Gemma-2's post-norms need the unfused PRENORM
-    assert not bias or fuse_rope, "q/k/v biases need the fused ROPE (ATTN path, hd 128, --ctx >= 768)"
+    # the q/k/v bias (and key centering) is added by the fused ROPE units or rope_fast.h (64-aligned token range);
+    # Gemma-2's post-norms need the unfused PRENORM
+    assert not bias or fuse_rope or aligned, "q/k/v biases: fused ROPE or 64-aligned tokens"
     assert not (gemma and fuse), "Gemma-2 post-norms: unfused PRENORM only"
     assert not a.debug_l0 or not (bias or gemma), "--debug-l0 covers the Llama path only"
 

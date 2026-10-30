@@ -818,58 +818,6 @@ static void rope_qk(const volatile uint32_t *d, uint32_t own, uint32_t nown, uin
   }
 }
 #include "rope_fast.h"
-// V: warp per (KV head, 32 keys); lane per column dd = 16 i + lane, amax over the 32 keys is lane-local.  The 32 x 16
-// code bytes of a column chunk go through the warp's stage (one word per byte), then lanes store whole words.
-template <bool BIAS = false>
-static void rope_v(const volatile uint32_t *d, uint32_t gw, uint32_t ngw, uint32_t lane, volatile __shared uint32_t *stage) {
-  const uint32_t qkv = d[2], NQKV = d[3], Hq = d[4], Hkv = d[5], hd = d[6], bias = d[27];
-  const uint32_t vb = d[17], vsc = d[18], vb_bs = d[19], vsc_bs = d[20];
-  const uint32_t P0 = d[21], M = d[22], SK = d[23], fal = d[25];
-  const uint32_t Dq = Hq * hd, Dkv = Hkv * hd, KSv = SK / 256;
-  const uint32_t SB = d[31] ? d[31] : M;                 // d[31]: rows per sample (batched expert, rope_fast.h)
-  for (uint32_t it = gw; it < Hkv * (M / 32); it += ngw) {
-    const uint32_t h = it / (M / 32), tg = it % (M / 32), key0 = P0 + (tg * 32) % SB, hb = ((tg * 32) / SB) * Hkv + h;
-    for (uint32_t d0 = 0; d0 < hd; d0 += MU_NUM_THREADS) {
-      const uint32_t dd = d0 + lane;
-      const uint16_t *src = (const uint16_t *)(qkv + ((tg * 32) * NQKV + Dq + Dkv + h * hd + dd) * 2);
-      uint32_t v[32];
-#pragma unroll
-      for (uint32_t k = 0; k < 32; k++) v[k] = src[k * NQKV];
-      if (BIAS) {   // the column's bias, bf16(v + b) as in rope_row
-        const float b = bfv(((const uint16_t *)bias)[Dq + Dkv + h * hd + dd]);
-#pragma unroll
-        for (uint32_t k = 0; k < 32; k++) v[k] = bf16(bfv(v[k]) + b);
-      }
-      float amax = 0.f;
-#pragma unroll
-      for (uint32_t k = 0; k < 32; k++) amax = __builtin_fmaxf(amax, fabs_(bfv(v[k])));
-      const int32_t e = block_exp(amax);
-      const float sc = pow2_neg(e);
-#pragma unroll
-      for (uint32_t k = 0; k < 32; k++) stage[k * 16 + lane] = fp8(bfv(v[k]) * sc);
-      stage[512 + lane] = (uint32_t)(e + 127);
-      mu_fence_smem();
-      // 32 keys x 16 bytes = 128 words: lane writes words lane + 16 j (key (lane + 16 j) / 4, bytes 4 ((lane + 16 j) % 4))
-      // ATTN layout: V [SK][hd], scales [SK/128][128/32][hd]; else the pretiled PV B operand
-      const uint32_t blk = vb + hb * vb_bs + ((key0 / 256) * (hd / 64) + d0 / 64) * 256 * 64 + d0 % 64;
-#pragma unroll
-      for (uint32_t j = 0; j < 8; j++) {
-        const uint32_t w = lane + 16 * j, k = w / 4, b0 = (w % 4) * 4;
-        const uint32_t dst = fal ? vb + hb * vb_bs + (key0 + k) * hd + d0 + b0 : blk + ((key0 + k) % 256) * 64 + b0;
-        *(uint32_t *)dst = stage[k * 16 + b0] | (stage[k * 16 + b0 + 1] << 8) | (stage[k * 16 + b0 + 2] << 16) |
-                           (stage[k * 16 + b0 + 3] << 24);
-      }
-      const uint32_t sdst = fal ? vsc + hb * vsc_bs + (key0 / 128) * 4 * hd + ((key0 % 128) / 32) * hd + d0
-                                : vsc + hb * vsc_bs + ((d0 / 64) * KSv + key0 / 256) * 8 * 64 + ((key0 % 256) / 32) * 64 + d0 % 64;
-      if (lane < 4)
-        *(uint32_t *)(sdst + 4 * lane) = stage[512 + 4 * lane] | (stage[512 + 4 * lane + 1] << 8) |
-                                         (stage[512 + 4 * lane + 2] << 16) | (stage[512 + 4 * lane + 3] << 24);
-      else asm volatile("nop");
-      mu_fence_smem();                                   // reads done before the next chunk rewrites the stage
-    }
-  }
-}
-
 // ---- ROPE for the ATTN layout (hd = 128), lane per group -------------------------------------------------------
 // Q unit = (token, HC heads): the heads' bf16 inputs and the token's cos / sin staged in SMEM, a lane quantizes whole
 // groups, codes go out through the code buffer.  K unit = (KV head, 64-key block): 4 keys per step (16 groups), codes
@@ -1667,12 +1615,12 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
     const uint32_t rfast = opaque(ty == LL_T_ROPE) & opaque(dsc[21] % 64 == 0) & opaque(dsc[22] % 64 == 0);
     if (r64 & (rb ^ 1u) & (rka ^ 1u) & (rfast ^ 1u)) rope_qk<2>(dsc, own, nown, wi, nwo, lane, red, cw);
     else asm volatile("nop");
-    if (r64 & (rb ^ 1u) & (rka ^ 1u) & rfast) rope_qk_fast<2, false, true>(dsc, gw, ngw, lane, stage);
+    if (r64 & (rb ^ 1u) & (rka ^ 1u) & rfast) rope_qk_fast<2, false, true>(dsc, own, nown, wi, nwo, lane, stage);
     else asm volatile("nop");
     const uint32_t nrot = opaque(dsc[28] != 0);           // hd 64, no rotation (SigLIP): rope_qk_norot
     if (r64 & rb & (nrot ^ 1u)) rope_qk<2, true>(dsc, own, nown, wi, nwo, lane, red, cw);
     else asm volatile("nop");
-    if (r64 & rb & nrot) rope_qk_fast<2, true, false>(dsc, gw, ngw, lane, stage);   // SigLIP (64-aligned)
+    if (r64 & rb & nrot) rope_qk_fast<2, true, false>(dsc, own, nown, wi, nwo, lane, stage);   // SigLIP (64-aligned)
     else asm volatile("nop");
     if (r64 & (rb ^ 1u) & rka) rope_qk<2, false, true>(dsc, own, nown, wi, nwo, lane, red, cw);
     else asm volatile("nop");
@@ -1688,9 +1636,9 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
     if (rfa & opaque(rpart == 0 || rpart == 3)) rope_v_fa(dsc, gw, ngw, lane, warp);
     else asm volatile("nop");
     const uint32_t rv = opaque(ty == LL_T_ROPE) & (opaque(dsc[25] == 0) | opaque(dsc[6] != 128));
-    if (rv & (rb ^ 1u)) rope_v<false>(dsc, gw, ngw, lane, stage);
+    if (rv & (rb ^ 1u)) rope_v<false>(dsc, own, nown, wi, nwo, lane, stage);
     else asm volatile("nop");
-    if (rv & rb) rope_v<true>(dsc, gw, ngw, lane, stage);
+    if (rv & rb) rope_v<true>(dsc, own, nown, wi, nwo, lane, stage);
     else asm volatile("nop");
     // SOFTMAX d[17]: soft-cap (Gemma-2; always the one-lane-per-group output); d[4] SK <= 256: two lanes per group
     const uint32_t tsm = opaque(ty == LL_T_SOFTMAX), scap = opaque(dsc[17] != 0), shalf = opaque(dsc[4] <= 256);
