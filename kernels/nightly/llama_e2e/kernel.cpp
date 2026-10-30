@@ -1800,6 +1800,9 @@ static void entry(void *, uint32_t tid, uint32_t tpb, uint32_t tb) {
     bar(BAR_PH, warps);
 #endif
     if (lead) {
+      // incoherent cluster L1 (MU_L1_BANKS > 0): write this phase's results back to the GPU L2 for the other
+      // clusters and gemmini, and drop every line so the next phase reads theirs (no-op for a coherent L1)
+      mu_l1_flush();
       perf[(p * NC + tb) * 16 + 1] = nightly_mcycle();
 #if defined(LL_FA_PROF) && LL_FA_PROF
       if (ty == LL_T_FA)

@@ -69,6 +69,33 @@ inline void mu_fence_smem() {
     asm volatile ("fence.s" ::: "memory");
 }
 
+/** Cluster L1 flush, for configs whose cluster L1 is incoherent (radiance L1IncoherentKey, e.g.
+ *  RadianceHBMConfig): MU_L1_BANKS is its bank count, 0 for a coherent L1 (no flush needed).
+ *
+ *  The flush writes every dirty line of the calling cluster's L1 back to the GPU L2 and invalidates
+ *  every line.  Call it from ONE thread per cluster, after every core's L0d has been flushed
+ *  (mu_fence on each core, then a cluster barrier):
+ *    - to publish GPU stores to the host, to gemmini DMA or to other clusters (release);
+ *    - before reading data that gemmini DMA or another cluster wrote (acquire: no stale lines).
+ *  It returns once every bank has finished, all writebacks acknowledged.  Each bank has a flush register at
+ *  cluster-local 0x82000 + 0x100 * bank: a write starts the flush, offset 0x8 reads 1 while it runs. */
+#ifndef MU_L1_BANKS
+#define MU_L1_BANKS 0
+#endif
+#define MU_L1_FLUSH_REG 0x82000u
+inline void mu_l1_flush() {
+#if MU_L1_BANKS > 0
+    for (uint32_t b = 0; b < MU_L1_BANKS; b++)
+        asm volatile ("sw.shared %0, 0(%1)" :: "r"(1u), "r"(MU_L1_FLUSH_REG + 0x100u * b) : "memory");
+    for (uint32_t b = 0; b < MU_L1_BANKS; b++) {
+        uint32_t busy;
+        do {
+            asm volatile ("lw.shared %0, 8(%1)" : "=r"(busy) : "r"(MU_L1_FLUSH_REG + 0x100u * b) : "memory");
+        } while (busy);
+    }
+#endif
+}
+
 /** NOTE about barriers: Placing barriers around thread-divergent branches
  *  may cause bugs.  The compiler might decide to duplicate mu_barrier() into
  *  both paths of a warp-divergent branch, which will cause the barrier to

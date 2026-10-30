@@ -16,7 +16,12 @@
 # (radiance WithGPUAddressHash).  The defaults below match radiance WithRadianceHBM's defaults (4 GPU
 # L2 slices, one channel each): Radiance2SMHBMConfig, RadianceE4M3MxGemmini*HBMConfig,
 # RadianceFP4HBMConfig and the FireSim *HBMRadianceConfig targets.  RadianceHBMConfig (4 SMs, 8 slices
-# x 2 channels) needs MU_ADDR_HASH_SLICES=16 MU_ADDR_HASH_CPS=2 MU_ADDR_HASH_CSS=128.
+# x 2 channels, 64 B lines, incoherent 4-bank cluster L1) needs HBM4=1, which sets MU_ADDR_HASH_SLICES=16
+# MU_ADDR_HASH_CPS=2 MU_ADDR_HASH_UNIT=64 MU_ADDR_HASH_CSS=64 MU_L1_BANKS=4.
+# MU_ADDR_HASH_UNIT (default 32) is the hash granule in bytes, the GPU L2 line.
+# MU_L1_BANKS (default 0): the cluster L1 is incoherent with this many banks (radiance L1IncoherentKey,
+# L1BanksKey); kernels then write the L1 flush registers to publish results (mu_l1_flush, device.h).
+# 0 = a coherent L1, no flush.
 # SimDRAM +loadmem and FireSim LoadMem write DRAM directly, so the GPU load segments are scrambled
 # into the hashed layout before the fuse step (soc/scramble_gpu_elf.py).  Use MU_ADDR_HASH=0 only for a loader that goes through the hash
 # (TSI, RadianceHBMTSIConfig) or for an unhashed config.  MU_ADDR_HASH_SLICES (default 4) is the
@@ -106,17 +111,28 @@ $(shell mkdir -p build; printf '%s\n' "$(GEN_ARGS)" | cmp -s - $(GEN_STAMP) || p
 
 # DEFS stamp: the objects depend on $(DEFS_STAMP), rewritten whenever DEFS changes, so
 # `make DEFS=...` recompiles even when no source changed.
+HBM4 ?= 0
+ifeq ($(HBM4),1)
+MU_ADDR_HASH_SLICES ?= 16
+MU_ADDR_HASH_CPS ?= 2
+MU_ADDR_HASH_UNIT ?= 64
+MU_ADDR_HASH_CSS ?= 64
+MU_L1_BANKS ?= 4
+endif
 MU_ADDR_HASH ?= 1
 MU_ADDR_HASH_SLICES ?= 4
 MU_ADDR_HASH_CPS ?= 1
+MU_ADDR_HASH_UNIT ?= 32
 MU_ADDR_HASH_CSS ?= 0
+MU_L1_BANKS ?= 0
+MU_CFLAGS += -DMU_L1_BANKS=$(MU_L1_BANKS)
 MU_ADDR_HASH_SCRAMBLER ?= $(SOC)/scramble_gpu_elf.py
-MU_ADDR_HASH_ARGS := --base 0x0 --size 0x80000000 --unit 32 --slices $(MU_ADDR_HASH_SLICES) \
+MU_ADDR_HASH_ARGS := --base 0x0 --size 0x80000000 --unit $(MU_ADDR_HASH_UNIT) --slices $(MU_ADDR_HASH_SLICES) \
   $(if $(filter-out 1,$(MU_ADDR_HASH_CPS)),--channels-per-slice $(MU_ADDR_HASH_CPS)) \
   $(if $(filter-out 0,$(MU_ADDR_HASH_CSS)),--chan-set-stride $(MU_ADDR_HASH_CSS))
-MU_ADDR_HASH_TEXT := unit=32 slices=$(MU_ADDR_HASH_SLICES)$(if $(filter-out 1,$(MU_ADDR_HASH_CPS)), cps=$(MU_ADDR_HASH_CPS))$(if $(filter-out 0,$(MU_ADDR_HASH_CSS)), css=$(MU_ADDR_HASH_CSS))
+MU_ADDR_HASH_TEXT := unit=$(MU_ADDR_HASH_UNIT) slices=$(MU_ADDR_HASH_SLICES)$(if $(filter-out 1,$(MU_ADDR_HASH_CPS)), cps=$(MU_ADDR_HASH_CPS))$(if $(filter-out 0,$(MU_ADDR_HASH_CSS)), css=$(MU_ADDR_HASH_CSS))
 DEFS_STAMP := build/defs.stamp
-STAMP_TEXT := $(DEFS) MU_ADDR_HASH=$(MU_ADDR_HASH) MU_ADDR_HASH_SLICES=$(MU_ADDR_HASH_SLICES) MU_ADDR_HASH_CPS=$(MU_ADDR_HASH_CPS) MU_ADDR_HASH_CSS=$(MU_ADDR_HASH_CSS)
+STAMP_TEXT := $(DEFS) MU_ADDR_HASH=$(MU_ADDR_HASH) MU_ADDR_HASH_SLICES=$(MU_ADDR_HASH_SLICES) MU_ADDR_HASH_CPS=$(MU_ADDR_HASH_CPS) MU_ADDR_HASH_UNIT=$(MU_ADDR_HASH_UNIT) MU_ADDR_HASH_CSS=$(MU_ADDR_HASH_CSS) MU_L1_BANKS=$(MU_L1_BANKS)
 $(shell mkdir -p build; printf '%s\n' "$(STAMP_TEXT)" | cmp -s - $(DEFS_STAMP) || printf '%s\n' "$(STAMP_TEXT)" > $(DEFS_STAMP))
 
 MU_OBJCOPY := $(LLVM_MUON)/bin/llvm-objcopy
