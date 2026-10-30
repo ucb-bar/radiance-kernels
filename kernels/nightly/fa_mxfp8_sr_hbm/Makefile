@@ -13,5 +13,10 @@ SMS      ?= 1 2 4
 KERNEL_MU_CFLAGS = -ffp-contract=off -DNIGHTLY_MX_WAIT_READY -DNIGHTLY_MX_RETIRE
 MU_ADDR_HASH ?= 1
 include ../nightly.mk
-$(SRC)/fa_data.h $(SRC)/data/fa.region1.bin $(SRC)/data/fa.region2.bin $(SRC)/data/fa.region3.bin &:
-	$(MAKE) -C $(SRC) fa_data.h
+# The data is fa_mxfp8_sr's, and its generator stamp records the arguments of the last generation by
+# either kernel. Always ask fa_mxfp8_sr for data with this build's ARGS: it regenerates only when they
+# differ, so a build here never links data generated for another shape (e.g. fa_mxfp8_sr ARGS="--SQ 512").
+$(SRC)/fa_data.h $(SRC)/data/fa.region1.bin $(SRC)/data/fa.region2.bin $(SRC)/data/fa.region3.bin &: FORCE
+	$(MAKE) -C $(SRC) fa_data.h ARGS="$(ARGS)"
+.PHONY: FORCE
+FORCE:
