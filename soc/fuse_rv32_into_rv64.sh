@@ -101,7 +101,6 @@ $(printf "%s\n" "${SEG_PHDRS[@]}")
 }
 
 __rom_base  = 0x80000000;
-__stack_top = 0x80080000;
 
 SECTIONS
 {
@@ -129,6 +128,12 @@ SECTIONS
   /* heap symbols expected by htif/newlib */
   _end = .;
   __heap_end = .;
+
+  /* stack: 256 KiB above the end of the image, never below the old fixed 0x80080000.  The fixed
+   * 0x80080000 put the stack inside images larger than 512 KiB (kernels/tapeout_encoder host,
+   * ~0.9 MB of reference tables): the stack overwrote the tables and host-side checks failed
+   * with values that changed from call to call (2026-10-15). */
+  __stack_top = MAX(0x80080000, ALIGN(_end + 0x40000, 16));
 
   /* mirrored rv32 segments as raw bytes */
 $(printf "%s\n" "${SEG_SECTIONS[@]}")

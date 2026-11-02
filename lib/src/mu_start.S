@@ -110,6 +110,9 @@ init_regs:
   # set stack pointer register
   li    sp, STACK_BASE_ADDR # load stack base address
   csrr  t0, mhartid
+#ifndef MU_STACK_SKEW
+#define MU_STACK_SKEW 0
+#endif
 #if MU_STACK_WORD_STRIDE > 1
   # warp region = (1 << MU_LOG2_LANES) * STACK_SIZE, one per warp
   srl   t1, t0, MU_LOG2_LANES
@@ -120,6 +123,20 @@ init_regs:
   andi  t2, t0, ((1 << MU_LOG2_LANES) - 1)
   sll   t2, t2, 2
   add   sp, sp, t2
+#if MU_STACK_SKEW
+  # MU_STACK_SKEW (radiance-kernels main 3002d83; off by default on this branch): global warp
+  # g = mhartid >> MU_LOG2_LANES starts 256 (g mod 16) + 64 ((g / 16) mod 4) bytes lower, so the
+  # warps' stacks (one region apart) stop mapping to one L0d / L1 set.  Encoder layer 4.300M ->
+  # 4.161M cycles, hashes unchanged (board fzs1).
+  srl   t1, t0, MU_LOG2_LANES
+  andi  t2, t1, 15
+  sll   t2, t2, 8
+  srl   t1, t1, 4
+  andi  t1, t1, 3
+  sll   t1, t1, 6
+  add   t1, t1, t2
+  sub   sp, sp, t1
+#endif
 #else
   sll   t1, t0, STACK_LOG2_SIZE
   sll   t2, t0, 4

@@ -238,6 +238,7 @@ static inline void rad_l0d_flush_mmio_unsafe(void) {
  *   16,17  epilogue: per-core DONE
  *   18,19  rad_tapeout_begin(): per-core start generation (incremented every run)
  *   20,21  epilogue: per-core trace
+ *   22     launch token: rad_host_run() writes RAD_LAUNCH_MAGIC before it releases the GPU
  *   24..31 epilogue: per-warp STOP  (24 + warp_rr, up to 8 warps)
  *   32..63 free for diagnostics
  * Collisions here have produced THREE false readings in this campaign: a working epilogue
@@ -246,6 +247,8 @@ static inline void rad_l0d_flush_mmio_unsafe(void) {
 #define RAD_PB_EPI_WARP        24u   /* + warp_rr : each stopping warp posts before tmc 0       */
 #define RAD_PB_EPI_TRACE       20u   /* + core id : how far warp 0 got, for diagnosing timeouts */
 #define RAD_PB_EPI_START       18u   /* + core id : start generation, see rad_tapeout_begin() */
+#define RAD_PB_LAUNCH          22u   /* launch token, see rad_tapeout_begin() */
+#define RAD_LAUNCH_MAGIC       0x1A0C4ED5u
 /* The generation that follows `g`.  Tolerates any initial slot contents. */
 #define RAD_EPI_NEXT_GEN(g)    ((((g) + 1u) & 0x00FFFFFFu) | 0xAC000000u)
 #define RAD_EPI_T_BARA         0xA0u /* passed barrier A            */
@@ -292,6 +295,17 @@ static inline uint32_t rad_pb_get(uint32_t slot) {
  * image started.  The counter lives in printBuf because GPU DRAM written by the host does not
  * reliably keep its value from one run to the next. */
 static inline void rad_tapeout_begin(void) {
+#ifdef RAD_LAUNCH_TOKEN
+  /* RAD_LAUNCH_TOKEN: the GPU also runs the image in DRAM when the SoC leaves reset, before the
+   * host has written any input.  On the board that run is harmless (the host soft-resets the GPU
+   * before each launch), but in RTL simulation with +loadmem its zero-length move-in trips a fatal
+   * Gemmini assertion (LoadController.scala:191; runs/tapeout-perf vl_sc1n).  rad_host_run() posts
+   * the token before every release; a core that starts without it parks here and touches nothing
+   * until the host's soft reset restarts it.  printBuf is read with lw.shared: no L0d copy can go
+   * stale across the reset. */
+  while (rad_pb_get(RAD_PB_LAUNCH) != RAD_LAUNCH_MAGIC) {
+  }
+#endif
   const uint32_t cid = (uint32_t)vx_core_id();
   rad_pb_put(RAD_PB_EPI_CORE + cid, 0u);
   rad_pb_put(RAD_PB_EPI_TRACE + cid, 0u);

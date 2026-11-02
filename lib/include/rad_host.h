@@ -25,8 +25,21 @@
 #include <stdint.h>
 #include <unistd.h>
 
+/* Upper bound on one kernel run, in host cycles, before rad_host_run() gives up and reports.
+ * Keep it inside the board runner's wall-clock timeout (300 s): the U250 host runs at roughly
+ * 10 MHz of host cycles per second as measured by these loops. */
+#ifndef RAD_HOST_RUN_MAX_CYCLES
+#define RAD_HOST_RUN_MAX_CYCLES 600000000ull
+#endif
+
 #ifndef RAD_HOST_NUM_CORES
-#define RAD_HOST_NUM_CORES 2   /* the taped-out part: one cluster of two cores */
+#define RAD_HOST_NUM_CORES 2   /* per cluster: the taped-out cluster has two cores */
+#endif
+/* Clusters rad_host_run() waits for.  Core ids are cluster-local and each cluster has its own
+ * printBuf postbox (RAD_PB_HOST(cl, slot)); the soft reset releases every cluster.  2 for the
+ * two-cluster FireSimRadianceTapeoutConfig (FireAxe pair). */
+#ifndef RAD_HOST_NUM_CLUSTERS
+#define RAD_HOST_NUM_CLUSTERS 1
 #endif
 
 /* ---- buffered console output ---------------------------------------------------------------- */
@@ -67,6 +80,9 @@ static inline void rad_wait_cycles(uint64_t n) {
 static inline uint32_t rad_host_postbox(uint32_t slot) {
   return (uint32_t)*(volatile uint64_t *)RAD_PB_HOST(0, slot);
 }
+static inline uint32_t rad_host_postbox_cl(uint32_t cl, uint32_t slot) {
+  return (uint32_t)*(volatile uint64_t *)RAD_PB_HOST(cl, slot);
+}
 
 /* ---- kernel execution ----------------------------------------------------------------------- */
 /* Run the loaded GPU image once and stop it.  Returns 1 if every core started THIS run and
@@ -75,7 +91,7 @@ static inline uint32_t rad_host_postbox(uint32_t slot) {
  *   2. release the GPU with a soft-reset edge (assert, hold, release);
  *   3. wait until every core has advanced its generation by one, which rad_tapeout_begin() does
  *      on the GPU;
- *   4. wait for every core's epilogue DONE (rad_host_wait_epilogue);
+ *   4. wait for every core's epilogue DONE, at most RAD_HOST_RUN_MAX_CYCLES after launch;
  *   5. soft-reset the GPU, which stops the cores the epilogue left parked.
  * Step 3 is what keeps a DONE left in the postbox by an earlier run from passing as this run.
  * Write all inputs to GPU DRAM before calling this.
@@ -87,36 +103,47 @@ static inline uint32_t rad_host_postbox(uint32_t slot) {
  * instructions it cached.  Evidence: between two runs of one image the start generation advances
  * once more than the launches alone explain. */
 static inline int rad_host_run(void) {
-  uint32_t expect[RAD_HOST_NUM_CORES];
-  for (int c = 0; c < RAD_HOST_NUM_CORES; c++)
-    expect[c] = RAD_EPI_NEXT_GEN(rad_host_postbox(RAD_PB_EPI_START + c));
+  enum { NC = RAD_HOST_NUM_CORES, NT = RAD_HOST_NUM_CLUSTERS * RAD_HOST_NUM_CORES };
+  uint32_t expect[NT];
+  for (int k = 0; k < NT; k++)
+    expect[k] = RAD_EPI_NEXT_GEN(rad_host_postbox_cl(k / NC, RAD_PB_EPI_START + k % NC));
 
   asm volatile("fence" ::: "memory");
   *(volatile uint32_t *)RAD_HOST_GPU_RESET = 1u;
+  /* launch token (rad_tapeout_begin() under RAD_LAUNCH_TOKEN): a core that started at SoC reset
+   * parks until it sees this.  Posted while the GPU is held in reset, so a parked core cannot start
+   * the kernel before the reset edge cuts it off (a soft reset does not stop Gemmini). */
+  for (int c = 0; c < RAD_HOST_NUM_CLUSTERS; c++)
+    *(volatile uint64_t *)RAD_PB_HOST(c, RAD_PB_LAUNCH) = ((uint64_t)RAD_LAUNCH_MAGIC << 32) | RAD_LAUNCH_MAGIC;
+  asm volatile("fence" ::: "memory");
   rad_wait_cycles(200000);
   *(volatile uint32_t *)RAD_HOST_GPU_RESET = 0u;
   const uint64_t t_launch = rad_rdcycle();
 
   int started = 0;
-  for (uint64_t i = 0; i < 2000000ull && started < RAD_HOST_NUM_CORES; i++) {
+  for (uint64_t i = 0; i < 2000000ull && started < NT; i++) {
     started = 0;
-    for (int c = 0; c < RAD_HOST_NUM_CORES; c++)
-      started += rad_host_postbox(RAD_PB_EPI_START + c) == expect[c];
+    for (int k = 0; k < NT; k++)
+      started += rad_host_postbox_cl(k / NC, RAD_PB_EPI_START + k % NC) == expect[k];
   }
   int done = 0;
-  if (started == RAD_HOST_NUM_CORES) done = rad_host_wait_epilogue(RAD_HOST_NUM_CORES, 20000000ull);
+  while (started == NT && done < NT && rad_rdcycle() - t_launch < RAD_HOST_RUN_MAX_CYCLES) {
+    done = 0;
+    for (int k = 0; k < NT; k++)
+      done += rad_host_postbox_cl(k / NC, RAD_PB_EPI_CORE + k % NC) == RAD_EPI_DONE_MAGIC;
+  }
   const uint64_t t_done = rad_rdcycle();
   rad_host_gpu_soft_reset();   /* stop the GPU whatever state it is in */
 
-  rad_puts("rad_host_run: started="); rad_putu(started); rad_puts("/"); rad_putu(RAD_HOST_NUM_CORES);
-  rad_puts(" done="); rad_putu(done); rad_puts("/"); rad_putu(RAD_HOST_NUM_CORES);
-  for (int c = 0; c < RAD_HOST_NUM_CORES; c++) {
-    rad_puts(" gen"); rad_putu(c); rad_puts("="); rad_putx(expect[c]);
-    rad_puts(" trace"); rad_putu(c); rad_puts("="); rad_putx(rad_host_postbox(RAD_PB_EPI_TRACE + c));
+  rad_puts("rad_host_run: started="); rad_putu(started); rad_puts("/"); rad_putu(NT);
+  rad_puts(" done="); rad_putu(done); rad_puts("/"); rad_putu(NT);
+  for (int k = 0; k < NT; k++) {
+    rad_puts(" gen"); rad_putu(k); rad_puts("="); rad_putx(expect[k]);
+    rad_puts(" trace"); rad_putu(k); rad_puts("="); rad_putx(rad_host_postbox_cl(k / NC, RAD_PB_EPI_TRACE + k % NC));
   }
   rad_puts(" host_cycles="); rad_putu(t_done - t_launch); rad_puts("\n");
   rad_flush();
-  return done == RAD_HOST_NUM_CORES;
+  return done == NT;
 }
 
 #endif /* __RAD_HOST_H__ */

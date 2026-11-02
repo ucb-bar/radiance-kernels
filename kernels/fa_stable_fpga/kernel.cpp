@@ -50,6 +50,15 @@ static inline void fa_pb_or(uint32_t slot, uint32_t bit) {
     asm volatile("sw.shared %0, 0(%1)" :: "r"(v), "r"(p + 1) : "memory");
 }
 #else
+// without FA_PB the beacons compile to nothing, but MARK() and friends still name the slots
+#define FA_PB_ENTRY     0
+#define FA_PB_STAGE     1
+#define FA_PB_TILE      2
+#define FA_PB_PRERET    3
+#define FA_PB_PREDRAIN  4
+#define FA_PB_POSTDRAIN 5
+#define FA_PB_RETIRE    6
+#define FA_PB_WARPS     7
 static inline void fa_pb(uint32_t, uint32_t) {}
 static inline void fa_pb_or(uint32_t, uint32_t) {}
 #endif
@@ -257,8 +266,11 @@ static constexpr uint32_t MARK_GMEM = FA_MARK_GMEM_ADDR;
 #else
 #define BAR_PAD4() BAR_PAD_FAST()
 #endif
+#ifndef FA_MARK_CL_OFF   // per-cluster offset of the MARK array (FA_ENC on two clusters)
+#define FA_MARK_CL_OFF 0u
+#endif
 #define MARK() do { if (tid == 0) { uint32_t _c; asm volatile("csrr %0, mcycle" : "=r"(_c)); \
-                                    ((volatile uint32_t *)MARK_GMEM)[mki++] = _c; \
+                                    ((volatile uint32_t *)(MARK_GMEM + FA_MARK_CL_OFF))[mki++] = _c; \
                                     fa_pb(FA_PB_STAGE, 0x57A60000u | mki); } } while (0)
 // PER-STAGE mark.  *** THESE ARE NOT FREE. ***  MARK() is a single-thread store to GMEM, i.e. to
 // DRAM, and mxgemm_core.hpp already measured a single such store at ~400 cycles on this machine
@@ -2066,6 +2078,9 @@ static inline volatile __shared uint32_t *fa_sf_b(uint32_t half) {
 // A-operand move-in: PE_TILES_I x PE_TILES_K tiles of DIM x DIM, GMEM row stride dim_k.
 // (Mirrors the !GEMMINI_DMA branch of copy_gmem_to_smem_async, but with an explicit spad row
 // and WITHOUT touching B -- the SKIP_B the loop-FSM path is missing.)
+#ifndef FA_MVIN_NB
+#define FA_MVIN_NB 2u   // blocks per wide move-in (max 2 on the tapeout, see fa_mvin_A)
+#endif
 template <GemmConfig C>
 static __attribute__((noinline)) void fa_mvin_A(const uint8_t *A, uint32_t spad_row,
                                                 uint32_t dim_k, uint32_t tid) {
@@ -2076,6 +2091,23 @@ static __attribute__((noinline)) void fa_mvin_A(const uint8_t *A, uint32_t spad_
 #endif
     // rolled on purpose: 32 unrolled ROCC mvin commands are 632 B of a 16 KB direct-mapped
     // icache, and this runs once per tile (the DMA, not the issue, is the cost).
+#if defined(FA_MVIN_WIDE) || defined(FA_MVIN_WIDE_A)
+    // FA_MVIN_WIDE: FA_MVIN_NB DIM x DIM blocks per command (fewer ROCC commands; the reload cost
+    // is per command).  Gemmini places block b of a multi-block move-in block_stride = DIM rows
+    // after block b-1, the same (i * K + k) * DIM layout as the per-block loop.  FA_MVIN_NB is 2:
+    // the tapeout's move-in cols field is 6 bits (LoadController rs2[37:32], weightType is 16 bits
+    // wide, so max_block_len = 64 B / 32 B = 2), and cols = 4*DIM = 64 encodes as 0 -- an empty
+    // move-in that leaves SMEM unwritten (kernels/tapeout_encoder EN_TEST 22, board 2026-10-20).
+    static_assert(C.PE_TILES_K() % FA_MVIN_NB == 0, "FA_MVIN_WIDE: K blocks in groups of FA_MVIN_NB");
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < C.PE_TILES_I(); i++)
+#pragma clang loop unroll(disable)
+        for (uint32_t k = 0; k < C.PE_TILES_K(); k += FA_MVIN_NB) {
+            const uint8_t *p = A + i * DIM * dim_k + k * DIM;
+            gemmini_extended_mvin(rad_device_to_host_address(reinterpret_cast<uint32_t>(p)),
+                                  spad_row + (i * C.PE_TILES_K() + k) * DIM, FA_MVIN_NB * DIM, DIM);
+        }
+#else
 #pragma clang loop unroll(disable)
     for (uint32_t i = 0; i < C.PE_TILES_I(); i++)
 #pragma clang loop unroll(disable)
@@ -2084,6 +2116,7 @@ static __attribute__((noinline)) void fa_mvin_A(const uint8_t *A, uint32_t spad_
             gemmini_extended_mvin(rad_device_to_host_address(reinterpret_cast<uint32_t>(p)),
                                   spad_row + (i * C.PE_TILES_K() + k) * DIM, DIM, DIM);
         }
+#endif
 #ifdef FA_NS_SENT
     fa_sent_wait(spad_row, C.PE_TILES_I() * C.PE_TILES_K());
 #endif
@@ -2096,6 +2129,17 @@ static __attribute__((noinline)) void fa_mvin_B(const uint8_t *B, uint32_t spad_
     if (tid != 0) return;
     gemmini_config_ld(dim_n * sizeof(uint8_t) / C.VALUES_PER_BYTE());
     const uint32_t start = spad_end_row - C.PE_TILES_K() * C.PE_TILES_J() * DIM;
+#if defined(FA_MVIN_WIDE) || defined(FA_MVIN_WIDE_B)   // four blocks per command, see fa_mvin_A
+    static_assert(C.PE_TILES_J() % FA_MVIN_NB == 0, "FA_MVIN_WIDE: J blocks in groups of FA_MVIN_NB");
+#pragma clang loop unroll(disable)
+    for (uint32_t k = 0; k < C.PE_TILES_K(); k++)
+#pragma clang loop unroll(disable)
+        for (uint32_t j = 0; j < C.PE_TILES_J(); j += FA_MVIN_NB) {
+            const uint8_t *p = B + k * DIM * dim_n / C.VALUES_PER_BYTE() + j * DIM;
+            gemmini_extended_mvin(rad_device_to_host_address(reinterpret_cast<uint32_t>(p)),
+                                  start + (k * C.PE_TILES_J() + j) * DIM, FA_MVIN_NB * DIM, DIM);
+        }
+#else
 #pragma clang loop unroll(disable)
     for (uint32_t k = 0; k < C.PE_TILES_K(); k++)
 #pragma clang loop unroll(disable)
@@ -2104,6 +2148,7 @@ static __attribute__((noinline)) void fa_mvin_B(const uint8_t *B, uint32_t spad_
             gemmini_extended_mvin(rad_device_to_host_address(reinterpret_cast<uint32_t>(p)),
                                   start + (k * C.PE_TILES_J() + j) * DIM, DIM, DIM);
         }
+#endif
 }
 // ============================================================================================
 // FA_ST_CFGFENCE / FA_ST_CFGPRE -- *** ORDER CONFIG_SCALE_MEM AGAINST LOOP_WS WITH A DRAIN
@@ -3919,8 +3964,212 @@ static __attribute__((noinline)) void fa_softmax_coop(
 #endif  // FA_SP_CBMAX || FA_SP_SM1F
 #endif  // FA_SP
 
+#ifdef FA_ENC
+// FA_ENC: the operands come from GPU DRAM (one attention head of an encoder layer, written by
+// kernels/tapeout_encoder) instead of fa_data.h.  The fa_data.h array names below become
+// pointer locals of fa_entry, read from a host-written argument block, so no .bss and no
+// cross-core visibility question.  One launch = one head = FA_SPTILES query tiles; K^T and V are
+// fixed for the launch, Q advances per tile and each tile's O goes to its own slot.
+//   Q   [tiles][FA_SQ][FA_D] e4m3      QS  [tiles][FA_GK][FA_SQ] e8m0
+//   K^T [FA_D][FA_SK] e4m3             KTS [FA_GK][FA_SK] e8m0
+//   V   [FA_SK][FA_D] e4m3             VS  [FA_GKV][FA_D] e8m0
+//   O   [tiles][FA_SQ][FA_D] bf16
+struct FaEncArgs { uint32_t q, qs, kt, kts, v, vs, o; };
+#ifndef FA_ENC_ARGS
+#define FA_ENC_ARGS 0x1F0F1000u
+#endif
+#define FA_ENC_Q_TILE  (FA_SQ * FA_D)
+#define FA_ENC_QS_TILE (FA_GK * FA_SQ)
+#define FA_ENC_O_TILE  (FA_SQ * FA_D * 2u)
+#define QK_A_in         fa_enc_q
+#define QK_A_scales_row fa_enc_qs
+#define QK_B_in         fa_enc_kt
+#define QK_B_scales_col fa_enc_kts
+#define V_in            fa_enc_v
+#define V_scales        fa_enc_vs
+#define O_GMEM          fa_enc_o
+#endif
+
+#if defined(FA_ENC_TPH)
+// true in the last tile of a head (not the last tile overall): K^T, V and their scales reload
+// (a macro: FA_SPTILES is defined inside fa_entry)
+#define fa_head_switch(t) (((t) + 1u) % FA_ENC_TPH == 0u && (t) + 1u < (uint32_t)FA_SPTILES)
+// FA_ENC_DMAO2: the head-switch tiles of FA_ENC_KVOVL keep the single-phase finalize
+#ifdef FA_ENC_KVOVL
+#define fa_head_switch_or0(t) fa_head_switch(t)
+#else
+#define fa_head_switch_or0(t) false
+#endif
+#endif
+#ifdef FA_ENC_DMAO
+// FA_ENC_DMAO: finalize O = O_acc / l IN PLACE in SMEM (SM_S = spad rows SP_C.., bf16 [SQ][D]) and
+// move the tile out with the Gemmini DMA instead of SIMT global stores.  In the encoder every tile
+// writes fresh O lines, and the SIMT stores ran at ~40 cycles per 64 B line (S6b ~15.5k per tile,
+// encoder per-stage stamps 2026-10-20).  The move-out is issued after the finalize barrier: the
+// mesh is idle (QK(t+1) already ran in S6), every warp waits at the next stage's barrier (no SIMT
+// SMEM traffic under it), and S1's drain completes it before S(t+1) is stored into the same rows.
+// rows [row0, row1) of O, row r on warp (r - row0) % nwarps
+template <uint32_t SQ, uint32_t D>
+static __attribute__((noinline)) void fa_finalize_smem(__shared uint32_t *O_acc32, const __shared uint16_t *l_state,
+                                                       uint32_t tid_in_threadblock, uint32_t threads_per_threadblock,
+                                                       uint32_t row0, uint32_t row1) {
+    constexpr uint32_t NT = MU_NUM_THREADS;
+    constexpr uint32_t DW = D / 2;
+    const uint32_t lane = tid_in_threadblock % NT;
+    const uint32_t warp = tid_in_threadblock / NT;
+    const uint32_t nwarps = threads_per_threadblock / NT;
+    for (uint32_t row = row0 + warp; row < row1; row += nwarps) {
+        const _Float16 inv_l =
+            (_Float16)(__builtin_bit_cast(_Float16, ONE_BF16_BITS) / as_bf16(l_state[row]));
+        for (uint32_t w = lane; w < DW; w += NT) {
+            const uint32_t a = O_acc32[row * DW + w];
+            O_acc32[row * DW + w] = pack_bf16x2((_Float16)(as_bf16((uint16_t)a) * inv_l),
+                                                (_Float16)(as_bf16((uint16_t)(a >> 16)) * inv_l));
+        }
+    }
+}
+#ifdef FA_ENC_OQ
+#if defined(FA_OQ_FUSE) && !defined(FA_ENC_DMAO)
+#error "FA_OQ_FUSE replaces FA_ENC_DMAO's in-place finalize"
+#endif
+#ifdef FA_ENC_DMAO2
+#error "FA_ENC_OQ quantizes after the single-phase in-place finalize (not FA_ENC_DMAO2)"
+#endif
+// FA_ENC_OQ: quantize the normalized O tile (bf16 [SQ][D] at SM_S) into the out-projection's MX A
+// operand, as the encoder's o_quant would: 32-element groups along d (4 per row), codes staged in
+// the P8 region (free after PV) in the 2-block move-out layout (16-row block rb, 16-byte chunk c:
+// SMEM row (rb * 8 + c) * 16 + row % 16), scale bytes [g][SQ] after the codes.
+static constexpr uint32_t FA_OQ_SC = SM_P8 + FA_SQ * FA_D;   // scale bytes, after 8 KB of codes
+// Lane q's group is 16 words at a 64-byte stride from its neighbours', so with 4-byte subbank
+// interleaving the in-order walk puts lanes q, q+4, q+8, q+12 on one subbank every access.
+// FA_OQ_ROT rotates each lane's word (and pair) order by q: the max is order-free, and the convert
+// writes each pair to its own position, so the codes are unchanged.
+#ifdef FA_OQ_ROT
+#define FA_OQ_W(i, q) (((i) + (q)) & 15u)
+#define FA_OQ_P(i, q) (((i) + (q)) & 7u)
+#else
+#define FA_OQ_W(i, q) (i)
+#define FA_OQ_P(i, q) (i)
+#endif
+// FA_OQ_UNROLL=n: unroll the finalize / convert inner loops n times (default: rolled; the renamer
+// budget is the limit, see fa_oq_quant's comment and runs/tapeout-perf/scripts/regs.py)
+#define FA_OQ_PRAGMA_(x) _Pragma(#x)
+#ifdef FA_OQ_UNROLL
+#define FA_OQ_LOOP_PRAGMA FA_OQ_PRAGMA_(clang loop unroll_count(FA_OQ_UNROLL))
+#else
+#define FA_OQ_LOOP_PRAGMA FA_OQ_PRAGMA_(clang loop unroll(disable))
+#endif
+// convert pass shared by both forms: pairs of normalized bf16 words -> 4 e4m3 codes, 2-block layout
+// (chunk c = 2g + p/4 of 16-row block row/16: SMEM row (rb * 8 + c) * 16 + row % 16), scale byte
+static inline void fa_oq_convert(const volatile __shared uint32_t *xv, uint32_t q, uint32_t mx) {
+    const uint32_t row = q >> 2, g = q & 3u;
+    const int e = oq_block_exp(mx << 16);
+    const uint32_t p2 = oq_swar_p2(e);
+    __shared uint32_t *op = reinterpret_cast<__shared uint32_t *>(SM_P8 + (((row / 16u) * 8u + 2u * g) * 16u + row % 16u) * 16u);
+FA_OQ_LOOP_PRAGMA
+    for (uint32_t i = 0; i < 8u; i++) {
+        const uint32_t p = FA_OQ_P(i, q);
+        op[(p / 4u) * 64u + p % 4u] = oq_swar_pack4(oq_e4m3_swar2(xv[2u * p], p2), oq_e4m3_swar2(xv[2u * p + 1u], p2));
+    }
+    reinterpret_cast<__shared uint8_t *>(FA_OQ_SC)[g * FA_SQ + row] = (uint8_t)(e + 127);
+}
+// Two passes over each group (max, then reload + convert) with the inner loops kept rolled: the
+// function is a leaf, so every extra live value takes a fresh caller-saved register that FA never
+// writes, and the renamer budget (union of written registers x occupancy 3, Rename.scala:123) has no
+// room for it (a 16-word buffer added 25 registers: union 86, x3 = 258).
+static __attribute__((noinline)) void fa_oq_quant(uint32_t tid, uint32_t thr) {
+    for (uint32_t q = tid; q < FA_SQ * 4u; q += thr) {
+        const volatile __shared uint32_t *xv = reinterpret_cast<const volatile __shared uint32_t *>(SM_S) + (q >> 2) * 64u + (q & 3u) * 16u;
+        uint32_t mx = 0;
+#pragma clang loop unroll(disable)
+        for (uint32_t i = 0; i < 16u; i++) {
+            const uint32_t a = xv[FA_OQ_W(i, q)] & 0x7FFF7FFFu;
+            mx = oq_fmax_h(oq_fmax_h(mx, a), a >> 16);
+        }
+        fa_oq_convert(xv, q, mx);
+    }
+}
+#ifdef FA_OQ_FUSE
+// FA_OQ_FUSE: the finalize (O = O_acc / l, in place, the same bf16 arithmetic as fa_finalize_smem)
+// and the group max in one pass, then the convert pass on the values this thread just wrote: one
+// load pass and the barrier between finalize and quantize are gone.  Groups q = tid .. 4 SQ step thr.
+static __attribute__((noinline)) void fa_oq_finq(uint32_t tid, uint32_t thr) {
+    const __shared uint16_t *l_state = reinterpret_cast<const __shared uint16_t *>(LS_SMEM);
+    for (uint32_t q = tid; q < FA_SQ * 4u; q += thr) {
+        const uint32_t row = q >> 2;
+        volatile __shared uint32_t *xv = reinterpret_cast<volatile __shared uint32_t *>(SM_S) + row * 64u + (q & 3u) * 16u;
+        const _Float16 inv_l =
+            (_Float16)(__builtin_bit_cast(_Float16, ONE_BF16_BITS) / as_bf16(l_state[row]));
+        uint32_t mx = 0;
+FA_OQ_LOOP_PRAGMA
+        for (uint32_t i = 0; i < 16u; i++) {
+            const uint32_t w = FA_OQ_W(i, q);
+            const uint32_t a = xv[w];
+            const uint32_t o = pack_bf16x2((_Float16)(as_bf16((uint16_t)a) * inv_l),
+                                           (_Float16)(as_bf16((uint16_t)(a >> 16)) * inv_l));
+            xv[w] = o;
+            const uint32_t m = o & 0x7FFF7FFFu;
+            mx = oq_fmax_h(oq_fmax_h(mx, m), m >> 16);
+        }
+        fa_oq_convert(xv, q, mx);
+    }
+}
+#endif
+// codes of head hn, query rows qb*64 .. +63 -> EN_OA [S][D] (columns hn*128 ..); scales -> EN_OA_S
+// (tile-blocked: group hn*4 + gi of rows row0 .. row0+63 is 64 contiguous bytes)
+static __attribute__((noinline)) void fa_oq_dma(uint32_t hn, uint32_t qb, uint32_t tid) {
+    if (tid != 0) return;
+    const uint32_t row0 = qb * FA_SQ;
+    gemmini_config_st(EN_D);
+    for (uint32_t rb = 0; rb < FA_SQ / 16u; rb++)
+        for (uint32_t cp = 0; cp < FA_D / 32u; cp++)
+            gemmini_extended_mvout(rad_device_to_host_address(EN_OA + (row0 + 16u * rb) * EN_D + hn * FA_D + 32u * cp),
+                                   (SM_P8 + (rb * 8u + 2u * cp) * 256u) / 16u, 2u * DIM, 16u);
+    gemmini_config_st(DIM);
+    for (uint32_t gi = 0; gi < 4u; gi++)
+        gemmini_extended_mvout(rad_device_to_host_address(EN_OA_S + (((row0 / 128u) * (EN_D / 128u) + hn) * 4u + gi) * 128u + row0 % 128u),
+                               (FA_OQ_SC + gi * FA_SQ) / 16u, DIM, FA_SQ / 16u);
+}
+#endif
+// O rows [row0, row1): one O row (FA_D bf16 = 256 B = 16 SMEM rows) per move-out
+static __attribute__((noinline)) void fa_o_dma(uint32_t o_dev, uint32_t row0, uint32_t row1, uint32_t tid) {
+    if (tid != 0) return;
+    static_assert(FA_D * 2u == 256u, "fa_o_dma: one 16-row move-out per O row");
+    gemmini_config_st(DIM);   // 16-byte SMEM rows, consecutive in DRAM (O's tile is contiguous)
+    for (uint32_t k = row0; k < row1; k++)
+        gemmini_extended_mvout(rad_device_to_host_address(o_dev + 256u * k), SP_C + 16u * k, DIM, 16u);
+}
+#endif
+
 void fa_entry(void *arg, uint32_t tid_in_threadblock,
               uint32_t threads_per_threadblock, uint32_t threadblock_id) {
+#ifdef FA_ENC
+  const volatile FaEncArgs *fa_ea = reinterpret_cast<const volatile FaEncArgs *>(FA_ENC_ARGS);
+  const uint32_t fa_enc_q0 = fa_ea->q, fa_enc_qs0 = fa_ea->qs, fa_enc_o0 = fa_ea->o;
+  const uint8_t (*fa_enc_q)[FA_D] = reinterpret_cast<const uint8_t (*)[FA_D]>(fa_enc_q0);
+  const uint8_t (*fa_enc_qs)[FA_SQ] = reinterpret_cast<const uint8_t (*)[FA_SQ]>(fa_enc_qs0);
+  const uint8_t (*fa_enc_kt)[FA_SK] = reinterpret_cast<const uint8_t (*)[FA_SK]>(fa_ea->kt);
+  const uint8_t (*fa_enc_kts)[FA_SK] = reinterpret_cast<const uint8_t (*)[FA_SK]>(fa_ea->kts);
+  const uint8_t (*fa_enc_v)[FA_D] = reinterpret_cast<const uint8_t (*)[FA_D]>(fa_ea->v);
+  const uint8_t (*fa_enc_vs)[FA_D] = reinterpret_cast<const uint8_t (*)[FA_D]>(fa_ea->vs);
+  uint32_t fa_enc_o = fa_enc_o0;
+#ifdef FA_ENC_ECHO
+  // Echo the operand pointers this launch read (every lane stores the same value: no divergence).
+  rad_pb_put(46u, fa_enc_q0);
+  rad_pb_put(47u, fa_ea->kt);
+#endif
+#ifdef FA_ENC_PB_T_START
+  // thread 0 only (as MARK()): several warps writing one slot land in arbitrary order
+  if (tid_in_threadblock == 0) {
+    uint32_t c; asm volatile("csrr %0, mcycle" : "=r"(c)); rad_pb_put(FA_ENC_PB_T_START, c);
+  } else {
+    asm volatile("nop");
+  }
+#endif
+#ifdef FA_HPM_SNAP
+  FA_HPM_SNAP(tid_in_threadblock, 0u);
+#endif
+#endif
 #ifdef FA_FPGA_ENTRYMARK
   // Unconditional "kernel entered" stamp, slot 15 -- OUTSIDE the mki range so it cannot collide
   // with the per-stage marks.  Distinguishes "never entered fa_entry" from "entered and stalled
@@ -4248,6 +4497,17 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 #if defined(FA_SP_FZ6) && !defined(FA_SP_QSPLIT)
 #  error "FA_SP_FZ6 needs FA_SP_QSPLIT (warp 0 only has slack in S6 once the prefetch has moved)"
 #endif
+#ifdef FA_ENC_DMAO
+#undef FA_SP_FINALIZE
+#define FA_FIN_ROWS(T, N, R0, R1) fa_finalize_smem<FA_SQ, FA_D>(reinterpret_cast<__shared uint32_t*>(SM_S), \
+        reinterpret_cast<const __shared uint16_t*>(LS_SMEM), (T), (N), (R0), (R1))
+#define FA_SP_FINALIZE(T, N) FA_FIN_ROWS(T, N, 0u, FA_SQ)
+#endif
+#ifdef FA_OQ_FUSE   // finalize + quantize in one function (FA_ENC_OQ)
+#undef FA_SP_FINALIZE
+#define FA_SP_FINALIZE(T, N) fa_oq_finq((T), (N))
+#endif
+
 #if defined(FA_SP_FZ6) && defined(FA_SP_BALF)
 #  error "FA_SP_FZ6 uses all 6 warps, which mu_schedule already balances 3/3 -- BALF is a no-op"
 #endif
@@ -4264,11 +4524,31 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 #ifdef FA_SP_LEANCFG
     fa_cfg_once(tid);
 #endif
+#if defined(FA_ENC_PROSCL) && !defined(FA_SP_HSF)
+    // FA_ENC_PROSCL: thread 16 (warp 1, the other core) writes K's and V's SF-SRAM scales while
+    // thread 0 is blocked issuing the K^T / V move-ins (~27k; the scales took another ~6.7k after
+    // them).  Scale writes under an in-flight move-in are what FA_ENC_KVOVL already does for V.
+    // Published with a fence and a gemmini-port load by the writing warp; the barrier after the
+    // prologue keeps QK(0) behind them.
+    {
+        const uint32_t t16 = (tid == MU_NUM_THREADS) ? 0u : 1u;
+        fa_scl(fa_sf_b(0), &QK_B_scales_col[0][0], QKF.SCALE_FACTORS_PER_TILE_B(), t16);
+        fa_scl(fa_sf_b(1), &V_scales[0][0], PVF.SCALE_FACTORS_PER_TILE_B(), t16);
+        mu_fence_smem();
+        fa_gf(t16);
+    }
+#endif
     fa_cfg<QKF>(/*asel=*/1, /*wsel=*/0, tid);
     fa_mvin_B<QKF>(&QK_B_in[0][0], SP_K_END, FA_SK, tid);
     fa_cfg<PVF>(/*asel=*/0, /*wsel=*/1, tid);
     fa_mvin_B<PVF>(&V_in[0][0], SP_V_END, FA_D, tid);
+#ifdef FA_PROLOGUE_MARKS   // stamps inside the once-per-launch prologue (later marks shift)
+    MARK();   // K^T / V move-ins issued
+#endif
     fa_gf(tid);
+#ifdef FA_PROLOGUE_MARKS   // stamps inside the once-per-launch prologue (later marks shift)
+    MARK();   // K^T / V landed
+#endif
 #ifdef FA_SP_HSF
     // FA_SP_HSF: the HOST owns both scale ports -- K -> weight half 0, V -> weight half 1,
     // Q -> act half 1 -- so the GPU writes NO scale word anywhere, ever.  That is what makes the
@@ -4276,8 +4556,13 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     // construction rather than by scheduling.  Block until they are resident.
     fa_sp_wait(FA_SPM_READY, FA_SPM_MAGIC, tid);
 #else
+#ifndef FA_ENC_PROSCL   // FA_ENC_PROSCL wrote them above, from thread 16
     fa_scl(fa_sf_b(0), &QK_B_scales_col[0][0], QKF.SCALE_FACTORS_PER_TILE_B(), tid);
     fa_scl(fa_sf_b(1), &V_scales[0][0], PVF.SCALE_FACTORS_PER_TILE_B(), tid);
+#endif
+#ifdef FA_PROLOGUE_MARKS   // stamps inside the once-per-launch prologue (later marks shift)
+    MARK();   // K / V scales written
+#endif
     // ==== FA_ST_PROLOGF -- PUBLISH THE PROLOGUE'S SF-SRAM SCALE WORDS AT THE GEMMINI PORT. =======
     // *** THE MEASUREMENT THAT MOTIVATES THIS IS A TILE-0-ONLY FAILURE, WHICH IS NOT WHAT IT LOOKED
     // LIKE AT FIRST. ***  On FULL_ATTN2 FA_SP FA_SP_WCNT at FA_NT2, and at every rung of the
@@ -4306,6 +4591,9 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     mu_fence_smem();   // this warp's stores leave its own LSU queues ...
     fa_gf(tid);        // ... and a load from the gemmini TL port orders them at the scale SRAM
 #endif
+#endif
+#if defined(FA_ENC_PROSCL) && !defined(FA_SP_HSF)
+    FAP_BAR(5);   // thread 16's K / V scales are published before anything reads them
 #endif
 #ifdef FA_SP_QOVL
     // tile 0's Q + Q scales: every later tile's are written one stage early (stage S2 below).
@@ -4796,6 +5084,12 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 
     for (uint32_t t = 0; t < (uint32_t)FA_SPTILES; t++) {
     MARK();   // s0: TOP of the steady-state iteration
+#ifdef FA_ENC
+    // iteration t prefetches Q/QS of tile t+1 and finalizes O of tile t
+    fa_enc_q = reinterpret_cast<const uint8_t (*)[FA_D]>(fa_enc_q0 + (t + 1u) * FA_ENC_Q_TILE);
+    fa_enc_qs = reinterpret_cast<const uint8_t (*)[FA_SQ]>(fa_enc_qs0 + (t + 1u) * FA_ENC_QS_TILE);
+    fa_enc_o = fa_enc_o0 + t * FA_ENC_O_TILE;
+#endif
     fa_phase_skew(tid);   // FA_PHASE<k>: measurement-only inter-cluster phase sweep
 #ifndef FA_SP_QOVL
     // ---- S0: [agent] Q(t) move-in + Q(t) scales + QK config ----------------------------
@@ -5029,6 +5323,14 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
           asm volatile("" :: "r"(_d)); }
 #endif
 #endif
+#ifdef FA_ENC_DMAO
+        // The previous tile's 64 O move-outs can still fill gemmini's command queue.  A LOOP_WS
+        // write that the queue backpressures is counted once PER STALLED CYCLE by runningLoops
+        // (GemminiTile.scala:409: mmioLoopStarted uses the write's valid, not its fire), which then
+        // never returns to 0 and fa_gfl's waitcount(0) spins forever (metasim ms_f23d: stuck at 6).
+        // Drain first: the move-outs were issued a barrier ago, so the busy poll cannot fall through.
+        fa_gf(tid);
+#endif
         fa_store_acc<QKF>(SP_C, tid);
         fa_gfl(tid);                                  // drain the accmem->spad store     (FA_SP_WCNT)
     } else { asm volatile("nop"); }
@@ -5086,7 +5388,33 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         if (t + 1 < (uint32_t)FA_SPTILES) fa_mvin_A<QKF>(&QK_A_in[0][0], SP_Q, FA_D, tid);
     } else { asm volatile("nop"); }   // the `else` is MANDATORY (unbalanced warp-uniform region)
 #endif
+#if defined(FA_ENC_TPH) && defined(FA_ENC_KTEARLY)
+    // FA_ENC_KTEARLY: in the last tile of a head, K^T(h+1) and its SF_B half-0 scales load HERE,
+    // not in stage S6 just before QK(t+1) (where the transfer was fully exposed, ~15k per switch).
+    // QK(t) drained in S1 and PV reads SF_B half 1, so K^T's spad rows and SF_B half 0 are free.
+    // Warp 0 issues and DRAINS the transfer inside this stage (no DMA across a stage boundary,
+    // the FA_ST_NOOVL rule) while warps 1-5 run the softmax; the per-row math does not depend on
+    // the warp count.
+    if (fa_head_switch(t)) {
+        if (warp == 0) {
+            const uint32_t hn = (t + 1u) / FA_ENC_TPH;
+            fa_enc_kt = reinterpret_cast<const uint8_t (*)[FA_SK]>(fa_ea->kt + hn * FA_D * FA_SK);
+            fa_enc_kts = reinterpret_cast<const uint8_t (*)[FA_SK]>(fa_ea->kts + hn * (FA_D / 32u) * FA_SK);
+            fa_cfg<QKF>(/*asel=*/1, /*wsel=*/0, tid);
+            fa_mvin_B<QKF>(&QK_B_in[0][0], SP_K_END, FA_SK, tid);
+            fa_gf(tid);
+            fa_scl(fa_sf_b(0), &QK_B_scales_col[0][0], QKF.SCALE_FACTORS_PER_TILE_B(), tid);
+            mu_fence_smem();
+            fa_gf(tid);
+        } else {
+            FA_SP_SOFTMAX(stid, sthr);
+        }
+    } else {
+        FA_SP_SOFTMAX(tid, thr);
+    }
+#else
     FA_SP_SOFTMAX(tid, thr);
+#endif
 #endif
     FAP_BAR(5);
     SMARK();  // s3: softmax / row max done
@@ -5480,6 +5808,27 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
 #endif
 // Barrier id for the extra S6a/S6b split.  MUST be < 16 -- see the note at the FAP_BAR below.
 #define FA_ST_NOOVL_BAR 3u
+#ifdef FA_ENC_DMAO2
+// FA_ENC_DMAO2: two-phase finalize.  All warps finalize O rows [0, SQ/2); after a barrier warp 0
+// moves those rows out while warps 1-5 finalize [SQ/2, SQ); the second half moves out after
+// FAP_BAR(9).  S1's drain then waits for half of the move-outs instead of all of them.
+#  ifndef FA_ENC_DMAO
+#    error "FA_ENC_DMAO2 needs FA_ENC_DMAO"
+#  endif
+#  ifndef FA_ST_SER_QK
+#    error "FA_ENC_DMAO2 splits the S6b finalize, which exists only with FA_ST_SER_QK"
+#  endif
+#  define FA_ST_FIN_TILE() do {                                                     \
+        FA_FIN_ROWS(tid, thr, 0u, FA_SQ / 2u);                                      \
+        FAP_BAR(10);                                                                \
+        if (warp == 0) fa_o_dma(reinterpret_cast<uint32_t>(O_GMEM), 0u, FA_SQ / 2u, tid); \
+        else FA_FIN_ROWS(stid, sthr, FA_SQ / 2u, FA_SQ);                            \
+    } while (0)
+#  define FA_O_DMA_ROW0(t) (fa_head_switch_or0(t) ? 0u : FA_SQ / 2u)
+#else
+#  define FA_ST_FIN_TILE() FA_SP_FINALIZE(tid, thr)
+#  define FA_O_DMA_ROW0(t) 0u
+#endif
     // ---- S6: [agent] QK(t+1) COMPUTE-ONLY -> ACC  ||  [warps1-5] finalize(t) -> GMEM ----
     // The mesh touches only its own spad read ports and the private accumulator, so it issues
     // ZERO SMEM writes and cannot collide with finalize's SMEM reads / GMEM stores.  No drain
@@ -5542,8 +5891,69 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
         fa_gf(tid);
 #endif
 #endif
+#ifdef FA_ENC_TPH
+        // FA_ENC_TPH (tiles per head): one launch covers several heads, because a second FA launch
+        // in a session fails (AccumulatorMem.scala:634; Gemmini state survives the soft reset).
+        // Q, QS and O are head-major, so they advance with t; at a head boundary K^T, V and their
+        // weight scales are reloaded HERE: PV(t) has drained (S5), QK(t+1) is not issued yet, so the
+        // mesh reads neither, and both SF_B halves are free.  Same sequence as the prologue.
+        if ((t + 1u) % FA_ENC_TPH == 0u && t + 1u < (uint32_t)FA_SPTILES) {
+            const uint32_t hn = (t + 1u) / FA_ENC_TPH;
+            fa_enc_kt = reinterpret_cast<const uint8_t (*)[FA_SK]>(fa_ea->kt + hn * FA_D * FA_SK);
+            fa_enc_kts = reinterpret_cast<const uint8_t (*)[FA_SK]>(fa_ea->kts + hn * (FA_D / 32u) * FA_SK);
+            fa_enc_v = reinterpret_cast<const uint8_t (*)[FA_D]>(fa_ea->v + hn * FA_SK * FA_D);
+            fa_enc_vs = reinterpret_cast<const uint8_t (*)[FA_D]>(fa_ea->vs + hn * (FA_SK / 32u) * FA_D);
+#ifndef FA_ENC_KTEARLY   // FA_ENC_KTEARLY loaded K^T(h+1) and its scales in stage S2
+            fa_cfg<QKF>(/*asel=*/1, /*wsel=*/0, tid);
+            fa_mvin_B<QKF>(&QK_B_in[0][0], SP_K_END, FA_SK, tid);
+#endif
+#ifdef FA_ENC_KVOVL
+            // FA_ENC_KVOVL: only K^T(h+1) and its scales are loaded before QK(t+1); V(h+1) and its
+            // SF_B half-1 scales follow the QK issue (the FA_SP_REFETCH pattern: QK reads half 0)
+            // and are drained after the finalize barrier, before any accumulator->SMEM store.
+#ifndef FA_ENC_KTEARLY
+            fa_gf(tid);
+            fa_scl(fa_sf_b(0), &QK_B_scales_col[0][0], QKF.SCALE_FACTORS_PER_TILE_B(), tid);
+#endif
+#else
+#ifdef FA_ENC_KTEARLY
+#error "FA_ENC_KTEARLY needs FA_ENC_KVOVL"
+#endif
+            fa_cfg<PVF>(/*asel=*/0, /*wsel=*/1, tid);
+            fa_mvin_B<PVF>(&V_in[0][0], SP_V_END, FA_D, tid);
+            fa_gf(tid);
+            fa_scl(fa_sf_b(0), &QK_B_scales_col[0][0], QKF.SCALE_FACTORS_PER_TILE_B(), tid);
+            fa_scl(fa_sf_b(1), &V_scales[0][0], PVF.SCALE_FACTORS_PER_TILE_B(), tid);
+#endif
+            mu_fence_smem();
+            fa_gf(tid);
+        } else {
+            asm volatile("nop");
+        }
+#endif
+#ifdef FA_ENC
+        // No QK prefetch past the last tile: it computed a tile that does not exist.  (It does not
+        // fix the second-launch AccumulatorMem.scala:634 failure, metasim enc_m7d.)
+        if (t + 1 < (uint32_t)FA_SPTILES) {
+#endif
         fa_cfg<QKF>(1, 0, tid);
         fa_mm_acc<QKF>(SP_Q, SP_K_END, /*asel=*/1, /*wsel=*/0, tid);
+#ifdef FA_ENC
+        } else {
+            asm volatile("nop");
+        }
+#endif
+#if defined(FA_ENC_TPH) && defined(FA_ENC_KVOVL) && !defined(FA_ST_SER_QK)
+        // FA_ENC_KVOVL with FA_ST_OVL_QK: warps 1-5 finalize in this stage while warp 0 is here, so
+        // V(h+1) is issued right after the QK issue (drained after FAP_BAR(9), as in the S6b form)
+        if (fa_head_switch(t)) {
+            fa_mvin_B<PVF>(&V_in[0][0], SP_V_END, FA_D, tid);
+            fa_scl(fa_sf_b(1), &V_scales[0][0], PVF.SCALE_FACTORS_PER_TILE_B(), tid);
+            mu_fence_smem();
+        } else {
+            asm volatile("nop");
+        }
+#endif
 #ifdef FA_SP_REFETCH
         // V(t+1): move-in + its SF_B half-1 scales, under the QK compute (which reads half 0).
         if (t + 1 < (uint32_t)FA_SPTILES) {
@@ -5567,7 +5977,24 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     FAP_BAR(FA_ST_NOOVL_BAR);   // end of S6a -- warps 1-5 were parked for all of it
     SMARK();                // s7: QK(t+1) resident in the accumulator, mesh idle
     // ---- S6b: [ALL SIX warps] finalize(t) -> GMEM, with NOTHING else in flight ----------
-    FA_SP_FINALIZE(tid, thr);
+#if defined(FA_ENC_TPH) && defined(FA_ENC_KVOVL)
+    // At a head switch warp 0 issues V(h+1) + its SF_B half-1 scales here, after the S6a barrier, so
+    // warps 1-5 finalize while the move-in commands block warp 0 (the load queue fills); issued in
+    // S6a they parked all six warps for the whole transfer (fxk h14k: no gain).
+    if (fa_head_switch(t)) {
+        if (warp == 0) {
+            fa_mvin_B<PVF>(&V_in[0][0], SP_V_END, FA_D, tid);
+            fa_scl(fa_sf_b(1), &V_scales[0][0], PVF.SCALE_FACTORS_PER_TILE_B(), tid);
+            mu_fence_smem();
+        } else {
+            FA_SP_FINALIZE(stid, sthr);
+        }
+    } else {
+        FA_ST_FIN_TILE();
+    }
+#else
+    FA_ST_FIN_TILE();
+#endif
 #elif defined(FA_SP_FZ6)
     } else { asm volatile("nop"); }     // (the `else` is MANDATORY: an unbalanced warp-uniform
                                         //  region makes llvm duplicate later control flow)
@@ -5590,6 +6017,20 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
     }
 #endif
     FAP_BAR(9);
+#if defined(FA_ENC_TPH) && defined(FA_ENC_KVOVL)
+    if (fa_head_switch(t)) fa_gf(tid);   // V(h+1) lands before the move-outs and S1's store
+    else asm volatile("nop");
+#endif
+#if defined(FA_ENC_OQ)
+#ifndef FA_OQ_FUSE   // FA_OQ_FUSE: the finalize quantized the tile; FAP_BAR(9) above staged it
+    fa_oq_quant(tid, thr);
+    mu_fence_smem();
+    FAP_BAR(10);   // the quantized tile is staged; thread 0 moves it out (drained in S1)
+#endif
+    fa_oq_dma((fa_ea->q - EN_FA_Q) / (EN_S * EN_DH) + t / FA_ENC_TPH, t % FA_ENC_TPH, tid);
+#elif defined(FA_ENC_DMAO) && !defined(FA_ENC_DMAO_NOMV)   // NOMV: diagnosis only, O is not written
+    fa_o_dma(reinterpret_cast<uint32_t>(O_GMEM), FA_O_DMA_ROW0(t), FA_SQ, tid);
+#endif
 #else
     // ---- S6: [SIMT] finalize O = O_unnorm / l -> GMEM ---------------------------------
     FA_SP_FINALIZE(tid, thr);
@@ -6448,6 +6889,22 @@ void fa_entry(void *arg, uint32_t tid_in_threadblock,
   // >= 2 leaves cores_finished at 0 0 0 0 with every output word stranded in cache even though the
   // kernel ran to completion (measured with the printBuf beacon, 2026-09-21).  Never returns; the
   // host polls the postbox and soft-resets.  Must be the LAST thing in fa_entry.
+#ifdef FA_ENC
+  // Leave Gemmini idle: the soft reset between launches does not stop it, and the next encoder
+  // stage issues its own commands.  Then the end stamp for the host.
+  if (tid_in_threadblock == 0) {
+    gemmini_fence_waitcount(0);
+    gemmini_fence();
+#ifdef FA_ENC_PB_T_END
+    uint32_t c; asm volatile("csrr %0, mcycle" : "=r"(c)); rad_pb_put(FA_ENC_PB_T_END, c);
+#endif
+  } else {
+    asm volatile("nop");
+  }
+#endif
+#ifdef FA_HPM_SNAP
+  FA_HPM_SNAP(tid_in_threadblock, 1u);
+#endif
   rad_tapeout_epilogue(tid_in_threadblock, wpb);
 #endif
 #ifdef FA_PB

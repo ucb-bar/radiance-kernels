@@ -318,6 +318,35 @@ static inline uint32_t e4m3_pack4_swar(uint32_t wlo, uint32_t whi, uint32_t D2,
     return acc;
 }
 
+// FA_CVT_C: the same integer operations as e4m3_pack4 / e4m3_pack4_swar above, in C instead of
+// one asm block each.  An asm block is one instruction to the compiler, so its in-place temporaries
+// (t, m / y, g, t) made every call one serial chain that the Muon hazard unit admits one
+// instruction at a time; in C the calls of an item interleave and the post-RA renaming pass
+// (llvm-muon-hz -muon-hazard-rename) gives each value its own register.  Bit-exact by construction.
+static inline uint32_t e4m3_elem_c(uint32_t field, uint32_t K8) {
+    const uint32_t t = field - K8;
+    const uint32_t m = ~(uint32_t)((int32_t)t >> 31);
+    return (t + 8u) & m;
+}
+static inline uint32_t e4m3_pack4_c(uint32_t wlo, uint32_t whi, uint32_t K8) {
+    return e4m3_elem_c((wlo << 17) >> 21, K8) | (e4m3_elem_c((wlo << 1) >> 21, K8) << 8) |
+           (e4m3_elem_c((whi << 17) >> 21, K8) << 16) | (e4m3_elem_c((whi << 1) >> 21, K8) << 24);
+}
+static inline uint32_t e4m3_swar2_c(uint32_t w, uint32_t D2, uint32_t C, uint32_t M) {
+    uint32_t y = ((w >> 4) & C) + D2;
+    const uint32_t g = y & M;
+    y = (y & (g - (g >> 15))) + (g >> 12);
+    return y | (y >> 8);
+}
+static inline uint32_t e4m3_pack4_swar_c(uint32_t wlo, uint32_t whi, uint32_t D2,
+                                         uint32_t C, uint32_t M, uint32_t H) {
+    return (e4m3_swar2_c(wlo, D2, C, M) & H) | (e4m3_swar2_c(whi, D2, C, M) << 16);
+}
+#ifdef FA_CVT_C
+#define e4m3_pack4 e4m3_pack4_c
+#define e4m3_pack4_swar e4m3_pack4_swar_c
+#endif
+
 // ============================================================================================
 // FA_SM_2P / FA_SM_2PRAW / FA_SM_2PBM  (+ FA_SP_CVTXS, FA_SP_PAX in flash_attention_mx.cpp)
 // A FOURTH-PASS STEADY-STATE SWEEP ON TOP OF FA_SP_QSPLIT.  All of these are BIT-EXACT by
