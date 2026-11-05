@@ -18,6 +18,8 @@
 # RadianceFP4HBMConfig and the FireSim *HBMRadianceConfig targets.  RadianceHBMConfig (4 SMs, 8 slices
 # x 2 channels, 64 B lines, incoherent 4-bank cluster L1) needs HBM4=1, which sets MU_ADDR_HASH_SLICES=16
 # MU_ADDR_HASH_CPS=2 MU_ADDR_HASH_UNIT=64 MU_ADDR_HASH_CSS=64 MU_L1_BANKS=4.
+# The v3 2-SM FireSim bitstreams (2SM_DRAM_v3, 2SM_HBM_v3 and their slowed-memory drivers: 4 slices, 64 B lines,
+# incoherent 4-bank cluster L1) need V3=1, which sets MU_ADDR_HASH_UNIT=64 MU_L1_BANKS=4.
 # MU_ADDR_HASH_UNIT (default 32) is the hash granule in bytes, the GPU L2 line.
 # MU_L1_BANKS (default 0): the cluster L1 is incoherent with this many banks (radiance L1IncoherentKey,
 # L1BanksKey); kernels then write the L1 flush registers to publish results (mu_l1_flush, device.h).
@@ -111,6 +113,11 @@ $(shell mkdir -p build; printf '%s\n' "$(GEN_ARGS)" | cmp -s - $(GEN_STAMP) || p
 
 # DEFS stamp: the objects depend on $(DEFS_STAMP), rewritten whenever DEFS changes, so
 # `make DEFS=...` recompiles even when no source changed.
+V3 ?= 0
+ifeq ($(V3),1)
+MU_ADDR_HASH_UNIT ?= 64
+MU_L1_BANKS ?= 4
+endif
 HBM4 ?= 0
 ifeq ($(HBM4),1)
 MU_ADDR_HASH_SLICES ?= 16
